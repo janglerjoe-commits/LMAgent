@@ -1095,7 +1095,7 @@ class WaitState:
             return True  # malformed → resume immediately
 
 
-_WAIT_RE = re.compile(r'WAIT:\s*(\S+):\s*(.+)')
+_WAIT_RE = re.compile(r'WAIT:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s:]*):\s*(.+)')
 
 
 def detect_wait(content: str) -> Optional[WaitState]:
