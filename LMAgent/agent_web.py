@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LMAgent Web — v6.5
+LMAgent Web — v6.5.1
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -8,25 +8,6 @@ LMAgent Web — v6.5
 
 Place this file next to those three files.
 
-Changes vs v6.4:
-  - Imports restructured to pull from agent_core, agent_tools, agent_main
-    instead of the old monolithic lm_agent_v9_3.py.
-  - _HeaderStreamCb patch now correctly targets agent_tools module.
-  - All v6.4 features preserved:
-      · Freeze fix (lock acquire timeout)
-      · Watchdog broadcasts done/error if agent thread dies unexpectedly
-      · Persistent chat log (in-memory replay on page refresh)
-      · Unicode SSE (ensure_ascii=False)
-      · Blank iteration spam suppression
-
-Cross-platform changes (v6.5-cross):
-  - Config.WORKSPACE resolution deferred to after Config.init() so the
-    workspace picker in agent_main._pick_workspace() is honoured when this
-    module is imported standalone (e.g. python agent_web.py).
-  - _TOOL_CATEGORIES System list includes "shell" alongside "powershell" so
-    the Tools panel in the browser shows both aliases correctly.
-  - No direct shell calls in this file; relies entirely on agent_core /
-    agent_tools for cross-platform behaviour.
 """
 
 import json
@@ -79,8 +60,6 @@ try:
 except Exception as _e:
     sys.exit(f"ERROR: Config.init() failed: {_e}")
 
-# Resolve workspace AFTER Config.init() so that the .env loader and any
-# workspace picker that ran before this module was imported are respected.
 WORKSPACE = Path(Config.WORKSPACE).resolve()
 soul      = SoulConfig.load(WORKSPACE)
 Log.set_silent(True)
@@ -94,23 +73,18 @@ except Exception:
 
 app = Flask(__name__)
 
-# ── Serialises agent execution (with timeout to prevent freeze) ───────────────
 _AGENT_LOCK         = threading.Lock()
-_AGENT_LOCK_TIMEOUT = 300   # seconds — safety valve
+_AGENT_LOCK_TIMEOUT = 300
 
-# ── Per-thread token callback ─────────────────────────────────────────────────
 _tl = threading.local()
 
-# ── Current session & permission ─────────────────────────────────────────────
 _session_lock            = threading.Lock()
 _current_session_id: "str | None" = None
 _current_permission_mode = Config.PERMISSION_MODE
 
-# ── Stop events keyed by request_id ───────────────────────────────────────────
 _stop_events:      "dict[str, threading.Event]" = {}
 _stop_events_lock = threading.Lock()
 
-# ── Agent state ───────────────────────────────────────────────────────────────
 _agent_state      = "idle"
 _agent_state_lock = threading.Lock()
 
@@ -126,7 +100,6 @@ def _get_agent_state() -> str:
         return _agent_state
 
 
-# ── Broadcast stream ──────────────────────────────────────────────────────────
 _stream_queues: "list[queue.Queue]" = []
 _stream_queues_lock = threading.Lock()
 
@@ -157,7 +130,7 @@ def _unregister_stream_q(q: "queue.Queue") -> None:
 
 
 # =============================================================================
-# PERSISTENT CHAT LOG  (in-memory, per session, survives page refreshes)
+# PERSISTENT CHAT LOG
 # =============================================================================
 
 _chat_logs: "dict[str, list]" = defaultdict(list)
@@ -193,7 +166,6 @@ def _chatlog_clear(session_id: "str | None") -> None:
 
 
 def _chatlog_merge_keys(old_key: "str | None", new_key: str) -> None:
-    """After agent assigns a real session_id, move _none entries to that key."""
     old = old_key or "_none"
     if old == new_key:
         return
@@ -203,7 +175,7 @@ def _chatlog_merge_keys(old_key: "str | None", new_key: str) -> None:
 
 
 # =============================================================================
-# STOP EXCEPTION  — BaseException so it bypasses bare `except Exception` blocks
+# STOP EXCEPTION
 # =============================================================================
 
 class _AgentStopped(BaseException):
@@ -212,8 +184,6 @@ class _AgentStopped(BaseException):
 
 # =============================================================================
 # _HeaderStreamCb PATCH
-# Patch the class in agent_tools so that every new instance (created inside
-# run_agent) forwards tokens to our per-thread callback.
 # =============================================================================
 
 class _PatchedHSC(_OrigHSC):
@@ -230,8 +200,6 @@ class _PatchedHSC(_OrigHSC):
                     pass
 
 
-# Patch the class in agent_tools so run_agent (which imports from agent_tools
-# internally via _HeaderStreamCb) picks up our version.
 agent_tools._HeaderStreamCb = _PatchedHSC
 _agent_main_mod._HeaderStreamCb = _PatchedHSC
 
@@ -343,8 +311,6 @@ def _sse_response(generator) -> Response:
 
 # =============================================================================
 # TOOL CATEGORIES
-# "shell" is the canonical cross-platform name; "powershell" kept as alias.
-# Both appear in the System category so the browser Tools panel shows them.
 # =============================================================================
 
 _TOOL_CATEGORIES = {
@@ -800,7 +766,7 @@ header {
     <div class="logo">
       <div class="logo-mark">λ</div>
       LMAgent
-      <span class="logo-sub">v6.5</span>
+      <span class="logo-sub">v6.5.1</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -1320,6 +1286,18 @@ const Agent = (() => {
           transition('waiting');
           Status.set('waiting — scheduled resume…', 'wait');
           Messages.sys('⏰ Session waiting — will resume automatically', 'warn');
+
+        // ── FIX: recover from freeze when server already finished but
+        //         the browser missed the `done` event (dropped SSE connection).
+        //         Without this the UI stays permanently locked after completion.
+        } else if (d.state === 'idle' && state !== 'idle') {
+          Stream.finalize();
+          Tools.endGroup();
+          transition('idle');
+          Status.set('done', 'done');
+          Status.iter('');
+          Messages.sys('✓ task finished', 'ok');
+          document.getElementById('msg-input').focus();
         }
         break;
       }
@@ -1398,6 +1376,20 @@ const Agent = (() => {
     } else {
       transition('idle');
       Status.set(reason || 'done', isErr ? 'err' : 'done');
+
+      // ── FIX: show a visible completion notice in the chat so the user
+      //         doesn't have to look at the status bar to know it's done.
+      if (isErr) {
+        if (reason === 'stopped') {
+          Messages.sys('— stopped —', 'warn');
+        }
+        // 'error' case is already handled by the 'error' event handler above
+      } else {
+        // Successful completion: show friendly green confirmation
+        const label = reason && reason !== 'done ✓' ? reason : 'task finished';
+        Messages.sys('✓ ' + label, 'ok');
+      }
+
       document.getElementById('msg-input').focus();
     }
   }
@@ -1886,7 +1878,6 @@ def _scheduler_loop():
                 with _running_lock:
                     _running.discard(sid)
 
-        # Freeze fix: acquire with timeout so a stuck lock never blocks forever
         acquired = _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT)
         if not acquired:
             _broadcast(("error", "agent lock timeout — server may need restart"))
@@ -2077,7 +2068,6 @@ def chat():
                 _stop_events.pop(rid, None)
 
     def locked_run():
-        # Freeze fix: acquire with timeout — never hang forever
         acquired = _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT)
         if not acquired:
             _broadcast(("error", "agent busy — try again in a moment"))
@@ -2091,7 +2081,6 @@ def chat():
         finally:
             _AGENT_LOCK.release()
 
-        # Watchdog: if the thread exited without broadcasting "done", do it now
         if _get_agent_state() == "running":
             _set_agent_state("idle")
             _broadcast(("done", "error"))
@@ -2177,7 +2166,6 @@ def run_cmd():
 
 @app.route("/new", methods=["POST"])
 def new_session():
-    """Clear the current session AND its chat log so the next /chat starts fresh."""
     global _current_session_id
     with _session_lock:
         old = _current_session_id
@@ -2221,7 +2209,7 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "═" * 58)
-    print("  LMAgent Web  v6.5")
+    print("  LMAgent Web  v6.5.1")
     print("═" * 58)
     print(f"  Local  →  http://localhost:{port}")
     print(f"  Phone  →  http://{ip}:{port}")
@@ -2236,6 +2224,8 @@ if __name__ == "__main__":
     print("  Persistent chat: in-memory replay on reconnect ✓")
     print("  New session clears chat log ✓")
     print("  Unicode SSE ✓  Blank iteration suppression ✓")
+    print("  FIX: Completion message shown in chat ✓")
+    print("  FIX: UI recovers from freeze on SSE reconnect ✓")
     print("═" * 58 + "\n")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
