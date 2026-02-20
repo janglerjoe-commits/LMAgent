@@ -31,7 +31,6 @@ Cross-platform changes (v9.3.1-cross):
   - subprocess.CREATE_NO_WINDOW flag is only applied on Windows.
 
 """
-
 import atexit
 import difflib
 import json
@@ -1095,7 +1094,7 @@ class WaitState:
             return True  # malformed → resume immediately
 
 
-_WAIT_RE = re.compile(r'WAIT:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s:]*):\s*(.+)')
+_WAIT_RE = re.compile(r'WAIT:\s*(\S+):\s*(.+)')
 
 
 def detect_wait(content: str) -> Optional[WaitState]:
@@ -1576,53 +1575,117 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         else:
             regular_msgs.append(msg)
 
-    critical     = _extract_critical_work_msgs(regular_msgs, Config.KEEP_RECENT_MESSAGES)
-    keep_indices = {regular_msgs.index(m) for m in critical if m in regular_msgs}
-    tail_start   = max(0, len(regular_msgs) - max(25, len(regular_msgs) // 2))
+    # ── score every message by importance ─────────────────────────────────────
+    # Build index → score map rather than using list.index() (which is O(n) and
+    # breaks on duplicate object references).
+    scored_indices: List[Tuple[int, int]] = []   # (index, priority)
+    for i, msg in enumerate(regular_msgs):
+        content = str(msg.get("content", ""))
+        role    = msg.get("role", "")
+        priority = 0
+
+        if role == "tool":
+            name = msg.get("name", "")
+            try:
+                result = json.loads(content)
+                if result.get("success"):
+                    if name in ("shell", "powershell"):
+                        stdout = result.get("stdout", "").lower()
+                        # Rename/move ops are high-value context
+                        priority = 900 if any(k in stdout for k in
+                                              ("rename", "move", "ren ", "mv ")) else 500
+                    elif name in ("write", "edit"):
+                        priority = 600
+                    elif name in ("read",):
+                        priority = 400
+                    elif name in ("todo_complete", "plan_complete_step"):
+                        priority = 700   # completion signals are high-value
+                    elif name in ("task_state_update",):
+                        priority = 650
+                    else:
+                        priority = 300
+                else:
+                    priority = 200   # failed results still useful for loop detection
+            except Exception:
+                priority = 100
+
+        elif role == "assistant":
+            if msg.get("tool_calls"):
+                priority = 350
+            elif len(content) > 50:
+                priority = 150
+
+        if priority > 0:
+            scored_indices.append((i, priority))
+
+    # Keep top-scored + always keep the tail half (minimum 25 msgs)
+    scored_indices.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    keep_indices: set = {idx for idx, _ in
+                         scored_indices[:Config.KEEP_RECENT_MESSAGES]}
+    tail_start = max(0, len(regular_msgs) - max(25, len(regular_msgs) // 2))
     keep_indices |= set(range(tail_start, len(regular_msgs)))
 
-    # Preserve recent reads to avoid re-read loops
+    # Preserve recent read call+result pairs to avoid re-read loops
     for i in range(max(0, len(regular_msgs) - 20), len(regular_msgs)):
         msg = regular_msgs[i]
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 if tc.get("function", {}).get("name") == "read":
                     try:
-                        path = json.loads(tc["function"].get("arguments", "{}")).get("path", "")
+                        path = json.loads(
+                            tc["function"].get("arguments", "{}")
+                        ).get("path", "")
                         if path:
                             keep_indices.add(i)
                             for j in range(i + 1, min(i + 3, len(regular_msgs))):
                                 if (regular_msgs[j].get("role") == "tool"
                                         and regular_msgs[j].get("name") == "read"):
-                                    keep_indices.add(j); break
+                                    keep_indices.add(j)
+                                    break
                     except Exception:
                         pass
 
-    # Keep tool-call / result pairs atomic
-    for i in sorted(keep_indices):
-        if i >= len(regular_msgs): continue
+    # ── keep tool-call / result pairs atomic ───────────────────────────────────
+    # BUG FIX: original only checked tool_calls[0]; an assistant turn can make
+    # multiple calls and the matching one may be at any index.
+    for i in sorted(list(keep_indices)):   # iterate a snapshot — set mutates
+        if i >= len(regular_msgs):
+            continue
         msg = regular_msgs[i]
+
         if msg.get("role") == "tool":
+            # Find the assistant turn that owns this result
             tid = msg.get("tool_call_id")
             for j in range(i - 1, -1, -1):
                 prev = regular_msgs[j]
-                if (prev.get("role") == "assistant" and prev.get("tool_calls")
-                        and prev["tool_calls"][0].get("id") == tid):
-                    keep_indices.add(j); break
+                if prev.get("role") != "assistant":
+                    continue
+                # Check ALL tool calls in the assistant turn, not just [0]
+                if any(tc.get("id") == tid
+                       for tc in (prev.get("tool_calls") or [])):
+                    keep_indices.add(j)
+                    break
+
         elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-            tid = msg["tool_calls"][0].get("id")
+            # Keep ALL result messages for this assistant turn's tool calls
+            call_ids = {tc.get("id") for tc in msg["tool_calls"]}
             for j in range(i + 1, len(regular_msgs)):
-                if (regular_msgs[j].get("role") == "tool"
-                        and regular_msgs[j].get("tool_call_id") == tid):
-                    keep_indices.add(j); break
+                r = regular_msgs[j]
+                if (r.get("role") == "tool"
+                        and r.get("tool_call_id") in call_ids):
+                    keep_indices.add(j)
+                    call_ids.discard(r.get("tool_call_id"))
+                    if not call_ids:
+                        break
 
     kept      = [regular_msgs[i] for i in sorted(keep_indices)]
-    discarded = [m for i, m in enumerate(regular_msgs) if i not in keep_indices]
+    discarded = [regular_msgs[i] for i in range(len(regular_msgs))
+                 if i not in keep_indices]
 
     result = [system_msg]
-    if task_state_msg:  result.append(task_state_msg)
-    if last_plan_msg:   result.append(last_plan_msg)
-    if last_todo_msg:   result.append(last_todo_msg)
+    if task_state_msg: result.append(task_state_msg)
+    if last_plan_msg:  result.append(last_plan_msg)
+    if last_todo_msg:  result.append(last_todo_msg)
 
     if discarded:
         result.append({"role": "system", "content": (
@@ -1652,6 +1715,27 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     new_tokens = TokenCounter.count_messages_tokens(result)
     Log.success(f"Compacted: {total_tokens} → {new_tokens} tokens "
                 f"({len(messages)} → {len(result)} msgs)")
+
+    # ── safety valve: if still over threshold, drop more aggressively ─────────
+    # This prevents the agent from hitting an infinite compaction loop when the
+    # kept + injected system messages alone exceed the threshold.
+    if new_tokens >= total_tokens * 0.95:
+        Log.warning("Compaction barely reduced tokens — forcing aggressive trim")
+        # Keep only system frames + last KEEP_RECENT_MESSAGES regular messages
+        hard_kept = kept[-max(10, Config.KEEP_RECENT_MESSAGES // 2):]
+        result = [system_msg]
+        if task_state_msg: result.append(task_state_msg)
+        if last_plan_msg:  result.append(last_plan_msg)
+        result.append({"role": "system", "content": (
+            "[AGGRESSIVE COMPACTION — context was very large]\n"
+            f"{_build_progress_summary(discarded + kept[:-len(hard_kept)])}\n"
+            "[END COMPACTION SUMMARY]"
+        )})
+        result.extend(hard_kept)
+        result.extend(reconcile_msgs[-3:])  # keep only last 3 reconcile msgs
+        new_tokens = TokenCounter.count_messages_tokens(result)
+        Log.warning(f"Aggressive compaction: now {new_tokens} tokens, {len(result)} msgs")
+
     return result
 
 
@@ -1768,7 +1852,7 @@ class MCPClient:
             self._send("initialize", {
                 "protocolVersion": "2024-11-05", "capabilities": {},
                 "clientInfo": {"name": "lm-agent", "version": VERSION},
-            }, timeout=5)
+            }, timeout=15)
             result     = self._send("tools/list", {}, timeout=5)
             self.tools = (result or {}).get("tools", [])
             self.healthy = True
