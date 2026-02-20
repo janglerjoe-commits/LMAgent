@@ -145,8 +145,8 @@ def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
         fp.parent.mkdir(parents=True, exist_ok=True)
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
-        fp.unlink(missing_ok=True)
-        tmp.rename(fp)
+        import os as _os
+        _os.replace(str(tmp), str(fp))  # atomic on both Windows and POSIX
         return {"success": True,
                 "path":    str(fp.relative_to(workspace)).replace("\\", "/"),
                 "action":  "modified" if existed else "created",
@@ -166,8 +166,8 @@ def tool_edit(workspace: Path, path: str, search: str, replace: str) -> Dict[str
         # Atomic write — same pattern as tool_write so a crash can't corrupt the file.
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(new_content, encoding="utf-8")
-        fp.unlink(missing_ok=True)
-        tmp.rename(fp)
+        import os as _os
+        _os.replace(str(tmp), str(fp))
         return {"success": True,
                 "path":    str(fp.relative_to(workspace)).replace("\\", "/"),
                 "method":  msg}
@@ -1139,7 +1139,7 @@ _ASKING_PHRASES = ("would you like", "what would you", "should i")
 
 def detect_completion(content: str, has_tool_calls: bool) -> Tuple[bool, str]:
     """content must already have <think> blocks stripped."""
-    if "TASK_COMPLETE" in content.upper():
+    if "TASK_COMPLETE" in content.upper() and not has_tool_calls:
         for line in content.split("\n"):
             if "TASK_COMPLETE" not in line.upper(): continue
             stripped = line.strip()
