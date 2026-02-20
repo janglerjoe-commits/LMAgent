@@ -2,39 +2,8 @@
 """
 agent_tools.py — Tool layer for LMAgent.
 
-Changes from v9.3.0:
-  - _write_context_file / _CTX_FILE removed: context is now built in-memory
-    (_build_parent_context) instead of writing a temp file to disk then
-    immediately reading and deleting it.
-  - LLMClient._tool_choice_rejected changed from a shared class variable to
-    thread-local storage (_llm_local). One session hitting a model that rejects
-    tool_choice no longer silently disables it for all concurrent sessions.
-  - tool_edit now uses the same atomic tmp-rename write pattern as tool_write.
-    Previously a crash mid-edit would corrupt the target file.
-  - run_sub_agent now saves and restores the parent thread-local context,
-    and installs a fresh context for the sub-agent before running it. Previously
-    sub-agent tool handlers (todo_complete, plan_complete_step, etc.) operated
-    on the parent session's managers.
-  - _NO_ARG_TOOLS frozenset removed — was defined but never referenced anywhere.
-  - _parse_stream: removed double delta.get("thinking") call and tightened the
-    thinking-block rendering path.
-
-Cross-platform changes (v9.3.1-cross):
-  - Imports get_shell_session / close_shell_session from agent_core instead of
-    the old get_powershell_session. Backward-compat alias kept for any external
-    caller that still references get_powershell_session.
-  - tool_powershell renamed to tool_shell internally; tool_powershell exposed as
-    an alias so existing sessions/configs that name the tool "powershell" keep
-    working. TOOL_HANDLERS registers both "shell" and "powershell" keys pointing
-    to the same handler.
-  - TOOL_SCHEMAS registers both a "shell" and a "powershell" entry so the LLM
-    can call either name. The description notes cross-platform shell.
-  - _git() uses get_shell_session instead of get_powershell_session.
-  - Config.DESTRUCTIVE_TOOLS updated in the local reference to include "shell".
-
 Depends on: agent_core.py
 """
-
 import json
 import re
 import sys
@@ -1076,10 +1045,18 @@ class LLMClient:
 
             if is_empty or args_str.strip() == "{}":
                 if fn_name in _REQUIRED_ARG_TOOLS:
+                    # ── TRUNCATION RECOVERY ───────────────────────────────────
+                    # Args are empty — generation was cut off before the JSON
+                    # body was written. Mark as truncated so _process_tool_calls
+                    # injects a retry prompt instead of silently skipping.
                     Log.error(f"'{fn_name}' received empty/bare args — "
                               f"finish_reason={finish_reason!r}")
                     incomplete = True
+                    tc["function"]["arguments"] = "{}"
+                    tc["_truncated"] = True
+                    calls.append(tc)
                     continue
+                # Tool that accepts empty args — fine to pass through.
                 tc["function"]["arguments"] = "{}"
                 calls.append(tc)
                 continue
@@ -1091,25 +1068,35 @@ class LLMClient:
                 Log.error(f"[PARSE] '{fn_name}' JSON decode failed at pos "
                           f"{parse_err.pos}: {parse_err.msg} — "
                           f"tail={repr(args_str[-80:])}")
+
+                repaired = False
                 if len(args_str) < 500:
                     opens, closes = args_str.count("{"), args_str.count("}")
                     if opens > closes:
-                        repaired = args_str + "}" * (opens - closes)
+                        candidate = args_str + "}" * (opens - closes)
                         try:
-                            json.loads(repaired)
-                            tc["function"]["arguments"] = repaired
+                            json.loads(candidate)
+                            tc["function"]["arguments"] = candidate
                             Log.info(f"[PARSE] Auto-repaired '{fn_name}': "
                                      f"added {opens - closes} brace(s)")
                             incomplete = True
                             calls.append(tc)
-                            continue
+                            repaired = True
                         except json.JSONDecodeError:
                             pass
-                    Log.error(f"[PARSE] '{fn_name}' short payload unrecoverable — skipping")
-                else:
-                    Log.error(f"[PARSE] '{fn_name}' large payload ({len(args_str)} chars) "
-                              f"invalid JSON — generation likely truncated mid-string")
-                incomplete = True
+
+                if not repaired:
+                    # ── TRUNCATION RECOVERY ───────────────────────────────────
+                    # JSON is broken and can't be auto-repaired — generation was
+                    # truncated mid-string. Mark as truncated so the agent retries
+                    # instead of giving up and declaring the task complete.
+                    Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
+                              f"({'short' if len(args_str) < 500 else 'large'} payload, "
+                              f"{len(args_str)} chars)")
+                    incomplete = True
+                    tc["function"]["arguments"] = "{}"
+                    tc["_truncated"] = True
+                    calls.append(tc)
 
         if finish_reason == "length":
             Log.warning("⚠️  Generation stopped: output token limit hit (finish_reason=length)")
@@ -1126,8 +1113,6 @@ class LLMClient:
             "incomplete":    incomplete,
             "finish_reason": finish_reason,
         }
-
-
 # =============================================================================
 # COMPLETION DETECTION
 # =============================================================================
