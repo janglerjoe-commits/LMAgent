@@ -14,6 +14,12 @@ Usage:
   python agent_main.py --scheduler            # Scheduler daemon only
   python agent_main.py --submit "task"        # Submit task to running scheduler
 
+BUG FIX (v9.3.2):
+  Tool calls now execute BEFORE completion is detected.
+  Previously, detect_completion() ran before _process_tool_calls(), so if the
+  LLM emitted TASK_COMPLETE in the same response as a tool call (common with
+  thinking models), the agent exited before the tool was ever executed.
+  The fix: execute tool_calls first, then run detect_completion().
 """
 
 import argparse
@@ -572,7 +578,37 @@ def run_agent(
                     wait_until=wait_state.resume_after,
                 )
 
-            # ── completion detection ───────────────────────────────────────────
+            # ── BUG FIX: execute tool calls BEFORE checking for completion ─────
+            #
+            # Previously the order was:
+            #   1. detect_completion()   ← triggered early exit if TASK_COMPLETE in text
+            #   2. append assistant msg
+            #   3. _process_tool_calls() ← never reached if step 1 returned True
+            #
+            # Thinking models (QwQ, DeepSeek-R1, etc.) commonly emit TASK_COMPLETE
+            # in their reasoning text in the same response as a tool call, so the
+            # old order caused the agent to exit before the tool ever ran.
+            #
+            # Fixed order:
+            #   1. append assistant msg
+            #   2. _process_tool_calls() ← tools execute first
+            #   3. detect_completion()   ← check after tools have run
+            # ──────────────────────────────────────────────────────────────────
+
+            # Append the assistant message first so the conversation stays coherent.
+            assistant_msg: Dict[str, Any] = {"role": "assistant"}
+            if content:    assistant_msg["content"]    = content
+            if tool_calls: assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            # Execute any tool calls BEFORE checking completion.
+            if tool_calls:
+                _, current_permission_mode = _process_tool_calls(
+                    tool_calls, workspace, available_tools, detector,
+                    iteration, mcp_manager, messages, current_permission_mode, emit=emit,
+                )
+
+            # Now check for completion (tools have already run).
             is_complete, reason = detect_completion(content, bool(tool_calls))
 
             if is_complete and task_state_mgr.current_state:
@@ -603,17 +639,6 @@ def run_agent(
                     ))
                 return AgentResult(status="completed", final_answer=final_answer,
                                    events=events, session_id=session_id, iterations=iteration)
-
-            assistant_msg: Dict[str, Any] = {"role": "assistant"}
-            if content:    assistant_msg["content"]    = content
-            if tool_calls: assistant_msg["tool_calls"] = tool_calls
-            messages.append(assistant_msg)
-
-            if tool_calls:
-                _, current_permission_mode = _process_tool_calls(
-                    tool_calls, workspace, available_tools, detector,
-                    iteration, mcp_manager, messages, current_permission_mode, emit=emit,
-                )
 
             if Config.AUTO_SAVE_SESSION and iteration % 5 == 0:
                 _save_session("active")
@@ -988,8 +1013,13 @@ def main() -> int:
 
     _repl_prompt_fn = _reprint_prompt
 
+    def _silent_run_scheduler(*args, **kwargs):
+        # Thread-local — only silences this thread, not the REPL thread.
+        Log.set_silent(True)
+        run_scheduler(*args, **kwargs)
+
     _sched_thread = threading.Thread(
-        target=run_scheduler,
+        target=_silent_run_scheduler,
         args=(workspace,),
         kwargs={"poll_interval": args.scheduler_interval or Config.SCHEDULER_POLL_INTERVAL},
         daemon=True,
