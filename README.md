@@ -1,5 +1,8 @@
 # LMAgent
 
+
+[![Watch the demo](https://img.youtube.com/vi/GNQP6M53c5A/hqdefault.jpg)](https://www.youtube.com/watch?v=GNQP6M53c5A)
+
 A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible LLM (LM Studio, Ollama, etc.) and can autonomously read and write files, run shell commands, manage git, track todos, coordinate sub-tasks, and much more — all from an interactive terminal REPL or a polished web UI.
 
 ---
