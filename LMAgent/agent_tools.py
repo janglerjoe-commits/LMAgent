@@ -4,6 +4,7 @@ agent_tools.py — Tool layer for LMAgent.
 
 Depends on: agent_core.py
 """
+
 import json
 import re
 import sys
@@ -968,6 +969,9 @@ class LLMClient:
         finish_reason = None
         in_think      = False
 
+        resp.encoding = "utf-8"  # force UTF-8 decoding — prevents mojibake when
+                                 # the server omits charset in Content-Type header
+
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "): continue
             data = line[6:].strip()
@@ -1045,10 +1049,6 @@ class LLMClient:
 
             if is_empty or args_str.strip() == "{}":
                 if fn_name in _REQUIRED_ARG_TOOLS:
-                    # ── TRUNCATION RECOVERY ───────────────────────────────────
-                    # Args are empty — generation was cut off before the JSON
-                    # body was written. Mark as truncated so _process_tool_calls
-                    # injects a retry prompt instead of silently skipping.
                     Log.error(f"'{fn_name}' received empty/bare args — "
                               f"finish_reason={finish_reason!r}")
                     incomplete = True
@@ -1056,7 +1056,6 @@ class LLMClient:
                     tc["_truncated"] = True
                     calls.append(tc)
                     continue
-                # Tool that accepts empty args — fine to pass through.
                 tc["function"]["arguments"] = "{}"
                 calls.append(tc)
                 continue
@@ -1086,10 +1085,6 @@ class LLMClient:
                             pass
 
                 if not repaired:
-                    # ── TRUNCATION RECOVERY ───────────────────────────────────
-                    # JSON is broken and can't be auto-repaired — generation was
-                    # truncated mid-string. Mark as truncated so the agent retries
-                    # instead of giving up and declaring the task complete.
                     Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
                               f"({'short' if len(args_str) < 500 else 'large'} payload, "
                               f"{len(args_str)} chars)")
