@@ -6,8 +6,6 @@ LMAgent Web — v6.5.1
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
   agent_main.py   — run_agent()
 
-Place this file next to those three files.
-
 """
 
 import json
@@ -128,8 +126,11 @@ _stream_queues_lock = threading.Lock()
 
 def _broadcast(item: tuple) -> None:
     kind, payload = item
-    # Sanitize text payloads so Unicode renders correctly in the browser
-    if kind in ("token", "status", "tool", "error", "done") and isinstance(payload, str):
+    # Note: mojibake repair for "token" payloads is intentionally done
+    # client-side on the full accumulated buffer (Stream.flush/finalize),
+    # because UTF-8 multi-byte sequences are often split across tokens.
+    # We still sanitize non-token text strings here as a best-effort pass.
+    if kind in ("status", "tool", "error", "done") and isinstance(payload, str):
         payload = _fix_mojibake(payload)
     item = (kind, payload)
     _chatlog_append(item)
@@ -899,16 +900,23 @@ header {
 // ═══════════════════════════════════════════════════════════════
 // UNICODE SANITIZER  — fix mojibake before rendering
 // ═══════════════════════════════════════════════════════════════
+const _TD = new TextDecoder('utf-8', { fatal: true });
 function fixMojibake(s) {
   if (!s) return s;
-  try {
-    // Encode each char as its char-code byte array, then decode as UTF-8
-    const bytes = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch (_) {
-    return s; // already valid or unfixable — return as-is
-  }
+  // Regex-replace ONLY the mojibake spans (Latin-1 chars that form valid
+  // UTF-8 multi-byte sequences), leaving all other Unicode untouched.
+  // Whole-buffer decode fails on mixed content because chars above U+00FF
+  // get truncated by & 0xff, breaking correctly-encoded emoji etc.
+  return s.replace(
+    /[Â-ß][-¿]|[à-ï][-¿]{2}|[ð-÷][-¿]{3}/g,
+    match => {
+      try {
+        const b = new Uint8Array(match.length);
+        for (let i = 0; i < match.length; i++) b[i] = match.charCodeAt(i);
+        return _TD.decode(b);
+      } catch (_) { return match; }
+    }
+  );
 }
 
 
@@ -1209,14 +1217,15 @@ const Stream = (() => {
   }
 
   function token(tok) {
-    buf += fixMojibake(tok);
+    buf += tok;  // accumulate raw — fix applied to full buffer at render time
     clearTimeout(timer);
     timer = setTimeout(flush, 35);
   }
 
   function flush() {
     if (!el) return;
-    el.innerHTML = MD.render(buf) || '';
+    const fixed = fixMojibake(buf);
+    el.innerHTML = MD.render(fixed) || '';
     el.appendChild(Object.assign(document.createElement('span'), { className: 'cursor' }));
     Scroll.maybe();
   }
@@ -1224,8 +1233,9 @@ const Stream = (() => {
   function finalize() {
     clearTimeout(timer);
     if (!el) return;
-    if (!buf.trim()) el.closest('.msg')?.remove();
-    else el.innerHTML = MD.render(buf) || buf;
+    const fixed = fixMojibake(buf);
+    if (!fixed.trim()) el.closest('.msg')?.remove();
+    else el.innerHTML = MD.render(fixed) || fixed;
     el = null; buf = '';
     Scroll.maybe();
   }
@@ -2285,24 +2295,7 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "\u2550" * 58)
-    print("  LMAgent Web  v6.5.1")
-    print("\u2550" * 58)
-    print(f"  Local  \u2192  http://localhost:{port}")
-    print(f"  Phone  \u2192  http://{ip}:{port}")
-    print(f"  Workspace : {WORKSPACE}")
-    print(f"  LLM       : {Config.LLM_URL}")
-    print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
-    print("\u2550" * 58)
-    print("  Modular import: agent_core + agent_tools + agent_main \u2713")
-    print("  Cross-platform shell (bash/PowerShell) \u2713")
-    print("  Mojibake fix: UTF-8 chars render correctly \u2713")
-    print("  Freeze fix: lock acquire timeout \u2713")
-    print("  Watchdog: unblocks UI if agent thread dies unexpectedly \u2713")
-    print("  Persistent chat: in-memory replay on reconnect \u2713")
-    print("  New session clears chat log \u2713")
-    print("  Unicode SSE \u2713  Blank iteration suppression \u2713")
-    print("  FIX: Completion message shown in chat \u2713")
-    print("  FIX: UI recovers from freeze on SSE reconnect \u2713")
+  
     print("  FIX: Agent prose uses readable sans-serif font \u2713")
     print("\u2550" * 58 + "\n")
 
