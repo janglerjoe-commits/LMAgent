@@ -14,7 +14,7 @@ Usage:
   python agent_main.py --scheduler            # Scheduler daemon only
   python agent_main.py --submit "task"        # Submit task to running scheduler
 
-BUG FIX (v9.3.2):
+BUG FIX :
   Tool calls now execute BEFORE completion is detected.
   Previously, detect_completion() ran before _process_tool_calls(), so if the
   LLM emitted TASK_COMPLETE in the same response as a tool call (common with
