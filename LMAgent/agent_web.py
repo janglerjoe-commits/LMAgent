@@ -100,11 +100,38 @@ def _get_agent_state() -> str:
         return _agent_state
 
 
+# =============================================================================
+# MOJIBAKE FIX  — UTF-8 bytes that were decoded as Latin-1
+# =============================================================================
+
+def _fix_mojibake(s: str) -> str:
+    """
+    Re-encode as Latin-1 and decode as UTF-8 to recover characters like
+    em-dashes, arrows, and emoji that got mangled during LLM streaming.
+    Falls back to the original string if the round-trip fails.
+    """
+    if not s:
+        return s
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return s
+
+
+# =============================================================================
+# BROADCAST / STREAM QUEUES
+# =============================================================================
+
 _stream_queues: "list[queue.Queue]" = []
 _stream_queues_lock = threading.Lock()
 
 
 def _broadcast(item: tuple) -> None:
+    kind, payload = item
+    # Sanitize text payloads so Unicode renders correctly in the browser
+    if kind in ("token", "status", "tool", "error", "done") and isinstance(payload, str):
+        payload = _fix_mojibake(payload)
+    item = (kind, payload)
     _chatlog_append(item)
     with _stream_queues_lock:
         for q in _stream_queues:
@@ -368,7 +395,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>LMAgent</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -520,73 +547,113 @@ header {
 .msg.agent .msg-label { color: var(--teal); }
 
 .msg-body {
-  padding: 11px 15px; border-radius: var(--r);
+  padding: 13px 16px; border-radius: var(--r);
   border: 1px solid var(--border);
-  word-break: break-word; overflow-x: auto; line-height: 1.75;
+  word-break: break-word; overflow-x: auto;
 }
-.msg.user  .msg-body { background: var(--user-bg); border-color: var(--user-bdr); white-space: pre-wrap; }
-.msg.agent .msg-body { background: var(--agent-bg); border-color: var(--agent-bdr); }
+.msg.user  .msg-body {
+  background: var(--user-bg); border-color: var(--user-bdr);
+  white-space: pre-wrap; line-height: 1.65;
+}
+
+/* ── Agent bubble: readable sans-serif prose ── */
+.msg.agent .msg-body {
+  background: var(--agent-bg); border-color: var(--agent-bdr);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--text);
+}
 
 .msg.agent .msg-body h1,.msg.agent .msg-body h2,
 .msg.agent .msg-body h3,.msg.agent .msg-body h4 {
   font-family: var(--sans); font-weight: 600;
-  color: var(--text); margin: .9em 0 .3em; line-height: 1.3;
+  color: var(--text); margin: 1em 0 .35em; line-height: 1.3;
 }
-.msg.agent .msg-body h1 { font-size: 1.25em; border-bottom: 1px solid var(--border2); padding-bottom: .25em; }
-.msg.agent .msg-body h2 { font-size: 1.1em; }
-.msg.agent .msg-body h3 { font-size: 1em; }
-.msg.agent .msg-body p  { margin: .4em 0; }
+.msg.agent .msg-body h1 {
+  font-size: 1.2em;
+  border-bottom: 1px solid var(--border2);
+  padding-bottom: .3em;
+}
+.msg.agent .msg-body h2 { font-size: 1.05em; }
+.msg.agent .msg-body h3 { font-size: 1em; color: var(--text2); }
+.msg.agent .msg-body p  { margin: .5em 0; }
 .msg.agent .msg-body p:first-child { margin-top: 0; }
 .msg.agent .msg-body p:last-child  { margin-bottom: 0; }
 .msg.agent .msg-body strong { color: var(--text); font-weight: 600; }
 .msg.agent .msg-body em     { font-style: italic; color: var(--text2); }
 .msg.agent .msg-body del    { text-decoration: line-through; color: var(--text3); }
-.msg.agent .msg-body a { color: var(--teal); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
+.msg.agent .msg-body a {
+  color: var(--teal); text-decoration: underline;
+  text-underline-offset: 2px; word-break: break-all;
+}
 .msg.agent .msg-body a:hover { color: var(--amber); }
+
+/* inline code stays monospace */
 .msg.agent .msg-body code {
   background: var(--code-bg); border: 1px solid var(--code-bdr);
-  border-radius: 3px; padding: 0px 5px;
-  font-family: var(--mono); font-size: .86em; color: var(--amber);
+  border-radius: 3px; padding: 1px 6px;
+  font-family: var(--mono); font-size: .82em; color: var(--amber);
 }
+/* code blocks */
 .msg.agent .msg-body pre {
   background: var(--code-bg); border: 1px solid var(--code-bdr);
-  border-radius: 6px; padding: 12px 14px; overflow-x: auto;
-  margin: .6em 0; position: relative;
+  border-radius: 6px; padding: 13px 15px; overflow-x: auto;
+  margin: .7em 0; position: relative;
 }
-.msg.agent .msg-body pre code { background: none; border: none; padding: 0; font-size: .83em; color: var(--text2); white-space: pre; }
-.msg.agent .msg-body pre .lang { position: absolute; top: 7px; right: 9px; font-size: 9px; color: var(--text3); text-transform: uppercase; letter-spacing: .06em; }
+.msg.agent .msg-body pre code {
+  background: none; border: none; padding: 0;
+  font-size: .83em; color: var(--text2); white-space: pre;
+  font-family: var(--mono);
+}
+.msg.agent .msg-body pre .lang {
+  position: absolute; top: 7px; right: 9px;
+  font-size: 9px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .06em;
+  font-family: var(--mono);
+}
 .msg.agent .msg-body ul,
-.msg.agent .msg-body ol { padding-left: 1.5em; margin: .4em 0; }
-.msg.agent .msg-body li { margin: .15em 0; }
+.msg.agent .msg-body ol { padding-left: 1.5em; margin: .5em 0; }
+.msg.agent .msg-body li { margin: .2em 0; }
 .msg.agent .msg-body blockquote {
-  border-left: 2px solid var(--teal-dim); margin: .4em 0;
-  padding: .2em .7em .2em .9em; color: var(--text2);
+  border-left: 2px solid var(--teal-dim); margin: .5em 0;
+  padding: .25em .8em .25em 1em; color: var(--text2);
   background: rgba(62,207,178,.04); border-radius: 0 4px 4px 0;
+  font-style: italic;
 }
-.msg.agent .msg-body hr { border: none; border-top: 1px solid var(--border2); margin: .8em 0; }
-.msg.agent .msg-body table { border-collapse: collapse; width: 100%; margin: .5em 0; font-size: .88em; }
+.msg.agent .msg-body hr { border: none; border-top: 1px solid var(--border2); margin: .9em 0; }
+.msg.agent .msg-body table {
+  border-collapse: collapse; width: 100%;
+  margin: .6em 0; font-size: .88em; font-family: var(--mono);
+}
 .msg.agent .msg-body th,
 .msg.agent .msg-body td { border: 1px solid var(--border2); padding: 5px 10px; text-align: left; }
 .msg.agent .msg-body th { background: var(--surface2); color: var(--text2); font-weight: 600; }
 .msg.agent .msg-body tr:nth-child(even) td { background: rgba(255,255,255,.015); }
 
+/* system / status messages */
 .msg.sys .msg-label { display: none; }
 .msg.sys .msg-body {
   background: transparent; border: none;
   border-left: 2px solid var(--border2); border-radius: 0;
   padding: 2px 10px; color: var(--text3);
   font-size: 11.5px; font-style: italic; white-space: pre-wrap;
+  font-family: var(--mono);
 }
 .msg.sys.err  .msg-body { border-left-color: var(--red);    color: #c07070; }
 .msg.sys.ok   .msg-body { border-left-color: var(--green);  color: #60b070; }
 .msg.sys.warn .msg-body { border-left-color: var(--amber);  color: #b08040; }
-.msg.sys.info .msg-body { border-left-color: var(--purple); color: var(--text2); font-style: normal; font-size: 12px; }
+.msg.sys.info .msg-body {
+  border-left-color: var(--purple); color: var(--text2);
+  font-style: normal; font-size: 12px;
+}
 
 .tool-group { display: flex; flex-direction: column; padding: 2px 0; }
 .tool-row {
   display: flex; align-items: center; gap: 6px;
   padding: 1px 0 1px 12px; font-size: 11px; color: var(--text3);
   min-height: 19px; animation: fadeUp .1s ease both;
+  font-family: var(--mono);
 }
 .tr-icon { width: 11px; flex-shrink: 0; font-size: 10px; transition: color .2s; }
 .tr-name { color: var(--text2); font-weight: 500; }
@@ -598,6 +665,7 @@ header {
 .tool-more {
   font-size: 10px; color: var(--text3);
   padding: 1px 0 1px 12px; cursor: pointer; transition: color .12s;
+  font-family: var(--mono);
 }
 .tool-more:hover { color: var(--text2); }
 
@@ -624,7 +692,7 @@ header {
   display: flex; align-items: center; gap: 7px;
   padding: 4px 16px; font-size: 11px; color: var(--text3);
   border-top: 1px solid var(--border); background: var(--surface);
-  flex-shrink: 0; min-height: 24px;
+  flex-shrink: 0; min-height: 24px; font-family: var(--mono);
 }
 .dot {
   width: 5px; height: 5px; border-radius: 50%;
@@ -737,7 +805,7 @@ header {
 .tool-entry:hover { background: var(--surface2); border-color: var(--border); }
 .te-name { font-size: 12px; color: var(--text); font-weight: 500; }
 .te-params { color: var(--text3); font-size: 11px; font-weight: 400; }
-.te-desc { font-size: 11px; color: var(--text2); margin-top: 1px; line-height: 1.4; }
+.te-desc { font-size: 11px; color: var(--text2); margin-top: 1px; line-height: 1.4; font-family: var(--sans); }
 
 #overlay {
   display: none; position: fixed; inset: 0;
@@ -764,7 +832,7 @@ header {
 <div id="app">
   <header>
     <div class="logo">
-      <div class="logo-mark">λ</div>
+      <div class="logo-mark">&#955;</div>
       LMAgent
       <span class="logo-sub">v6.5.1</span>
     </div>
@@ -780,13 +848,13 @@ header {
   <div id="messages">
     <div id="replay-banner"></div>
     <div id="empty">
-      <div class="empty-glyph">λ_</div>
+      <div class="empty-glyph">&#955;_</div>
       <p>Send a message to start</p>
       <div class="hint">/ for commands</div>
     </div>
   </div>
 
-  <button id="scroll-btn" onclick="Scroll.jump()" title="↓">↓</button>
+  <button id="scroll-btn" onclick="Scroll.jump()" title="&#8595;">&#8595;</button>
 
   <div id="status-bar">
     <div class="dot" id="dot"></div>
@@ -798,7 +866,7 @@ header {
   <div id="input-area">
     <div id="palette"></div>
     <div id="input-row">
-      <textarea id="msg-input" rows="1" placeholder="Message or /command…"
+      <textarea id="msg-input" rows="1" placeholder="Message or /command&hellip;"
         onkeydown="Palette.onKey(event)"
         oninput="Palette.onInput(this)"></textarea>
       <button id="send-btn" onclick="Agent.sendOrStop()">Send</button>
@@ -811,7 +879,7 @@ header {
 <div class="panel" id="sessions-panel">
   <div class="panel-hdr">
     <span>Sessions</span>
-    <button class="btn" onclick="UI.closeSessions()">✕</button>
+    <button class="btn" onclick="UI.closeSessions()">&#x2715;</button>
   </div>
   <div id="sessions-list"></div>
 </div>
@@ -819,14 +887,30 @@ header {
 <div class="panel" id="tools-panel">
   <div class="panel-hdr">
     <span>Tools</span>
-    <button class="btn" onclick="UI.closeTools()">✕</button>
+    <button class="btn" onclick="UI.closeTools()">&#x2715;</button>
   </div>
-  <input id="tools-search" placeholder="Filter…" oninput="ToolsPanel.filter(this.value)">
+  <input id="tools-search" placeholder="Filter&hellip;" oninput="ToolsPanel.filter(this.value)">
   <div id="tools-list"></div>
 </div>
 
 <script>
 'use strict';
+
+// ═══════════════════════════════════════════════════════════════
+// UNICODE SANITIZER  — fix mojibake before rendering
+// ═══════════════════════════════════════════════════════════════
+function fixMojibake(s) {
+  if (!s) return s;
+  try {
+    // Encode each char as its char-code byte array, then decode as UTF-8
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (_) {
+    return s; // already valid or unfixable — return as-is
+  }
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // MARKDOWN
@@ -984,7 +1068,7 @@ const ConnDot = (() => {
   return {
     ok()  { el().className = 'conn-dot ok'; el().title = 'Stream connected'; },
     err() { el().className = 'conn-dot err'; el().title = 'Stream disconnected'; },
-    try() { el().className = 'conn-dot try'; el().title = 'Reconnecting…'; },
+    try() { el().className = 'conn-dot try'; el().title = 'Reconnecting\u2026'; },
   };
 })();
 
@@ -997,7 +1081,7 @@ const Replay = (() => {
     if (!events || !events.length) return;
 
     const banner = document.getElementById('replay-banner');
-    banner.textContent = `↩ restored ${events.length} events from this session`;
+    banner.textContent = `\u21a9 restored ${events.length} events from this session`;
     banner.classList.add('show');
     setTimeout(() => banner.classList.remove('show'), 3000);
 
@@ -1007,7 +1091,7 @@ const Replay = (() => {
     function flushTokens() {
       if (!tokenBuf.trim()) { tokenBuf = ''; return; }
       const body = Messages.add('agent', '', '', false);
-      body.innerHTML = MD.render(tokenBuf) || tokenBuf;
+      body.innerHTML = MD.render(fixMojibake(tokenBuf)) || fixMojibake(tokenBuf);
       tokenBuf = '';
     }
 
@@ -1023,9 +1107,9 @@ const Replay = (() => {
         row.className = 'tool-row';
         const ok = t.ok;
         row.dataset.s = ok === null ? 'pending' : (ok ? 'ok' : 'fail');
-        const icon = ok === null ? '◌' : (ok ? '✓' : '✗');
+        const icon = ok === null ? '\u25cc' : (ok ? '\u2713' : '\u2717');
         const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        const preview = t.args ? t.args.slice(0, 50) + (t.args.length > 50 ? '…' : '') : '';
+        const preview = t.args ? t.args.slice(0, 50) + (t.args.length > 50 ? '\u2026' : '') : '';
         row.innerHTML = `<span class="tr-icon">${icon}</span><span class="tr-name">${esc(t.name)}</span>${preview ? `<span class="tr-args">(${esc(preview)})</span>` : ''}`;
         group.appendChild(row);
       }
@@ -1043,10 +1127,10 @@ const Replay = (() => {
         if (lastWasToken) { flushTokens(); }
         lastWasToken = false;
         const t = payload;
-        if (t.startsWith('✓') || t.startsWith('✗')) {
+        if (t.startsWith('\u2713') || t.startsWith('\u2717')) {
           const name = t.slice(1).trim();
           const item = [...toolGroupItems].reverse().find(x => x.name === name && x.ok === null);
-          if (item) item.ok = t.startsWith('✓');
+          if (item) item.ok = t.startsWith('\u2713');
         } else {
           flushTokens();
           const m    = t.match(/^([^(]+)\(?(.*?)\)?$/s);
@@ -1059,7 +1143,7 @@ const Replay = (() => {
         flushTools();
         lastWasToken = false;
         const m = String(payload).match(/(\d+)\/(\d+)/);
-        if (m) Messages.sys(`— iteration ${m[1]}/${m[2]} —`, 'info');
+        if (m) Messages.sys(`\u2014 iteration ${m[1]}/${m[2]} \u2014`, 'info');
       } else if (kind === 'done') {
         flushTokens();
         flushTools();
@@ -1068,7 +1152,7 @@ const Replay = (() => {
         flushTokens();
         flushTools();
         lastWasToken = false;
-        Messages.sys('⚠ ' + payload, 'err');
+        Messages.sys('\u26a0 ' + payload, 'err');
       }
     }
 
@@ -1125,7 +1209,7 @@ const Stream = (() => {
   }
 
   function token(tok) {
-    buf += tok;
+    buf += fixMojibake(tok);
     clearTimeout(timer);
     timer = setTimeout(flush, 35);
   }
@@ -1178,8 +1262,8 @@ const Tools = (() => {
     const row = document.createElement('div');
     row.className = 'tool-row';
     row.dataset.s = 'pending';
-    const preview = args ? (args.slice(0, 50) + (args.length > 50 ? '…' : '')) : '';
-    row.innerHTML = `<span class="tr-icon">◌</span><span class="tr-name">${esc(name)}</span>${preview ? `<span class="tr-args">(${esc(preview)})</span>` : ''}`;
+    const preview = args ? (args.slice(0, 50) + (args.length > 50 ? '\u2026' : '')) : '';
+    row.innerHTML = `<span class="tr-icon">\u25cc</span><span class="tr-name">${esc(name)}</span>${preview ? `<span class="tr-args">(${esc(preview)})</span>` : ''}`;
     if (!pending.has(name)) pending.set(name, []);
     pending.get(name).push(row);
     return row;
@@ -1199,7 +1283,7 @@ const Tools = (() => {
         g.appendChild(more);
       }
       const n = count - MAX;
-      more.textContent = `+${n} more call${n !== 1 ? 's' : ''} — click to expand`;
+      more.textContent = `+${n} more call${n !== 1 ? 's' : ''} \u2014 click to expand`;
       const row = makeRow(name, args);
       row.dataset.hidden = '1'; row.style.display = 'none';
       g.insertBefore(row, more);
@@ -1216,7 +1300,7 @@ const Tools = (() => {
     if (!q.length) pending.delete(name);
     if (!row) return;
     row.dataset.s = ok ? 'ok' : 'fail';
-    row.querySelector('.tr-icon').textContent = ok ? '✓' : '✗';
+    row.querySelector('.tr-icon').textContent = ok ? '\u2713' : '\u2717';
   }
 
   function reset() { pending.clear(); endGroup(); }
@@ -1281,22 +1365,18 @@ const Agent = (() => {
 
         if (d.state === 'running' && state === 'idle') {
           transition('running');
-          Status.set('running…', 'run');
+          Status.set('running\u2026', 'run');
         } else if (d.state === 'waiting' && state === 'idle') {
           transition('waiting');
-          Status.set('waiting — scheduled resume…', 'wait');
-          Messages.sys('⏰ Session waiting — will resume automatically', 'warn');
-
-        // ── FIX: recover from freeze when server already finished but
-        //         the browser missed the `done` event (dropped SSE connection).
-        //         Without this the UI stays permanently locked after completion.
+          Status.set('waiting \u2014 scheduled resume\u2026', 'wait');
+          Messages.sys('\u23f0 Session waiting \u2014 will resume automatically', 'warn');
         } else if (d.state === 'idle' && state !== 'idle') {
           Stream.finalize();
           Tools.endGroup();
           transition('idle');
           Status.set('done', 'done');
           Status.iter('');
-          Messages.sys('✓ task finished', 'ok');
+          Messages.sys('\u2713 task finished', 'ok');
           document.getElementById('msg-input').focus();
         }
         break;
@@ -1315,8 +1395,8 @@ const Agent = (() => {
 
       case 'tool': {
         const t = evt.data;
-        if (t.startsWith('✓') || t.startsWith('✗')) {
-          Tools.resolve(t.slice(1).trim(), t.startsWith('✓'));
+        if (t.startsWith('\u2713') || t.startsWith('\u2717')) {
+          Tools.resolve(t.slice(1).trim(), t.startsWith('\u2713'));
         } else {
           Stream.finalize();
           const m    = t.match(/^([^(]+)\(?(.*?)\)?$/s);
@@ -1338,7 +1418,7 @@ const Agent = (() => {
           Stream.finalize();
           Tools.endGroup();
           if (_hadContent) {
-            Messages.sys(`— iteration ${m[1]}/${m[2]} —`, 'info');
+            Messages.sys(`\u2014 iteration ${m[1]}/${m[2]} \u2014`, 'info');
           }
           _hadContent = false;
           Status.iter(`${m[1]}/${m[2]}`);
@@ -1353,7 +1433,7 @@ const Agent = (() => {
       case 'error':
         Stream.finalize();
         Tools.endGroup();
-        Messages.sys('⚠ ' + evt.data, 'err');
+        Messages.sys('\u26a0 ' + evt.data, 'err');
         transition('idle');
         Status.set('error', 'err');
         Status.iter('');
@@ -1371,23 +1451,19 @@ const Agent = (() => {
 
     if (isWait) {
       transition('waiting');
-      Status.set('waiting — will resume automatically', 'wait');
-      Messages.sys('⏸ ' + reason, 'warn');
+      Status.set('waiting \u2014 will resume automatically', 'wait');
+      Messages.sys('\u23f8 ' + reason, 'warn');
     } else {
       transition('idle');
       Status.set(reason || 'done', isErr ? 'err' : 'done');
 
-      // ── FIX: show a visible completion notice in the chat so the user
-      //         doesn't have to look at the status bar to know it's done.
       if (isErr) {
         if (reason === 'stopped') {
-          Messages.sys('— stopped —', 'warn');
+          Messages.sys('\u2014 stopped \u2014', 'warn');
         }
-        // 'error' case is already handled by the 'error' event handler above
       } else {
-        // Successful completion: show friendly green confirmation
-        const label = reason && reason !== 'done ✓' ? reason : 'task finished';
-        Messages.sys('✓ ' + label, 'ok');
+        const label = reason && reason !== 'done \u2713' ? reason : 'task finished';
+        Messages.sys('\u2713 ' + label, 'ok');
       }
 
       document.getElementById('msg-input').focus();
@@ -1400,7 +1476,7 @@ const Agent = (() => {
     Messages.add('user', text);
     Scroll.pin();
     transition('running');
-    Status.set('thinking…', 'run');
+    Status.set('thinking\u2026', 'run');
     Tools.reset();
     _hadContent = false;
 
@@ -1430,7 +1506,7 @@ const Agent = (() => {
     if (state === 'waiting') {
       transition('idle');
       Status.set('wait dismissed', '');
-      Messages.sys('— wait dismissed (session saved) —', 'warn');
+      Messages.sys('\u2014 wait dismissed (session saved) \u2014', 'warn');
       return;
     }
     if (state !== 'running') return;
@@ -1445,7 +1521,7 @@ const Agent = (() => {
     }
     Stream.finalize();
     Tools.endGroup();
-    Messages.sys('— stopped —', 'warn');
+    Messages.sys('\u2014 stopped \u2014', 'warn');
     transition('idle');
     Status.set('stopped', '');
     Status.iter('');
@@ -1460,7 +1536,7 @@ const Agent = (() => {
     Tools.reset();
     Stream.reset();
     document.getElementById('messages').innerHTML =
-      '<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">λ_</div><p>Send a message to start</p><div class="hint">/ for commands</div></div>';
+      '<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">&#955;_</div><p>Send a message to start</p><div class="hint">/ for commands</div></div>';
     Status.set('ready', '');
     Status.iter('');
     document.getElementById('msg-input').focus();
@@ -1587,7 +1663,7 @@ const SlashCmds = (() => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode: arg }),
           }).then(r => r.json());
-          if (r.ok) { Status.mode(arg); sys(`Mode → ${arg}`, 'ok'); }
+          if (r.ok) { Status.mode(arg); sys(`Mode \u2192 ${arg}`, 'ok'); }
           else      { sys(`Invalid mode '${arg}'. Use: auto, normal, manual`, 'err'); }
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
         break;
@@ -1678,7 +1754,7 @@ const SessionsPanel = (() => {
 
   async function load() {
     const list = document.getElementById('sessions-list');
-    list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading…</div>';
+    list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
     try {
       const sessions = await fetch('/sessions').then(r => r.json());
       list.innerHTML = '';
@@ -1686,7 +1762,7 @@ const SessionsPanel = (() => {
       for (const s of sessions) {
         const d = document.createElement('div');
         d.className = 'session-item' + (s.id === Agent.getSession() ? ' active' : '');
-        d.innerHTML = `<div class="si-id">${esc(s.id)}</div><div class="si-task">${esc(s.task||'—')}</div><div class="si-stat ${esc(s.status)}">${esc(s.status)} · ${s.iterations} iter</div>`;
+        d.innerHTML = `<div class="si-id">${esc(s.id)}</div><div class="si-task">${esc(s.task||'\u2014')}</div><div class="si-stat ${esc(s.status)}">${esc(s.status)} \u00b7 ${s.iterations} iter</div>`;
         d.onclick = () => {
           if (Agent.running()) return;
           Agent.setSession(s.id);
@@ -1712,7 +1788,7 @@ const ToolsPanel = (() => {
 
   async function load() {
     const list = document.getElementById('tools-list');
-    list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading…</div>';
+    list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
     try {
       data = await fetch('/tools').then(r => r.json());
       render('');
@@ -1860,7 +1936,7 @@ def _scheduler_loop():
                     _set_agent_state("idle")
 
                 label = {
-                    "completed":      "done ✓",
+                    "completed":      "done \u2713",
                     "waiting":        f"waiting until {result.wait_until}",
                     "max_iterations": "max iterations reached",
                     "error":          "error",
@@ -1880,7 +1956,7 @@ def _scheduler_loop():
 
         acquired = _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT)
         if not acquired:
-            _broadcast(("error", "agent lock timeout — server may need restart"))
+            _broadcast(("error", "agent lock timeout \u2014 server may need restart"))
             _broadcast(("done", "error"))
             with _running_lock:
                 _running.discard(sid)
@@ -2036,7 +2112,7 @@ def chat():
                     _set_agent_state("idle")
 
                 label = {
-                    "completed":      "done ✓",
+                    "completed":      "done \u2713",
                     "waiting":        f"waiting until {result.wait_until}",
                     "max_iterations": "max iterations reached",
                     "error":          "error",
@@ -2070,7 +2146,7 @@ def chat():
     def locked_run():
         acquired = _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT)
         if not acquired:
-            _broadcast(("error", "agent busy — try again in a moment"))
+            _broadcast(("error", "agent busy \u2014 try again in a moment"))
             _broadcast(("done", "error"))
             _set_agent_state("idle")
             with _stop_events_lock:
@@ -2109,7 +2185,7 @@ def status():
 
 @app.route("/soul")
 def get_soul():
-    return jsonify({"soul": soul or "(no soul config — create .soul.md in workspace)"})
+    return jsonify({"soul": soul or "(no soul config \u2014 create .soul.md in workspace)"})
 
 
 @app.route("/mode", methods=["POST"])
@@ -2143,7 +2219,7 @@ def run_cmd():
             todos  = result.get("todos", [])
             if not todos:
                 return jsonify({"text": "No todos yet."})
-            icons = {"pending": "⏳", "in_progress": "🔄", "completed": "✅", "blocked": "🚫"}
+            icons = {"pending": "\u23f3", "in_progress": "\U0001f504", "completed": "\u2705", "blocked": "\U0001f6ab"}
             lines = [f"Todos ({result['completed']}/{result['total']} done):"]
             for t in todos:
                 lines.append(f"  {icons.get(t['status'],'?')} #{t['id']} [{t['status']}] {t['description']}")
@@ -2208,24 +2284,26 @@ if __name__ == "__main__":
 
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
-    print("\n" + "═" * 58)
+    print("\n" + "\u2550" * 58)
     print("  LMAgent Web  v6.5.1")
-    print("═" * 58)
-    print(f"  Local  →  http://localhost:{port}")
-    print(f"  Phone  →  http://{ip}:{port}")
+    print("\u2550" * 58)
+    print(f"  Local  \u2192  http://localhost:{port}")
+    print(f"  Phone  \u2192  http://{ip}:{port}")
     print(f"  Workspace : {WORKSPACE}")
     print(f"  LLM       : {Config.LLM_URL}")
     print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
-    print("═" * 58)
-    print("  Modular import: agent_core + agent_tools + agent_main ✓")
-    print("  Cross-platform shell (bash/PowerShell) ✓")
-    print("  Freeze fix: lock acquire timeout ✓")
-    print("  Watchdog: unblocks UI if agent thread dies unexpectedly ✓")
-    print("  Persistent chat: in-memory replay on reconnect ✓")
-    print("  New session clears chat log ✓")
-    print("  Unicode SSE ✓  Blank iteration suppression ✓")
-    print("  FIX: Completion message shown in chat ✓")
-    print("  FIX: UI recovers from freeze on SSE reconnect ✓")
-    print("═" * 58 + "\n")
+    print("\u2550" * 58)
+    print("  Modular import: agent_core + agent_tools + agent_main \u2713")
+    print("  Cross-platform shell (bash/PowerShell) \u2713")
+    print("  Mojibake fix: UTF-8 chars render correctly \u2713")
+    print("  Freeze fix: lock acquire timeout \u2713")
+    print("  Watchdog: unblocks UI if agent thread dies unexpectedly \u2713")
+    print("  Persistent chat: in-memory replay on reconnect \u2713")
+    print("  New session clears chat log \u2713")
+    print("  Unicode SSE \u2713  Blank iteration suppression \u2713")
+    print("  FIX: Completion message shown in chat \u2713")
+    print("  FIX: UI recovers from freeze on SSE reconnect \u2713")
+    print("  FIX: Agent prose uses readable sans-serif font \u2713")
+    print("\u2550" * 58 + "\n")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
