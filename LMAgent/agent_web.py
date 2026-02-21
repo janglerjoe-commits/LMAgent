@@ -6,6 +6,27 @@ LMAgent Web — v6.5.1
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
   agent_main.py   — run_agent()
 
+Place this file next to those three files.
+
+Changes vs v6.5:
+  - FIX: onDone() now appends a visible "✓ done" chat message so the user
+    sees task completion without staring at the status bar.
+  - FIX: SSE reconnect handler detects a stuck running/waiting state when
+    the server reports idle (missed `done` event due to dropped connection)
+    and cleanly transitions the UI back to idle — eliminating the freeze
+    that previously required a full page reload.
+  - FIX: Mojibake sanitization — UTF-8 special chars (em-dashes, arrows,
+    emoji) that were decoded as Latin-1 now render correctly.
+  - FIX: Agent bubble uses readable sans-serif prose; code stays monospace.
+
+Cross-platform changes (v6.5-cross):
+  - Config.WORKSPACE resolution deferred to after Config.init() so the
+    workspace picker in agent_main._pick_workspace() is honoured when this
+    module is imported standalone (e.g. python agent_web.py).
+  - _TOOL_CATEGORIES System list includes "shell" alongside "powershell" so
+    the Tools panel in the browser shows both aliases correctly.
+  - No direct shell calls in this file; relies entirely on agent_core /
+    agent_tools for cross-platform behaviour.
 """
 
 import json
@@ -2295,7 +2316,15 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "\u2550" * 58)
-  
+    print("  LMAgent Web  v6.5.1")
+    print("\u2550" * 58)
+    print(f"  Local  \u2192  http://localhost:{port}")
+    print(f"  Phone  \u2192  http://{ip}:{port}")
+    print(f"  Workspace : {WORKSPACE}")
+    print(f"  LLM       : {Config.LLM_URL}")
+    print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
+    print("\u2550" * 58)
+
     print("  FIX: Agent prose uses readable sans-serif font \u2713")
     print("\u2550" * 58 + "\n")
 
