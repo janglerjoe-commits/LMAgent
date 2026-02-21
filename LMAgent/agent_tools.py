@@ -2,11 +2,23 @@
 """
 agent_tools.py — Tool layer for LMAgent.
 
-Depends on: agent_core.py
+Sandbox patch v9.5.0-sandbox:
+  - Re-introduces the shell tool using a cross-platform sandboxed subprocess.
+  - Windows + pywin32  : Windows Job Object (kill_on_job_close, memory limit).
+  - Windows, no pywin32: psutil process-tree kill on timeout.
+  - macOS / Linux      : os.setsid() process group + RLIMIT_AS + RLIMIT_CPU.
+  - All paths still validated through Safety.validate_command() before execution.
+  - sandboxed_shell.py must live in the same directory as this file.
+  - pip install psutil        # all platforms
+  - pip install pywin32       # Windows only — stronger Job Object backend
+
+All other behaviour is unchanged from v9.4.0-nosell.
 """
 
 import json
+import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -17,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from agent_core import (
-    Config, Colors, Log, PermissionMode,
+    Config, Colors, Log, PermissionMode, _IS_WINDOWS,
     truncate_output, strip_thinking,
     get_current_context, set_current_context, _get_ctx,
     Safety, FileEditor,
@@ -26,10 +38,49 @@ from agent_core import (
     SessionManager, LoopDetector,
     colored,
 )
+from sandboxed_shell import run_sandboxed, sandbox_info
 
-# Backward-compat alias — any external code that imported get_powershell_session
-# from agent_tools will still work without modification.
+# Backward-compat alias for any external code that imported get_powershell_session.
 get_powershell_session = get_shell_session
+
+
+# =============================================================================
+# SHELL QUOTING UTILITIES  (used only by git helpers — not exposed to LLM)
+# =============================================================================
+
+def _shell_quote(s: str) -> str:
+    if _IS_WINDOWS:
+        escaped = s.replace("`", "``").replace('"', '`"').replace("$", "`$")
+        return f'"{escaped}"'
+    return shlex.quote(s)
+
+
+_GIT_REF_RE = re.compile(r'^[A-Za-z0-9_.\-/]+$')
+
+
+def _validate_git_ref(name: str) -> Tuple[bool, str]:
+    if not name:
+        return False, "Empty ref name"
+    if not _GIT_REF_RE.match(name):
+        bad = sorted({c for c in name if not re.match(r'[A-Za-z0-9_.\-/]', c)})
+        return False, (
+            f"Ref name '{name}' contains disallowed characters: {bad!r}. "
+            "Only alphanumerics, hyphens, underscores, dots, and slashes are permitted."
+        )
+    if ".." in name:
+        return False, f"Ref name '{name}' contains '..' (path-traversal sequence)"
+    return True, ""
+
+
+# =============================================================================
+# SECURE GIT EXECUTION HELPER  (internal only — not a tool the LLM can call)
+# =============================================================================
+
+def _git_safe(workspace: Path, cmd: str) -> Tuple[str, int]:
+    ok, reason = Safety.validate_command(cmd, workspace)
+    if not ok:
+        raise ValueError(reason)
+    return get_shell_session(workspace).execute(cmd)
 
 
 # =============================================================================
@@ -37,7 +88,6 @@ get_powershell_session = get_shell_session
 # =============================================================================
 
 def _unpack_tc(tc: Dict[str, Any], fallback_id: str) -> Tuple[str, str, str]:
-    """Return (fn_name, args_raw, tc_id) from a raw tool-call dict."""
     fn = tc.get("function") or {}
     return (
         fn.get("name", "").strip(),
@@ -47,7 +97,6 @@ def _unpack_tc(tc: Dict[str, Any], fallback_id: str) -> Tuple[str, str, str]:
 
 
 def _parse_tool_args(fn_name: str, args_raw: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Returns (args_dict, None) on success or (None, error_message) on failure."""
     if not args_raw or not args_raw.strip():
         return {}, None
     try:
@@ -72,28 +121,12 @@ def tool_get_time(workspace: Path) -> Dict[str, Any]:
     }
 
 
-def tool_shell(workspace: Path, command: str) -> Dict[str, Any]:
-    """Execute a shell command. Uses PowerShell on Windows, /bin/bash on Linux/macOS."""
-    ok, err = Safety.validate_command(command)
-    if not ok:
-        return {"success": False, "error": err}
-    try:
-        output, code = get_shell_session(workspace).execute(command, timeout=60)
-        return {"success":   code == 0,
-                "stdout":    truncate_output(output, Config.MAX_TOOL_OUTPUT),
-                "exit_code": code}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# Backward-compat alias — TOOL_HANDLERS exposes both "shell" and "powershell".
-tool_powershell = tool_shell
-
-
 def tool_read(workspace: Path, path: str) -> Dict[str, Any]:
     ok, err, fp = Safety.validate_path(workspace, path, must_exist=True)
-    if not ok: return {"success": False, "error": err}
-    if not fp.is_file(): return {"success": False, "error": "Not a file"}
+    if not ok:
+        return {"success": False, "error": err}
+    if not fp.is_file():
+        return {"success": False, "error": "Not a file"}
     if fp.suffix.lower() in Config.BINARY_EXTS:
         return {"success": False, "error": "Cannot read binary file"}
     try:
@@ -107,7 +140,8 @@ def tool_read(workspace: Path, path: str) -> Dict[str, Any]:
 
 def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
     ok, err, fp = Safety.validate_path(workspace, path)
-    if not ok: return {"success": False, "error": err}
+    if not ok:
+        return {"success": False, "error": err}
     if fp.exists() and fp.suffix.lower() in Config.BINARY_EXTS:
         return {"success": False, "error": "Cannot overwrite binary file"}
     try:
@@ -115,8 +149,7 @@ def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
         fp.parent.mkdir(parents=True, exist_ok=True)
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
-        import os as _os
-        _os.replace(str(tmp), str(fp))  # atomic on both Windows and POSIX
+        os.replace(str(tmp), str(fp))
         return {"success": True,
                 "path":    str(fp.relative_to(workspace)).replace("\\", "/"),
                 "action":  "modified" if existed else "created",
@@ -127,17 +160,16 @@ def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
 
 def tool_edit(workspace: Path, path: str, search: str, replace: str) -> Dict[str, Any]:
     ok, err, fp = Safety.validate_path(workspace, path, must_exist=True)
-    if not ok: return {"success": False, "error": err}
+    if not ok:
+        return {"success": False, "error": err}
     try:
         content = fp.read_text(encoding="utf-8", errors="replace")
         success, new_content, msg = FileEditor.search_replace(content, search, replace)
         if not success:
             return {"success": False, "error": truncate_output(msg, 500)}
-        # Atomic write — same pattern as tool_write so a crash can't corrupt the file.
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(new_content, encoding="utf-8")
-        import os as _os
-        _os.replace(str(tmp), str(fp))
+        os.replace(str(tmp), str(fp))
         return {"success": True,
                 "path":    str(fp.relative_to(workspace)).replace("\\", "/"),
                 "method":  msg}
@@ -172,7 +204,8 @@ def tool_grep(workspace: Path, pattern: str,
                     search_files.extend(workspace.glob(p))
                 else:
                     fp = workspace / p
-                    if fp.exists(): search_files.append(fp)
+                    if fp.exists():
+                        search_files.append(fp)
         else:
             search_files = [f for f in workspace.rglob("*")
                             if f.is_file()
@@ -188,8 +221,10 @@ def tool_grep(workspace: Path, pattern: str,
                                 "line":    i,
                                 "content": line.rstrip()[:200],
                             })
-                        if len(matches) >= Config.MAX_GREP_RESULTS: break
-                if len(matches) >= Config.MAX_GREP_RESULTS: break
+                        if len(matches) >= Config.MAX_GREP_RESULTS:
+                            break
+                if len(matches) >= Config.MAX_GREP_RESULTS:
+                    break
             except Exception:
                 continue
         return {"success":   True,
@@ -201,14 +236,18 @@ def tool_grep(workspace: Path, pattern: str,
 
 def tool_ls(workspace: Path, path: str = ".") -> Dict[str, Any]:
     ok, err, dp = Safety.validate_path(workspace, path)
-    if not ok: return {"success": False, "error": err}
-    if not dp.exists(): return {"success": False, "error": "Path does not exist"}
-    if not dp.is_dir():  return {"success": False, "error": "Not a directory"}
+    if not ok:
+        return {"success": False, "error": err}
+    if not dp.exists():
+        return {"success": False, "error": "Path does not exist"}
+    if not dp.is_dir():
+        return {"success": False, "error": "Not a directory"}
     try:
         all_entries = list(dp.iterdir())
         entries     = []
         for item in sorted(all_entries)[:Config.MAX_LS_ENTRIES]:
-            if item.name.startswith("."): continue
+            if item.name.startswith("."):
+                continue
             stat = item.stat()
             entries.append({"name": item.name,
                              "type": "dir" if item.is_dir() else "file",
@@ -222,9 +261,11 @@ def tool_ls(workspace: Path, path: str = ".") -> Dict[str, Any]:
 
 def tool_mkdir(workspace: Path, path: str) -> Dict[str, Any]:
     ok, err, dp = Safety.validate_path(workspace, path)
-    if not ok: return {"success": False, "error": err}
+    if not ok:
+        return {"success": False, "error": err}
     try:
-        if dp.exists(): return {"success": True, "message": "Already exists"}
+        if dp.exists():
+            return {"success": True, "message": "Already exists"}
         dp.mkdir(parents=True, exist_ok=True)
         return {"success": True, "message": "Created"}
     except Exception as e:
@@ -232,75 +273,146 @@ def tool_mkdir(workspace: Path, path: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# TOOL HANDLERS — GIT
+# TOOL HANDLERS — SANDBOXED SHELL
 # =============================================================================
 
-def _git(workspace: Path, cmd: str) -> Tuple[str, int]:
-    """Run a git command via the current thread's shell session."""
-    return get_shell_session(workspace).execute(cmd)
+def tool_shell(
+    workspace: Path,
+    command: str,
+    timeout: int = 30,
+    max_memory_mb: int = 512,
+) -> Dict[str, Any]:
+    """
+    Run *command* inside a platform-appropriate sandbox.
 
+    Sandbox backends (auto-selected):
+      • Windows + pywin32  : Job Object — kill_on_job_close + memory limit.
+        The process tree is hard-killed the moment the handle closes, even if
+        Python itself crashes.
+      • Windows, no pywin32: psutil tree-kill on timeout.
+      • macOS / Linux      : new process group (os.setsid) + RLIMIT_AS +
+        RLIMIT_CPU — entire group killed on timeout or error.
+
+    The command is validated by Safety.validate_command() before execution.
+    stdout and stderr are merged; output is capped at 32 KB.
+
+    Install:
+        pip install psutil          # all platforms
+        pip install pywin32         # Windows only, for stronger Job Object backend
+    """
+    # ── safety gate (same check used by _git_safe) ───────────────────────────
+    ok, reason = Safety.validate_command(command, workspace)
+    if not ok:
+        return {"success": False, "error": f"Command blocked by safety check: {reason}"}
+
+    # ── clamp user-supplied limits to sane bounds ─────────────────────────────
+    timeout       = max(1, min(timeout, 120))           # 1 – 120 s
+    max_memory_mb = max(64, min(max_memory_mb, 2048))   # 64 MB – 2 GB
+
+    try:
+        output, exit_code = run_sandboxed(
+            cmd=command,
+            workspace=workspace,
+            timeout=timeout,
+            max_output_bytes=32_768,
+            max_memory_mb=max_memory_mb,
+        )
+        success = exit_code == 0
+        return {
+            "success":   success,
+            "exit_code": exit_code,
+            "output":    output,
+            "sandbox":   sandbox_info()["backend"],
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Sandbox error: {e}"}
+
+
+# =============================================================================
+# TOOL HANDLERS — GIT  (use _git_safe internally; never exposed as raw shell)
+# =============================================================================
 
 def tool_git_status(workspace: Path) -> Dict[str, Any]:
     try:
-        output, code = _git(workspace, "git status --porcelain")
-        if code != 0: return {"success": False, "error": "Not a git repository"}
+        output, code = _git_safe(workspace, "git status --porcelain")
+        if code != 0:
+            return {"success": False, "error": "Not a git repository"}
         files: Dict[str, List[str]] = {
             "modified": [], "added": [], "deleted": [], "untracked": []
         }
         for line in output.splitlines()[:Config.MAX_LS_ENTRIES]:
-            if len(line) < 3: continue
+            if len(line) < 3:
+                continue
             status, path = line[:2], line[3:]
             if   "M" in status: files["modified"].append(path)
             elif "A" in status: files["added"].append(path)
             elif "D" in status: files["deleted"].append(path)
             elif "?" in status: files["untracked"].append(path)
-        branch, _ = _git(workspace, "git branch --show-current")
+        branch, _ = _git_safe(workspace, "git branch --show-current")
         total      = sum(len(v) for v in files.values())
         return {"success": True, "branch": branch.strip(), **files,
                 "total_changes": total,
                 "truncated":     total > Config.MAX_LS_ENTRIES}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_git_diff(workspace: Path, path: str = "", staged: bool = False) -> Dict[str, Any]:
     try:
+        if path:
+            ok, err, resolved = Safety.validate_path(workspace, path)
+            if not ok:
+                return {"success": False, "error": f"Invalid diff path: {err}"}
         cmd = "git diff"
-        if staged: cmd += " --staged"
-        if path:   cmd += f" -- {path}"
-        output, code = _git(workspace, cmd)
-        if code != 0: return {"success": False, "error": "Git diff failed"}
+        if staged:
+            cmd += " --staged"
+        if path:
+            cmd += f" -- {_shell_quote(path)}"
+        output, code = _git_safe(workspace, cmd)
+        if code != 0:
+            return {"success": False, "error": "Git diff failed"}
         return {"success":     True,
                 "diff":        truncate_output(output, Config.MAX_TOOL_OUTPUT),
                 "has_changes": bool(output.strip())}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_git_add(workspace: Path, paths: List[str]) -> Dict[str, Any]:
     try:
+        quoted: List[str] = []
         for p in paths:
             ok, err, _ = Safety.validate_path(workspace, p)
-            if not ok: return {"success": False, "error": f"{p}: {err}"}
-        output, code = _git(workspace, f"git add {' '.join(paths)}")
-        if code != 0: return {"success": False, "error": truncate_output(output, 500)}
+            if not ok:
+                return {"success": False, "error": f"{p}: {err}"}
+            quoted.append(_shell_quote(p))
+        cmd = f"git add {' '.join(quoted)}"
+        output, code = _git_safe(workspace, cmd)
+        if code != 0:
+            return {"success": False, "error": truncate_output(output, 500)}
         return {"success": True, "staged": len(paths)}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_git_commit(workspace: Path, message: str, allow_empty: bool = False) -> Dict[str, Any]:
     try:
-        # Quote the message safely for both bash and PowerShell.
-        # Single-quoting works in bash; PowerShell uses double-quotes — we
-        # already strip double-quotes here to avoid injection in both shells.
-        safe_msg = message.replace('"', "'")
-        cmd = f'git commit -m "{safe_msg}"'
-        if allow_empty: cmd += " --allow-empty"
-        output, code = _git(workspace, cmd)
-        if code != 0: return {"success": False, "error": truncate_output(output, 500)}
-        rev, _ = _git(workspace, "git rev-parse HEAD")
+        cmd = f"git commit -m {_shell_quote(message)}"
+        if allow_empty:
+            cmd += " --allow-empty"
+        output, code = _git_safe(workspace, cmd)
+        if code != 0:
+            return {"success": False, "error": truncate_output(output, 500)}
+        rev, _ = _git_safe(workspace, "git rev-parse HEAD")
         return {"success": True, "commit": rev.strip()[:8]}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -309,21 +421,30 @@ def tool_git_branch(workspace: Path, name: str = "",
                     create: bool = False, switch: bool = False) -> Dict[str, Any]:
     try:
         if not name:
-            output, code = _git(workspace, "git branch")
-            if code != 0: return {"success": False, "error": "Failed to list branches"}
+            output, code = _git_safe(workspace, "git branch")
+            if code != 0:
+                return {"success": False, "error": "Failed to list branches"}
             branches, current = [], None
             for line in output.splitlines()[:20]:
                 line = line.strip()
-                if line.startswith("* "): current = line[2:]
-                elif line:               branches.append(line)
+                if line.startswith("* "):
+                    current = line[2:]
+                elif line:
+                    branches.append(line)
             return {"success": True, "action": "list",
                     "branches": branches, "current": current}
-        cmd    = ("git checkout -b" if create else
-                  "git checkout"    if switch  else "git branch")
-        action = "created" if create or not switch else "switched"
-        output, code = _git(workspace, f"{cmd} {name}")
-        if code != 0: return {"success": False, "error": truncate_output(output, 500)}
+        ok, err = _validate_git_ref(name)
+        if not ok:
+            return {"success": False, "error": err}
+        git_cmd = ("git checkout -b" if create else
+                   "git checkout"    if switch  else "git branch")
+        action  = "created" if create else ("switched" if switch else "created_local")
+        output, code = _git_safe(workspace, f"{git_cmd} {_shell_quote(name)}")
+        if code != 0:
+            return {"success": False, "error": truncate_output(output, 500)}
         return {"success": True, "action": action, "branch": name}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -342,7 +463,6 @@ def set_tool_context(
     mode: str = "interactive",
     stream_callback: Optional[Callable] = None,
 ):
-    """Populate the thread-local context used by all tool handlers."""
     set_current_context({
         "workspace":          workspace,
         "session_id":         session_id,
@@ -364,7 +484,6 @@ def tool_todo_add(workspace: Path, description: str, notes: str = "") -> Dict[st
 def tool_todo_complete(workspace: Path, todo_id: int) -> Dict[str, Any]:
     mgr, err = _get_ctx("todo_manager", "Todo manager")
     if err: return err
-
     existing = next((t for t in mgr.todos if t.id == todo_id), None)
     if existing and existing.status == "completed":
         summary  = mgr.list_all()
@@ -381,7 +500,6 @@ def tool_todo_complete(workspace: Path, todo_id: int) -> Dict[str, Any]:
             "message": ("ALL TODOS DONE. Output TASK_COMPLETE now."
                         if all_done else f"{done}/{total} todos complete."),
         }
-
     result = mgr.complete(todo_id)
     if result.get("success"):
         summary  = mgr.list_all()
@@ -415,7 +533,7 @@ def tool_todo_update(workspace: Path, todo_id: int,
 def tool_todo_list(workspace: Path) -> Dict[str, Any]:
     mgr, err = _get_ctx("todo_manager", "Todo manager")
     if err: return err
-    result   = mgr.list_all()
+    result = mgr.list_all()
     if result.get("success"):
         total    = result.get("total", 0)
         done     = result.get("completed", 0)
@@ -431,9 +549,11 @@ def tool_plan_complete_step(workspace: Path, step_id: str,
                              verification_notes: str = "") -> Dict[str, Any]:
     mgr, err = _get_ctx("plan_manager", "Plan manager")
     if err: return err
-    if not mgr.plan: return {"success": False, "error": "No active plan"}
+    if not mgr.plan:
+        return {"success": False, "error": "No active plan"}
     step = next((s for s in mgr.plan["steps"] if s["id"] == step_id), None)
-    if not step: return {"success": False, "error": f"Step '{step_id}' not found"}
+    if not step:
+        return {"success": False, "error": f"Step '{step_id}' not found"}
     if step["status"] == "completed":
         return {"success": False, "error": f"Step '{step_id}' already completed"}
     if step["status"] == "pending":
@@ -464,7 +584,6 @@ def tool_task_state_update(
 ) -> Dict[str, Any]:
     mgr, err = _get_ctx("task_state_manager", "Task state manager")
     if err: return err
-
     state = mgr.current_state
     if not state:
         if not objective:
@@ -483,19 +602,17 @@ def tool_task_state_update(
             last_updated="",
         )
     else:
-        if objective:                   state.objective           = objective
-        if completion_gate:             state.completion_gate     = completion_gate
-        if total_count     >= 0:        state.total_count         = total_count
-        if processed_count >= 0:        state.processed_count     = processed_count
-        if remaining_queue is not None: state.remaining_queue     = remaining_queue
+        if objective:                   state.objective            = objective
+        if completion_gate:             state.completion_gate      = completion_gate
+        if total_count     >= 0:        state.total_count          = total_count
+        if processed_count >= 0:        state.processed_count      = processed_count
+        if remaining_queue is not None: state.remaining_queue      = remaining_queue
         if rename_map      is not None: state.rename_map.update(rename_map)
-        if last_error:                  state.last_error          = last_error
+        if last_error:                  state.last_error           = last_error
         if recovery_instruction:        state.recovery_instruction = recovery_instruction
-        if next_action:                 state.next_action         = next_action
-
+        if next_action:                 state.next_action          = next_action
     if remaining_queue:
         state.inventory_hash = TaskState.compute_inventory_hash(remaining_queue)
-
     mgr.checkpoint(state)
     return {
         "success": True,
@@ -535,10 +652,6 @@ def tool_task_reconcile(workspace: Path) -> Dict[str, Any]:
 
 def _build_parent_context(parent_messages: List[Dict[str, Any]],
                            max_chars: int = 12000) -> str:
-    """Build a context string from recent parent tool results and reasoning.
-
-    Pure in-memory — no temp files written to disk.
-    """
     sections: List[str] = []
     for msg in reversed(parent_messages):
         role = msg.get("role", "")
@@ -552,12 +665,12 @@ def _build_parent_context(parent_messages: List[Dict[str, Any]],
             except (json.JSONDecodeError, AttributeError):
                 text = raw
             text = str(text).strip()
-            if text: sections.append(f"[{name} result]\n{text[:3000]}")
+            if text:
+                sections.append(f"[{name} result]\n{text[:3000]}")
         elif role == "assistant":
             content = msg.get("content", "")
             if content and len(content) > 40:
                 sections.append(f"[reasoning]\n{content[:800]}")
-
     if not sections:
         return ""
     sections.reverse()
@@ -569,7 +682,6 @@ def _build_parent_context(parent_messages: List[Dict[str, Any]],
 
 def tool_task(workspace: Path, task_type: str,
               instructions: str, file_path: str) -> Dict[str, Any]:
-    """Spawn an isolated sub-agent to create a single file."""
     if not Config.ENABLE_SUB_AGENTS:
         return {"success": False, "error": "Sub-agents disabled"}
     try:
@@ -577,14 +689,12 @@ def tool_task(workspace: Path, task_type: str,
         ctx             = get_current_context()
         parent_messages = ctx.get("messages") or []
         ctx_content     = _build_parent_context(parent_messages)
-
         if ctx_content:
             ctx_note = ("\n\nPARENT CONTEXT (research/data gathered by parent agent):"
                         f"\n\n{ctx_content}")
             step1    = "Use the parent context above as your primary data source"
         else:
             ctx_note, step1 = "", "Create the file at the specified path"
-
         sub_sid = SessionManager(ctx["workspace"]).create(
             f"[CREATE-{task_type}] {file_path}",
             parent_session=ctx["session_id"],
@@ -632,67 +742,77 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "description": "Get the current date and time.",
         "parameters": {"type": "object", "properties": {}}}},
 
-    # "shell" is the canonical cross-platform name; "powershell" is kept as an
-    # alias so existing prompts / saved sessions remain compatible.
     {"type": "function", "function": {
-        "name": "shell",
-        "description": (
-            "Execute a shell command. Uses PowerShell on Windows, /bin/bash on Linux/macOS. "
-            "State preserved between calls in this session."
-        ),
-        "parameters": {"type": "object",
-                       "properties": {"command": {"type": "string"}},
-                       "required": ["command"]}}},
-    {"type": "function", "function": {
-        "name": "powershell",
-        "description": (
-            "Alias for shell — execute a shell command. "
-            "Uses PowerShell on Windows, /bin/bash on Linux/macOS."
-        ),
-        "parameters": {"type": "object",
-                       "properties": {"command": {"type": "string"}},
-                       "required": ["command"]}}},
-
-    {"type": "function", "function": {
-        "name": "read", "description": "Read file contents.",
+        "name": "read", "description": "Read file contents (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"}},
                        "required": ["path"]}}},
     {"type": "function", "function": {
-        "name": "write", "description": "Create or overwrite file.",
+        "name": "write", "description": "Create or overwrite a file (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"},
                                       "content": {"type": "string"}},
                        "required": ["path", "content"]}}},
     {"type": "function", "function": {
-        "name": "edit", "description": "Edit file with fuzzy search/replace.",
+        "name": "edit", "description": "Edit file with fuzzy search/replace (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"},
                                       "search": {"type": "string"},
                                       "replace": {"type": "string"}},
                        "required": ["path", "search", "replace"]}}},
     {"type": "function", "function": {
-        "name": "glob", "description": "Find files matching pattern.",
+        "name": "glob", "description": "Find files matching a glob pattern (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"pattern": {"type": "string"}},
                        "required": ["pattern"]}}},
     {"type": "function", "function": {
-        "name": "grep", "description": "Search for pattern in files.",
+        "name": "grep", "description": "Search for a text pattern in files (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"pattern": {"type": "string"},
                                       "paths": {"type": "array", "items": {"type": "string"}}},
                        "required": ["pattern"]}}},
     {"type": "function", "function": {
-        "name": "ls", "description": "List directory contents.",
+        "name": "ls", "description": "List directory contents (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"}}}}},
     {"type": "function", "function": {
-        "name": "mkdir", "description": "Create directory.",
+        "name": "mkdir", "description": "Create a directory (workspace only).",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"}},
                        "required": ["path"]}}},
+
+    # ── sandboxed shell ───────────────────────────────────────────────────────
     {"type": "function", "function": {
-        "name": "git_status", "description": "Get git status.",
+        "name": "shell",
+        "description": (
+            "Run a shell command inside a platform sandbox (bash on macOS/Linux, "
+            "cmd on Windows). stdout and stderr are merged. Output is capped at 32 KB. "
+            "Timeout defaults to 30 s (max 120 s). Memory defaults to 512 MB (max 2 GB). "
+            "Use for build commands, tests, installers, package managers, or any "
+            "operation the file tools cannot handle directly. "
+            "All commands are validated by the safety layer before execution."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to run.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds before the process is killed (1–120, default 30).",
+                },
+                "max_memory_mb": {
+                    "type": "integer",
+                    "description": "Memory limit in MB (64–2048, default 512).",
+                },
+            },
+            "required": ["command"],
+        }}},
+
+    {"type": "function", "function": {
+        "name": "git_status", "description": "Get git status of the workspace.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "git_diff", "description": "Show git diff.",
@@ -700,33 +820,34 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                        "properties": {"path": {"type": "string"},
                                       "staged": {"type": "boolean"}}}}},
     {"type": "function", "function": {
-        "name": "git_add", "description": "Stage files.",
+        "name": "git_add", "description": "Stage files for commit.",
         "parameters": {"type": "object",
                        "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
                        "required": ["paths"]}}},
     {"type": "function", "function": {
-        "name": "git_commit", "description": "Commit changes.",
+        "name": "git_commit", "description": "Commit staged changes.",
         "parameters": {"type": "object",
                        "properties": {"message": {"type": "string"},
                                       "allow_empty": {"type": "boolean"}},
                        "required": ["message"]}}},
     {"type": "function", "function": {
         "name": "git_branch",
-        "description": "Manage branches. No args → list. With name+flags → create/switch.",
+        "description": "Manage git branches. No args → list. With name+flags → create/switch.",
         "parameters": {"type": "object",
                        "properties": {"name": {"type": "string"},
                                       "create": {"type": "boolean"},
                                       "switch": {"type": "boolean"}}}}},
+
     {"type": "function", "function": {
         "name": "todo_add",
-        "description": "Add todo item. WARNING: Only add todos BEFORE execution begins.",
+        "description": "Add a todo item. WARNING: Only add todos BEFORE execution begins.",
         "parameters": {"type": "object",
                        "properties": {"description": {"type": "string"},
                                       "notes": {"type": "string"}},
                        "required": ["description"]}}},
     {"type": "function", "function": {
         "name": "todo_complete",
-        "description": "Mark todo completed. Each todo_id must be completed ONCE. When all_complete=true, immediately output TASK_COMPLETE.",
+        "description": "Mark a todo completed. Each todo_id must be completed ONCE. When all_complete=true, immediately output TASK_COMPLETE.",
         "parameters": {"type": "object",
                        "properties": {"todo_id": {"type": "integer"}},
                        "required": ["todo_id"]}}},
@@ -743,17 +864,19 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "name": "todo_list",
         "description": "List todos. If all_complete=true is returned, output TASK_COMPLETE immediately.",
         "parameters": {"type": "object", "properties": {}}}},
+
     {"type": "function", "function": {
         "name": "plan_complete_step",
-        "description": "Mark plan step complete after verification.",
+        "description": "Mark a plan step complete after verification.",
         "parameters": {"type": "object",
                        "properties": {"step_id": {"type": "string",
                                                    "description": "Step ID from the plan (e.g. 'step_1')"},
                                       "verification_notes": {"type": "string"}},
                        "required": ["step_id"]}}},
+
     {"type": "function", "function": {
         "name": "task",
-        "description": "Delegate file creation to isolated sub-agent.",
+        "description": "Delegate file creation to an isolated sub-agent.",
         "parameters": {"type": "object",
                        "properties": {"task_type": {"type": "string",
                                                      "description": "File type (html, css, js, python, etc.)"},
@@ -762,6 +885,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                                       "file_path": {"type": "string",
                                                     "description": "Where to save the file"}},
                        "required": ["task_type", "instructions", "file_path"]}}},
+
     {"type": "function", "function": {
         "name": "task_state_update",
         "description": "Checkpoint task progress. Call after each file processed.",
@@ -789,9 +913,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
 TOOL_HANDLERS: Dict[str, Callable] = {
     "get_time":           tool_get_time,
-    # Both names route to the same cross-platform handler.
     "shell":              tool_shell,
-    "powershell":         tool_shell,
     "read":               tool_read,
     "write":              tool_write,
     "edit":               tool_edit,
@@ -815,21 +937,20 @@ TOOL_HANDLERS: Dict[str, Callable] = {
     "task_reconcile":     tool_task_reconcile,
 }
 
+_REQUIRED_ARG_TOOLS = frozenset({
+    "shell",
+    "write", "read", "edit", "glob", "grep", "ls", "mkdir",
+    "todo_add", "todo_complete", "todo_update", "plan_complete_step",
+    "git_add", "git_commit", "git_branch", "git_diff",
+    "task",
+})
+
+_llm_local = threading.local()
+
 
 # =============================================================================
 # LLM CLIENT
 # =============================================================================
-
-_REQUIRED_ARG_TOOLS = frozenset({
-    "write", "read", "edit", "glob", "grep", "ls", "mkdir",
-    "todo_add", "todo_complete", "todo_update", "plan_complete_step",
-    "git_add", "git_commit", "git_branch", "git_diff",
-    "task", "shell", "powershell",
-})
-
-# Thread-local: each agent thread tracks its own tool_choice rejection state.
-_llm_local = threading.local()
-
 
 class LLMClient:
     _HEADERS: Dict[str, str] = {"Content-Type": "application/json"}
@@ -843,7 +964,7 @@ class LLMClient:
         return getattr(_llm_local, "tool_choice_rejected", False)
 
     @classmethod
-    def _set_tool_choice_rejected(cls, val: bool):
+    def _set_tool_choice_rejected(cls, val: bool) -> None:
         _llm_local.tool_choice_rejected = val
 
     @staticmethod
@@ -872,18 +993,15 @@ class LLMClient:
         }
         if Config.LLM_MODEL:      payload["model"]      = Config.LLM_MODEL
         if Config.MAX_TOKENS > 0: payload["max_tokens"] = Config.MAX_TOKENS
-
         if Config.THINKING_MODEL:
             payload["max_tokens"] = max(payload.get("max_tokens", 0) or 0,
                                         Config.THINKING_MAX_TOKENS)
             if payload.get("temperature", 0) > 0.7:
                 Log.warning("High temperature with thinking model — consider TEMPERATURE<=0.6")
-
         if tools:
             payload["tools"] = tools
             if not cls._tool_choice_rejected():
                 payload["tool_choice"] = "auto"
-
         return payload
 
     @staticmethod
@@ -912,14 +1030,12 @@ class LLMClient:
              stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
         payload    = cls._build_payload(messages, tools)
         last_error: Optional[str] = None
-
         for attempt in range(1, Config.LLM_MAX_RETRIES + 1):
             try:
                 resp = requests.post(
                     Config.LLM_URL, json=payload, headers=cls._headers(),
                     stream=True, timeout=Config.LLM_TIMEOUT,
                 )
-
                 if resp.status_code == 400 and "tool_choice" in (resp.text or "").lower():
                     Log.warning("Model rejected tool_choice — disabling for this session")
                     cls._set_tool_choice_rejected(True)
@@ -928,7 +1044,6 @@ class LLMClient:
                         Config.LLM_URL, json=payload, headers=cls._headers(),
                         stream=True, timeout=Config.LLM_TIMEOUT,
                     )
-
                 if resp.status_code in (500, 503):
                     Log.warning(f"LLM returned {resp.status_code} — waiting for recovery")
                     if cls._wait_for_server(60):
@@ -936,29 +1051,24 @@ class LLMClient:
                         continue
                     last_error = f"HTTP {resp.status_code} and server did not recover"
                     break
-
                 resp.raise_for_status()
                 return cls._parse_stream(resp, stream_callback)
-
             except requests.ConnectionError as e:
                 last_error = str(e)
                 Log.warning(f"Connection lost (attempt {attempt}): {e}")
                 if cls._wait_for_server(60) and attempt < Config.LLM_MAX_RETRIES:
                     continue
                 break
-
             except requests.Timeout as e:
                 last_error = str(e)
                 Log.warning(f"Request timed out (attempt {attempt}): {e}")
                 if attempt < Config.LLM_MAX_RETRIES:
                     time.sleep(Config.LLM_RETRY_DELAY * attempt)
-
             except requests.RequestException as e:
                 last_error = str(e)
                 if attempt < Config.LLM_MAX_RETRIES:
                     Log.warning(f"LLM error (attempt {attempt}): {e}")
                     time.sleep(Config.LLM_RETRY_DELAY * attempt)
-
         return {"error": f"LLM failed after {Config.LLM_MAX_RETRIES} attempts: {last_error}"}
 
     @staticmethod
@@ -969,8 +1079,7 @@ class LLMClient:
         finish_reason = None
         in_think      = False
 
-        resp.encoding = "utf-8"  # force UTF-8 decoding — prevents mojibake when
-                                 # the server omits charset in Content-Type header
+        resp.encoding = "utf-8"
 
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "): continue
@@ -1005,7 +1114,6 @@ class LLMClient:
                         else:
                             stream_callback(part)
 
-            # Native thinking blocks (Anthropic-style API)
             thinking_blocks = delta.get("thinking")
             if isinstance(thinking_blocks, list) and stream_callback:
                 for tb in thinking_blocks:
@@ -1067,7 +1175,6 @@ class LLMClient:
                 Log.error(f"[PARSE] '{fn_name}' JSON decode failed at pos "
                           f"{parse_err.pos}: {parse_err.msg} — "
                           f"tail={repr(args_str[-80:])}")
-
                 repaired = False
                 if len(args_str) < 500:
                     opens, closes = args_str.count("{"), args_str.count("}")
@@ -1083,7 +1190,6 @@ class LLMClient:
                             repaired = True
                         except json.JSONDecodeError:
                             pass
-
                 if not repaired:
                     Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
                               f"({'short' if len(args_str) < 500 else 'large'} payload, "
@@ -1108,6 +1214,8 @@ class LLMClient:
             "incomplete":    incomplete,
             "finish_reason": finish_reason,
         }
+
+
 # =============================================================================
 # COMPLETION DETECTION
 # =============================================================================
@@ -1118,7 +1226,6 @@ _ASKING_PHRASES = ("would you like", "what would you", "should i")
 
 
 def detect_completion(content: str, has_tool_calls: bool) -> Tuple[bool, str]:
-    """content must already have <think> blocks stripped."""
     if "TASK_COMPLETE" in content.upper() and not has_tool_calls:
         for line in content.split("\n"):
             if "TASK_COMPLETE" not in line.upper(): continue
@@ -1160,6 +1267,7 @@ def ask_permission(tool_name: str, args: Dict[str, Any]) -> Tuple[bool, Optional
 # =============================================================================
 # SYSTEM PROMPTS
 # =============================================================================
+
 SYSTEM_PROMPT = """You are a skilled, proactive digital coworker. You have real tools that make real changes.
 
 YEAR: 2026. Think modern. Don't mention the year.
@@ -1232,15 +1340,9 @@ Every call needs ALL required arguments. No exceptions.
   write  → "path" AND "content" (complete file, not a placeholder)
   read   → "path"
   edit   → "path", "search", "replace"
+  shell  → "command" (timeout and max_memory_mb are optional)
 
 When unsure of a path: ls or glob first, then act.
-
-════════════════════════════════════════════════════
-TOOL HIERARCHY
-════════════════════════════════════════════════════
-
-  1. read / write / edit / glob / grep / ls / mkdir  ← always try first
-  2. shell / powershell                               ← fallback only, after file tool fails
 
 ════════════════════════════════════════════════════
 EXECUTION RULES
@@ -1260,11 +1362,11 @@ EXECUTION RULES
 
 3. EXECUTE, DON'T SCRIPT
    Writing a script is not completing a task. Make the changes directly.
+   Exception: if the task IS to write a script, write it then TASK_COMPLETE.
 
 4. TODOS — STRICT RULES
    • todo_complete on each ID exactly once — never twice
    • todo_complete returns all_complete: true → output TASK_COMPLETE immediately
-     Do not call any more tools. Do not write any more text. Just: TASK_COMPLETE
    • Never add todos after execution has started
    • Todos are bookkeeping only — they never gate TASK_COMPLETE
 
@@ -1317,12 +1419,17 @@ TOOLS
 ════════════════════════════════════════════════════
 
   Files:      read, write, edit, glob, grep, ls, mkdir
-  System:     shell / powershell (cross-platform, fallback only)
+  Shell:      shell (sandboxed — timeout 30 s, memory 512 MB by default)
   Git:        git_status, git_diff, git_add, git_commit, git_branch
   Todos:      todo_add, todo_complete, todo_update, todo_list
   Task State: task_state_update, task_state_get, task_reconcile
   Planning:   plan_complete_step
   Delegation: task (sub-agent for a single file — once per file maximum)
+
+Shell sandbox backends (selected automatically):
+  Windows + pywin32  → Job Object (process tree killed on handle close)
+  Windows, no pywin32→ psutil tree-kill
+  macOS / Linux      → process group + RLIMIT_AS + RLIMIT_CPU
 """
 
 SUB_AGENT_SYSTEM_PROMPT = """You are a precise file-creation agent. One job: create the file exactly as specified.
@@ -1374,11 +1481,13 @@ OUTPUT FORMAT — valid JSON only, no text before or after the JSON block:
 After the JSON, output exactly this on its own line:
 PLAN_APPROVED
 """
+
+
 # =============================================================================
-# SUB-AGENT EXECUTION
+# SUB-AGENT EXECUTION  (shell intentionally excluded — sub-agents are file-only)
 # =============================================================================
 
-_SUB_AGENT_TOOL_NAMES = frozenset({"write", "read", "edit", "ls", "glob", "shell", "powershell"})
+_SUB_AGENT_TOOL_NAMES = frozenset({"write", "read", "edit", "ls", "glob"})
 
 
 def run_sub_agent(
@@ -1392,7 +1501,6 @@ def run_sub_agent(
                        if t["function"]["name"] in _SUB_AGENT_TOOL_NAMES]
     detector = LoopDetector()
 
-    # Save parent context, install a fresh sub-agent context, restore on exit.
     parent_ctx   = get_current_context()
     sub_todo_mgr = TodoManager(workspace, session_id)
     sub_plan_mgr = PlanManager(workspace, session_id)
@@ -1421,7 +1529,8 @@ def run_sub_agent(
             tool_calls = response.get("tool_calls") or []
 
             if not content and not tool_calls:
-                detector.track_empty(); continue
+                detector.track_empty()
+                continue
 
             if detect_completion(content, bool(tool_calls))[0]:
                 return {"status": "completed", "output": "File created",
@@ -1540,7 +1649,7 @@ def run_plan_mode(task: str, workspace: Path) -> Optional[Dict[str, Any]]:
 
 
 # =============================================================================
-# TOOL EXECUTION HELPERS (used by agent main loop)
+# TOOL EXECUTION HELPERS
 # =============================================================================
 
 def _execute_tool(
@@ -1572,7 +1681,6 @@ def _execute_tool(
                 detector.track_error()
                 detector.track_tool(fn_name, args, False)
                 return {"success": False, "error": mcp_result.get("error", "MCP call failed")}
-
             blocks = mcp_result.get("result", {}).get("content", [])
             if isinstance(blocks, list) and blocks:
                 text_parts = [b["text"] for b in blocks
@@ -1627,8 +1735,10 @@ def _process_tool_calls(
     emit: Callable,
 ) -> Tuple[bool, PermissionMode]:
     """Execute all tool calls for one agent iteration.
-    Returns (had_rename_op, updated_permission_mode)."""
-    had_rename_op = False
+    Returns (had_rename_op, updated_permission_mode).
+    had_rename_op is always False — shell sandbox captures stdout rather than
+    parsing it for rename operations; git tools handle their own rename logic.
+    """
     todo_op_count = 0
     total_calls   = len(tool_calls)
 
@@ -1666,13 +1776,6 @@ def _process_tool_calls(
         if result.get("success"):
             emit("tool_result", {"name": fn_name, "success": True,
                                   "summary": str(result)[:200]})
-
-            if fn_name in ("shell", "powershell"):
-                stdout = result.get("stdout", "")
-                if any(kw in stdout.lower() for kw in ("rename", "move", "ren ", "mv ")):
-                    had_rename_op = True
-                    emit("log", {"message": "Rename op detected — reconciliation required"})
-
             if fn_name == "todo_complete" and result.get("all_complete"):
                 emit("log", {"message": "✓ All todos complete"})
                 messages.append({
@@ -1688,11 +1791,9 @@ def _process_tool_calls(
                     ),
                 })
                 continue
-
         else:
             emit("tool_result", {"name": fn_name, "success": False,
                                   "error": result.get("error", "")[:200]})
-
             if (fn_name == "todo_complete"
                     and result.get("already_completed")
                     and result.get("all_complete")):
@@ -1721,7 +1822,6 @@ def _process_tool_calls(
             "content": json.dumps(result),
         })
 
-    # Hard-stop if entire iteration was pure todo bookkeeping with nothing pending
     if todo_op_count > 0 and todo_op_count == total_calls:
         todo_mgr = get_current_context().get("todo_manager")
         if todo_mgr:
@@ -1739,25 +1839,7 @@ def _process_tool_calls(
                     ),
                 })
 
-    if (had_rename_op
-            and get_current_context().get("task_state_manager")
-            and get_current_context()["task_state_manager"].current_state):
-        emit("warning", {"message": "Injecting reconciliation checkpoint after rename"})
-        messages.append({
-            "role": "user",
-            "content": (
-                "⚠️ RECONCILIATION REQUIRED\n\n"
-                "Files were renamed/moved. Before continuing:\n"
-                "1. task_reconcile() to checkpoint\n"
-                "2. Re-enumerate from disk (ls/glob)\n"
-                "3. task_state_update() with new remaining_queue, rename_map, inventory_hash\n"
-                "4. Confirm processed_count is accurate\n"
-                "5. Continue with next file\n\n"
-                "Do NOT use stale paths."
-            ),
-        })
-
-    return had_rename_op, current_permission_mode
+    return False, current_permission_mode
 
 
 # =============================================================================
@@ -1765,19 +1847,19 @@ def _process_tool_calls(
 # =============================================================================
 
 class _HeaderStreamCb:
-    """Prints the 'Assistant:' header exactly once per LLM response, interactive only."""
-
     def __init__(self, inner_cb: Optional[Callable[[str], None]], mode: str):
         self._inner   = inner_cb
         self._mode    = mode
         self._printed = False
 
-    def reset(self): self._printed = False
+    def reset(self) -> None:
+        self._printed = False
 
     @property
-    def printed(self) -> bool: return self._printed
+    def printed(self) -> bool:
+        return self._printed
 
-    def __call__(self, token: str):
+    def __call__(self, token: str) -> None:
         if not self._printed and self._mode == "interactive":
             self._printed = True
             sys.stdout.write(colored("\nAssistant:\n\n", Colors.CYAN, bold=True))
