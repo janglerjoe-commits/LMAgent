@@ -2,7 +2,7 @@
 """
 agent_core.py — Foundation layer for LM Agent.
 
-Changes from v9.3.0:
+Changes:
   - PowerShell sessions are now per-thread (thread-local) instead of a global
     singleton — concurrent scheduler sessions no longer share one PS process.
   - Log._silent is now thread-local — output-mode sessions no longer silently
@@ -20,7 +20,7 @@ Changes from v9.3.0:
   - close_shell_session() exported so callers (agent_main finally block)
     can clean up the current thread's shell process explicitly.
 
-Cross-platform changes (v9.3.1-cross):
+Cross-platform changes:
   - .env file loader added at module load time — users can set config in a
     plain text file instead of system environment variables.
   - PersistentPowerShellSession replaced with cross-platform ShellSession:
