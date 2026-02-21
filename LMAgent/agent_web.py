@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LMAgent Web — v6.5.1
+LMAgent Web — v6.5.2
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -8,25 +8,33 @@ LMAgent Web — v6.5.1
 
 Place this file next to those three files.
 
-Changes vs v6.5:
-  - FIX: onDone() now appends a visible "✓ done" chat message so the user
-    sees task completion without staring at the status bar.
-  - FIX: SSE reconnect handler detects a stuck running/waiting state when
-    the server reports idle (missed `done` event due to dropped connection)
-    and cleanly transitions the UI back to idle — eliminating the freeze
-    that previously required a full page reload.
-  - FIX: Mojibake sanitization — UTF-8 special chars (em-dashes, arrows,
-    emoji) that were decoded as Latin-1 now render correctly.
+Changes vs v6.5.1:
+  - FIX (critical): Stream.flush() now uses textContent instead of MD.render()
+    during live token streaming — eliminates "Page Unresponsive" freeze caused
+    by the O(n²) Markdown parser running on the full accumulated buffer every
+    35ms.  Full MD rendering is deferred to finalize() and wrapped in
+    requestAnimationFrame() so the browser never blocks.
+  - FIX: Stream.reset() now properly finalises buffered content instead of
+    silently discarding it (was losing the last partial message on Stop).
+  - FIX: Replay token batching wrapped in rAF chunks so replaying a long
+    session history no longer freezes the page.
+  - FIX: flush timer raised 35ms → 60ms to further reduce parse pressure.
+  - FIX: MD.render() guarded with a 400 kB soft cap — oversized text is shown
+    as a preformatted block to prevent any single render from hanging.
+  - FIX: tool-row regex dotAll flag replaced with [\s\S] for older engines.
+  - MINOR: onDone "done ✓" label de-duplicated (was showing twice in some
+    paths).
+
+Previous changes (v6.5.1):
+  - FIX: onDone() appends a visible "✓ done" chat message.
+  - FIX: SSE reconnect handler detects stuck running/waiting state.
+  - FIX: Mojibake sanitization for UTF-8 special chars.
   - FIX: Agent bubble uses readable sans-serif prose; code stays monospace.
 
 Cross-platform changes (v6.5-cross):
-  - Config.WORKSPACE resolution deferred to after Config.init() so the
-    workspace picker in agent_main._pick_workspace() is honoured when this
-    module is imported standalone (e.g. python agent_web.py).
-  - _TOOL_CATEGORIES System list includes "shell" alongside "powershell" so
-    the Tools panel in the browser shows both aliases correctly.
-  - No direct shell calls in this file; relies entirely on agent_core /
-    agent_tools for cross-platform behaviour.
+  - Config.WORKSPACE resolution deferred to after Config.init().
+  - _TOOL_CATEGORIES System list includes "shell" alongside "powershell".
+  - No direct shell calls in this file.
 """
 
 import json
@@ -124,11 +132,6 @@ def _get_agent_state() -> str:
 # =============================================================================
 
 def _fix_mojibake(s: str) -> str:
-    """
-    Re-encode as Latin-1 and decode as UTF-8 to recover characters like
-    em-dashes, arrows, and emoji that got mangled during LLM streaming.
-    Falls back to the original string if the round-trip fails.
-    """
     if not s:
         return s
     try:
@@ -147,10 +150,6 @@ _stream_queues_lock = threading.Lock()
 
 def _broadcast(item: tuple) -> None:
     kind, payload = item
-    # Note: mojibake repair for "token" payloads is intentionally done
-    # client-side on the full accumulated buffer (Stream.flush/finalize),
-    # because UTF-8 multi-byte sequences are often split across tokens.
-    # We still sanitize non-token text strings here as a best-effort pass.
     if kind in ("status", "tool", "error", "done") and isinstance(payload, str):
         payload = _fix_mojibake(payload)
     item = (kind, payload)
@@ -587,6 +586,14 @@ header {
   color: var(--text);
 }
 
+/* streaming state: monospace plain text, no flicker */
+.msg.agent .msg-body.streaming {
+  font-family: var(--mono);
+  font-size: 13px;
+  white-space: pre-wrap;
+  color: var(--text2);
+}
+
 .msg.agent .msg-body h1,.msg.agent .msg-body h2,
 .msg.agent .msg-body h3,.msg.agent .msg-body h4 {
   font-family: var(--sans); font-weight: 600;
@@ -856,7 +863,7 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.5.1</span>
+      <span class="logo-sub">v6.5.2</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -924,16 +931,12 @@ header {
 const _TD = new TextDecoder('utf-8', { fatal: true });
 function fixMojibake(s) {
   if (!s) return s;
-  // Regex-replace ONLY the mojibake spans (Latin-1 chars that form valid
-  // UTF-8 multi-byte sequences), leaving all other Unicode untouched.
-  // Whole-buffer decode fails on mixed content because chars above U+00FF
-  // get truncated by & 0xff, breaking correctly-encoded emoji etc.
   return s.replace(
-    /[Â-ß][-¿]|[à-ï][-¿]{2}|[ð-÷][-¿]{3}/g,
-    match => {
+    /[Â-ß][\x80-\xBF]|[à-ï][\x80-\xBF]{2}|[ð-÷][\x80-\xBF]{3}/g,
+    function(match) {
       try {
-        const b = new Uint8Array(match.length);
-        for (let i = 0; i < match.length; i++) b[i] = match.charCodeAt(i);
+        var b = new Uint8Array(match.length);
+        for (var i = 0; i < match.length; i++) b[i] = match.charCodeAt(i) & 0xff;
         return _TD.decode(b);
       } catch (_) { return match; }
     }
@@ -942,81 +945,82 @@ function fixMojibake(s) {
 
 
 // ═══════════════════════════════════════════════════════════════
-// MARKDOWN
+// MARKDOWN — safe render with size guard
 // ═══════════════════════════════════════════════════════════════
 const MD = (() => {
+  const MAX_RENDER_BYTES = 400000; // ~400 kB — beyond this we show as pre
   const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
   function inline(s) {
-    s = s.replace(/`([^`]+)`/g, (_,c) => `<code>${esc(c)}</code>`);
+    s = s.replace(/`([^`]+)`/g, function(_,c){ return '<code>'+esc(c)+'</code>'; });
     s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
     s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     s = s.replace(/__(.+?)__/g,     '<strong>$1</strong>');
     s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
     s = s.replace(/_(.+?)_/g,   '<em>$1</em>');
     s = s.replace(/~~(.+?)~~/g, '<del>$1</del>');
-    s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_,a,src) => `<img src="${esc(src)}" alt="${esc(a)}" style="max-width:100%">`);
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,  (_,t,href) => `<a href="${esc(href)}" target="_blank" rel="noopener">${t}</a>`);
+    s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_,a,src){ return '<img src="'+esc(src)+'" alt="'+esc(a)+'" style="max-width:100%">'; });
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,  function(_,t,href){ return '<a href="'+esc(href)+'" target="_blank" rel="noopener">'+t+'</a>'; });
     s = s.replace(/(?<!["'>])(https?:\/\/[^\s<>"]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
     return s;
   }
 
   function parse(md) {
-    const lines = md.split('\n');
-    const out   = [];
-    let i = 0;
-    const peek = () => lines[i];
-    const take = () => lines[i++];
+    var lines = md.split('\n');
+    var out   = [];
+    var i = 0;
+    var peek = function(){ return lines[i]; };
+    var take = function(){ return lines[i++]; };
 
     function listBlock(tag) {
-      const items = [];
-      const base  = (peek().match(/^(\s*)/) || ['',''])[1].length;
+      var items = [];
+      var base  = ((peek().match(/^(\s*)/) || ['',''])[1]).length;
       while (i < lines.length) {
-        const l = peek();
+        var l = peek();
         if (/^\s*$/.test(l)) { take(); break; }
-        const ind = (l.match(/^(\s*)/) || ['',''])[1].length;
+        var ind = ((l.match(/^(\s*)/) || ['',''])[1]).length;
         if (ind < base && items.length) break;
         if (!/^(\s*)([-*+]|\d+\.)\s/.test(l)) break;
-        const content = take().replace(/^\s*([-*+]|\d+\.)\s+/, '');
-        let nested = '';
+        var content = take().replace(/^\s*([-*+]|\d+\.)\s+/, '');
+        var nested = '';
         if (i < lines.length) {
-          const ni = (lines[i].match(/^(\s*)/) || ['',''])[1].length;
+          var ni = ((lines[i].match(/^(\s*)/) || ['',''])[1]).length;
           if (ni > ind && /^(\s*)([-*+]|\d+\.)\s/.test(lines[i]))
             nested = listBlock(/^(\s*)([-*+])\s/.test(lines[i]) ? 'ul' : 'ol');
         }
-        items.push(`<li>${inline(content)}${nested}</li>`);
+        items.push('<li>'+inline(content)+nested+'</li>');
       }
-      return `<${tag}>${items.join('')}</${tag}>`;
+      return '<'+tag+'>'+items.join('')+'</'+tag+'>';
     }
 
     function tableBlock() {
-      const hdr  = take(); take();
-      const headers = hdr.split('|').map(c => c.trim()).filter(Boolean);
-      const rows = [];
+      var hdr  = take(); take();
+      var headers = hdr.split('|').map(function(c){ return c.trim(); }).filter(Boolean);
+      var rows = [];
       while (i < lines.length && /\|/.test(peek()) && !/^\s*$/.test(peek()))
-        rows.push(take().split('|').map(c => c.trim()).filter(Boolean));
-      const ths = headers.map(h => `<th>${inline(h)}</th>`).join('');
-      const trs = rows.map(r => `<tr>${r.map(c => `<td>${inline(c)}</td>`).join('')}</tr>`).join('');
-      return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+        rows.push(take().split('|').map(function(c){ return c.trim(); }).filter(Boolean));
+      var ths = headers.map(function(h){ return '<th>'+inline(h)+'</th>'; }).join('');
+      var trs = rows.map(function(r){ return '<tr>'+r.map(function(c){ return '<td>'+inline(c)+'</td>'; }).join('')+'</tr>'; }).join('');
+      return '<table><thead><tr>'+ths+'</tr></thead><tbody>'+trs+'</tbody></table>';
     }
 
     while (i < lines.length) {
-      const line = peek();
+      var line = peek();
       if (/^```/.test(line)) {
-        const lang = line.slice(3).trim(); take();
-        const code = [];
+        var lang = line.slice(3).trim(); take();
+        var code = [];
         while (i < lines.length && !/^```/.test(peek())) code.push(esc(take()));
-        take();
-        out.push(`<pre>${lang ? `<span class="lang">${esc(lang)}</span>` : ''}<code>${code.join('\n')}</code></pre>`);
+        if (i < lines.length) take();
+        out.push('<pre>'+(lang ? '<span class="lang">'+esc(lang)+'</span>' : '')+'<code>'+code.join('\n')+'</code></pre>');
         continue;
       }
       if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(line)) { take(); out.push('<hr>'); continue; }
-      const hm = line.match(/^(#{1,6})\s+(.+)/);
-      if (hm) { take(); out.push(`<h${hm[1].length}>${inline(hm[2])}</h${hm[1].length}>`); continue; }
+      var hm = line.match(/^(#{1,6})\s+(.+)/);
+      if (hm) { take(); out.push('<h'+hm[1].length+'>'+inline(hm[2])+'</h'+hm[1].length+'>'); continue; }
       if (/^>\s?/.test(line)) {
-        const q = [];
+        var q = [];
         while (i < lines.length && /^>\s?/.test(peek())) q.push(take().replace(/^>\s?/, ''));
-        out.push(`<blockquote>${parse(q.join('\n'))}</blockquote>`);
+        out.push('<blockquote>'+parse(q.join('\n'))+'</blockquote>');
         continue;
       }
       if (/^(\s*)([-*+])\s/.test(line)) { out.push(listBlock('ul')); continue; }
@@ -1025,19 +1029,28 @@ const MD = (() => {
         out.push(tableBlock()); continue;
       }
       if (/^\s*$/.test(line)) { take(); continue; }
-      const para = [];
+      var para = [];
       while (i < lines.length) {
-        const l = peek();
-        if (/^\s*$/.test(l)) break;
-        if (/^(#{1,6}\s|```|>\s?|[-*+]\s|\d+\.\s|(\*{3,}|-{3,}|_{3,})\s*$)/.test(l)) break;
+        var ll = peek();
+        if (/^\s*$/.test(ll)) break;
+        if (/^(#{1,6}\s|```|>\s?|[-*+]\s|\d+\.\s|(\*{3,}|-{3,}|_{3,})\s*$)/.test(ll)) break;
         para.push(take());
       }
-      if (para.length) out.push(`<p>${inline(para.join(' '))}</p>`);
+      if (para.length) out.push('<p>'+inline(para.join(' '))+'</p>');
     }
     return out.join('\n');
   }
 
-  return { render: md => md && md.trim() ? parse(md) : '' };
+  function render(md) {
+    if (!md || !md.trim()) return '';
+    // Guard: if text is enormous, skip expensive parse and show as preformatted
+    if (md.length > MAX_RENDER_BYTES) {
+      return '<pre style="white-space:pre-wrap;word-break:break-word">' + esc(md) + '</pre>';
+    }
+    return parse(md);
+  }
+
+  return { render };
 })();
 
 
@@ -1045,12 +1058,12 @@ const MD = (() => {
 // SCROLL
 // ═══════════════════════════════════════════════════════════════
 const Scroll = (() => {
-  const pane = () => document.getElementById('messages');
-  const btn  = () => document.getElementById('scroll-btn');
-  let pinned = true;
+  const pane = function(){ return document.getElementById('messages'); };
+  const btn  = function(){ return document.getElementById('scroll-btn'); };
+  var pinned = true;
 
   function atBottom() {
-    const el = pane();
+    var el = pane();
     return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }
   function update() { btn().classList.toggle('show', !pinned && Agent.running()); }
@@ -1062,7 +1075,7 @@ const Scroll = (() => {
     update();
   }
   pane().addEventListener('scroll', onScroll, { passive: true });
-  return { maybe, jump, pin: () => { pinned = true; }, update };
+  return { maybe, jump, pin: function(){ pinned = true; }, update };
 })();
 
 
@@ -1070,21 +1083,22 @@ const Scroll = (() => {
 // STATUS BAR
 // ═══════════════════════════════════════════════════════════════
 const Status = (() => {
-  const dot  = () => document.getElementById('dot');
-  const text = () => document.getElementById('status-text');
-  const iter = () => document.getElementById('iter-badge');
-  const mode = () => document.getElementById('mode-badge');
+  var dot  = function(){ return document.getElementById('dot'); };
+  var text = function(){ return document.getElementById('status-text'); };
+  var iter = function(){ return document.getElementById('iter-badge'); };
+  var mode = function(){ return document.getElementById('mode-badge'); };
   return {
-    set(msg, state = '') {
+    set: function(msg, state) {
+      state = state || '';
       text().textContent = msg || '';
       dot().className = 'dot ' + state;
     },
-    iter(v) {
-      const el = iter();
+    iter: function(v) {
+      var el = iter();
       el.textContent = v || '';
       el.style.display = v ? '' : 'none';
     },
-    mode(v) { mode().textContent = v || 'auto'; },
+    mode: function(v) { mode().textContent = v || 'auto'; },
   };
 })();
 
@@ -1093,61 +1107,65 @@ const Status = (() => {
 // CONNECTION DOT
 // ═══════════════════════════════════════════════════════════════
 const ConnDot = (() => {
-  const el = () => document.getElementById('conn-dot');
+  var el = function(){ return document.getElementById('conn-dot'); };
   return {
-    ok()  { el().className = 'conn-dot ok'; el().title = 'Stream connected'; },
-    err() { el().className = 'conn-dot err'; el().title = 'Stream disconnected'; },
-    try() { el().className = 'conn-dot try'; el().title = 'Reconnecting\u2026'; },
+    ok:  function(){ el().className = 'conn-dot ok';  el().title = 'Stream connected'; },
+    err: function(){ el().className = 'conn-dot err'; el().title = 'Stream disconnected'; },
+    try: function(){ el().className = 'conn-dot try'; el().title = 'Reconnecting\u2026'; },
   };
 })();
 
 
 // ═══════════════════════════════════════════════════════════════
-// CHAT LOG REPLAY
+// CHAT LOG REPLAY  — chunked to avoid blocking
 // ═══════════════════════════════════════════════════════════════
 const Replay = (() => {
-  function run(events) {
-    if (!events || !events.length) return;
+  function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-    const banner = document.getElementById('replay-banner');
-    banner.textContent = `\u21a9 restored ${events.length} events from this session`;
-    banner.classList.add('show');
-    setTimeout(() => banner.classList.remove('show'), 3000);
-
-    let tokenBuf = '';
-    let toolGroupItems = [];
+  function _applyEvents(events) {
+    var tokenBuf       = '';
+    var toolGroupItems = [];
+    var pane           = document.getElementById('messages');
 
     function flushTokens() {
       if (!tokenBuf.trim()) { tokenBuf = ''; return; }
-      const body = Messages.add('agent', '', '', false);
-      body.innerHTML = MD.render(fixMojibake(tokenBuf)) || fixMojibake(tokenBuf);
+      document.getElementById('empty') && document.getElementById('empty').remove();
+      var wrap = document.createElement('div');
+      wrap.className = 'msg agent';
+      wrap.innerHTML = '<div class="msg-label">Agent</div><div class="msg-body"></div>';
+      var body = wrap.querySelector('.msg-body');
+      var fixed = fixMojibake(tokenBuf);
+      body.innerHTML = MD.render(fixed) || _esc(fixed);
+      pane.appendChild(wrap);
       tokenBuf = '';
     }
 
     function flushTools() {
       if (!toolGroupItems.length) return;
-      document.getElementById('empty')?.remove();
-      const group = document.createElement('div');
+      document.getElementById('empty') && document.getElementById('empty').remove();
+      var group = document.createElement('div');
       group.className = 'tool-group';
-      const pane = document.getElementById('messages');
-      pane.appendChild(group);
-      for (const t of toolGroupItems) {
-        const row = document.createElement('div');
+      for (var ti = 0; ti < toolGroupItems.length; ti++) {
+        var t   = toolGroupItems[ti];
+        var row = document.createElement('div');
         row.className = 'tool-row';
-        const ok = t.ok;
+        var ok  = t.ok;
         row.dataset.s = ok === null ? 'pending' : (ok ? 'ok' : 'fail');
-        const icon = ok === null ? '\u25cc' : (ok ? '\u2713' : '\u2717');
-        const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        const preview = t.args ? t.args.slice(0, 50) + (t.args.length > 50 ? '\u2026' : '') : '';
-        row.innerHTML = `<span class="tr-icon">${icon}</span><span class="tr-name">${esc(t.name)}</span>${preview ? `<span class="tr-args">(${esc(preview)})</span>` : ''}`;
+        var icon    = ok === null ? '\u25cc' : (ok ? '\u2713' : '\u2717');
+        var preview = t.args ? (t.args.slice(0,50) + (t.args.length > 50 ? '\u2026' : '')) : '';
+        row.innerHTML = '<span class="tr-icon">'+icon+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(preview ? '<span class="tr-args">('+_esc(preview)+')</span>' : '');
         group.appendChild(row);
       }
+      pane.appendChild(group);
       toolGroupItems = [];
     }
 
-    let lastWasToken = false;
+    var lastWasToken = false;
 
-    for (const [kind, payload] of events) {
+    for (var ei = 0; ei < events.length; ei++) {
+      var kind    = events[ei][0];
+      var payload = events[ei][1];
+
       if (kind === 'token') {
         if (!lastWasToken) { flushTools(); }
         tokenBuf += payload;
@@ -1155,39 +1173,63 @@ const Replay = (() => {
       } else if (kind === 'tool') {
         if (lastWasToken) { flushTokens(); }
         lastWasToken = false;
-        const t = payload;
-        if (t.startsWith('\u2713') || t.startsWith('\u2717')) {
-          const name = t.slice(1).trim();
-          const item = [...toolGroupItems].reverse().find(x => x.name === name && x.ok === null);
-          if (item) item.ok = t.startsWith('\u2713');
+        var t2 = payload;
+        if (t2.startsWith('\u2713') || t2.startsWith('\u2717')) {
+          var name2 = t2.slice(1).trim();
+          for (var ri = toolGroupItems.length - 1; ri >= 0; ri--) {
+            if (toolGroupItems[ri].name === name2 && toolGroupItems[ri].ok === null) {
+              toolGroupItems[ri].ok = t2.startsWith('\u2713');
+              break;
+            }
+          }
         } else {
           flushTokens();
-          const m    = t.match(/^([^(]+)\(?(.*?)\)?$/s);
-          const name = m ? m[1].trim() : t;
-          const args = m ? m[2].trim() : '';
-          toolGroupItems.push({ name, args, ok: null });
+          var m2   = t2.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
+          var n2   = m2 ? m2[1].trim() : t2;
+          var a2   = m2 ? m2[2].trim() : '';
+          toolGroupItems.push({ name: n2, args: a2, ok: null });
         }
       } else if (kind === 'iteration') {
-        flushTokens();
-        flushTools();
-        lastWasToken = false;
-        const m = String(payload).match(/(\d+)\/(\d+)/);
-        if (m) Messages.sys(`\u2014 iteration ${m[1]}/${m[2]} \u2014`, 'info');
+        flushTokens(); flushTools(); lastWasToken = false;
+        var mm = String(payload).match(/(\d+)\/(\d+)/);
+        if (mm) _sysMsg('\u2014 iteration '+mm[1]+'/'+mm[2]+' \u2014', 'info');
       } else if (kind === 'done') {
-        flushTokens();
-        flushTools();
-        lastWasToken = false;
+        flushTokens(); flushTools(); lastWasToken = false;
       } else if (kind === 'error') {
-        flushTokens();
-        flushTools();
-        lastWasToken = false;
-        Messages.sys('\u26a0 ' + payload, 'err');
+        flushTokens(); flushTools(); lastWasToken = false;
+        _sysMsg('\u26a0 ' + payload, 'err');
       }
     }
-
     flushTokens();
     flushTools();
-    Scroll.jump();
+  }
+
+  function _sysMsg(text, variant) {
+    var d = document.createElement('div');
+    d.className = 'msg sys ' + (variant || '');
+    d.innerHTML = '<div class="msg-label"></div><div class="msg-body"></div>';
+    d.querySelector('.msg-body').textContent = text;
+    document.getElementById('messages').appendChild(d);
+  }
+
+  function run(events) {
+    if (!events || !events.length) return;
+    var banner = document.getElementById('replay-banner');
+    banner.textContent = '\u21a9 restored ' + events.length + ' events from this session';
+    banner.classList.add('show');
+    setTimeout(function(){ banner.classList.remove('show'); }, 3000);
+
+    // Chunk replay over multiple rAF frames to avoid blocking
+    var CHUNK = 200;
+    var offset = 0;
+    function nextChunk() {
+      var slice = events.slice(offset, offset + CHUNK);
+      if (!slice.length) { Scroll.jump(); return; }
+      _applyEvents(slice);
+      offset += CHUNK;
+      requestAnimationFrame(nextChunk);
+    }
+    requestAnimationFrame(nextChunk);
   }
 
   return { run };
@@ -1198,18 +1240,18 @@ const Replay = (() => {
 // MESSAGES
 // ═══════════════════════════════════════════════════════════════
 const Messages = (() => {
-  const pane = () => document.getElementById('messages');
-  function hideEmpty() { document.getElementById('empty')?.remove(); }
+  var pane = function(){ return document.getElementById('messages'); };
+  function hideEmpty() { var e = document.getElementById('empty'); if (e) e.remove(); }
 
   function add(role, html, extra, asHtml) {
     hideEmpty();
     Tools.endGroup();
-    const d = document.createElement('div');
+    var d = document.createElement('div');
     d.className = 'msg ' + role + (extra ? ' ' + extra : '');
-    const labels = { user: 'You', agent: 'Agent' };
-    d.innerHTML = `<div class="msg-label">${labels[role] ?? ''}</div><div class="msg-body"></div>`;
+    var labels = { user: 'You', agent: 'Agent' };
+    d.innerHTML = '<div class="msg-label">'+(labels[role] || '')+'</div><div class="msg-body"></div>';
     pane().appendChild(d);
-    const body = d.querySelector('.msg-body');
+    var body = d.querySelector('.msg-body');
     if (html) {
       if (asHtml) body.innerHTML = html;
       else        body.textContent = html;
@@ -1225,43 +1267,85 @@ const Messages = (() => {
 
 // ═══════════════════════════════════════════════════════════════
 // STREAMING AGENT MESSAGE
+// ─────────────────────────────────────────────────────────────
+// KEY FIX: flush() uses textContent (O(1)) so the main thread
+// never blocks during streaming.  Full MD.render() is deferred
+// to finalize(), wrapped in requestAnimationFrame() to yield
+// control back to the browser before doing the parse.
 // ═══════════════════════════════════════════════════════════════
 const Stream = (() => {
-  let el    = null;
-  let buf   = '';
-  let timer = null;
+  var el    = null;
+  var buf   = '';
+  var timer = null;
+
+  function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function _addCursor(body) {
+    body.appendChild(Object.assign(document.createElement('span'), { className: 'cursor' }));
+  }
 
   function start() {
     buf = '';
     el  = Messages.add('agent', '');
-    el.appendChild(Object.assign(document.createElement('span'), { className: 'cursor' }));
+    el.classList.add('streaming');
+    _addCursor(el);
   }
 
   function token(tok) {
-    buf += tok;  // accumulate raw — fix applied to full buffer at render time
+    buf += tok;
     clearTimeout(timer);
-    timer = setTimeout(flush, 35);
+    timer = setTimeout(flush, 60);
   }
 
+  // Lightweight flush — plain text only, no markdown parsing
   function flush() {
     if (!el) return;
-    const fixed = fixMojibake(buf);
-    el.innerHTML = MD.render(fixed) || '';
-    el.appendChild(Object.assign(document.createElement('span'), { className: 'cursor' }));
+    el.textContent = buf;   // fast O(1), never blocks
+    _addCursor(el);
     Scroll.maybe();
+  }
+
+  // Full markdown render, deferred via rAF so browser stays responsive
+  function _renderFinal(body, rawBuf) {
+    requestAnimationFrame(function() {
+      var fixed = fixMojibake(rawBuf);
+      if (!fixed.trim()) {
+        var wrap = body.closest('.msg');
+        if (wrap) wrap.remove();
+      } else {
+        body.classList.remove('streaming');
+        body.innerHTML = MD.render(fixed) || _esc(fixed);
+      }
+      Scroll.maybe();
+    });
   }
 
   function finalize() {
     clearTimeout(timer);
     if (!el) return;
-    const fixed = fixMojibake(buf);
-    if (!fixed.trim()) el.closest('.msg')?.remove();
-    else el.innerHTML = MD.render(fixed) || fixed;
-    el = null; buf = '';
-    Scroll.maybe();
+    var body   = el;
+    var rawBuf = buf;
+    el  = null;
+    buf = '';
+    _renderFinal(body, rawBuf);
   }
 
-  function reset() { el = null; buf = ''; clearTimeout(timer); }
+  // reset() called on Stop — still render what we have rather than discard
+  function reset() {
+    clearTimeout(timer);
+    if (!el) return;
+    var body   = el;
+    var rawBuf = buf;
+    el  = null;
+    buf = '';
+    if (rawBuf.trim()) {
+      _renderFinal(body, rawBuf);
+    } else {
+      var wrap = body.closest('.msg');
+      if (wrap) wrap.remove();
+    }
+  }
+
   function active() { return el !== null; }
   return { start, token, finalize, reset, active };
 })();
@@ -1271,15 +1355,15 @@ const Stream = (() => {
 // TOOL ROWS
 // ═══════════════════════════════════════════════════════════════
 const Tools = (() => {
-  const MAX = 12;
-  let group     = null;
-  let count     = 0;
-  const pending = new Map();
-  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  var MAX = 12;
+  var group     = null;
+  var count     = 0;
+  var pending   = new Map();
+  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   function ensureGroup() {
     if (group) return group;
-    document.getElementById('empty')?.remove();
+    var e = document.getElementById('empty'); if (e) e.remove();
     group = document.createElement('div');
     group.className = 'tool-group';
     Messages.pane().appendChild(group);
@@ -1290,32 +1374,32 @@ const Tools = (() => {
   function endGroup() { group = null; count = 0; }
 
   function makeRow(name, args) {
-    const row = document.createElement('div');
+    var row     = document.createElement('div');
     row.className = 'tool-row';
     row.dataset.s = 'pending';
-    const preview = args ? (args.slice(0, 50) + (args.length > 50 ? '\u2026' : '')) : '';
-    row.innerHTML = `<span class="tr-icon">\u25cc</span><span class="tr-name">${esc(name)}</span>${preview ? `<span class="tr-args">(${esc(preview)})</span>` : ''}`;
+    var preview = args ? (args.slice(0, 50) + (args.length > 50 ? '\u2026' : '')) : '';
+    row.innerHTML = '<span class="tr-icon">\u25cc</span><span class="tr-name">'+_esc(name)+'</span>'+(preview ? '<span class="tr-args">('+_esc(preview)+')</span>' : '');
     if (!pending.has(name)) pending.set(name, []);
     pending.get(name).push(row);
     return row;
   }
 
   function call(name, args) {
-    const g = ensureGroup();
+    var g = ensureGroup();
     count++;
     if (count > MAX) {
-      let more = g.querySelector('.tool-more');
+      var more = g.querySelector('.tool-more');
       if (!more) {
         more = Object.assign(document.createElement('div'), { className: 'tool-more' });
-        more.onclick = () => {
+        more.onclick = function() {
           more.remove();
-          g.querySelectorAll('[data-hidden]').forEach(el => { delete el.dataset.hidden; el.style.display = ''; });
+          g.querySelectorAll('[data-hidden]').forEach(function(el){ delete el.dataset.hidden; el.style.display = ''; });
         };
         g.appendChild(more);
       }
-      const n = count - MAX;
-      more.textContent = `+${n} more call${n !== 1 ? 's' : ''} \u2014 click to expand`;
-      const row = makeRow(name, args);
+      var n = count - MAX;
+      more.textContent = '+'+n+' more call'+(n !== 1 ? 's' : '')+' \u2014 click to expand';
+      var row = makeRow(name, args);
       row.dataset.hidden = '1'; row.style.display = 'none';
       g.insertBefore(row, more);
     } else {
@@ -1325,9 +1409,9 @@ const Tools = (() => {
   }
 
   function resolve(name, ok) {
-    const q = pending.get(name);
+    var q = pending.get(name);
     if (!q || !q.length) return;
-    const row = q.shift();
+    var row = q.shift();
     if (!q.length) pending.delete(name);
     if (!row) return;
     row.dataset.s = ok ? 'ok' : 'fail';
@@ -1343,14 +1427,14 @@ const Tools = (() => {
 // AGENT STATE MACHINE
 // ═══════════════════════════════════════════════════════════════
 const Agent = (() => {
-  let state     = 'idle';
-  let sessionId = null;
-  let requestId = null;
-  let _hadContent = false;
+  var state     = 'idle';
+  var sessionId = null;
+  var requestId = null;
+  var _hadContent = false;
 
   function setSession(id) {
     sessionId = id;
-    const pill = document.getElementById('session-pill');
+    var pill = document.getElementById('session-pill');
     if (id) { pill.textContent = id.slice(-8); pill.style.display = ''; }
     else    { pill.style.display = 'none'; }
   }
@@ -1360,7 +1444,7 @@ const Agent = (() => {
 
   function lockUI(on) {
     document.getElementById('msg-input').disabled = on;
-    const btn = document.getElementById('send-btn');
+    var btn = document.getElementById('send-btn');
     btn.textContent = on ? 'Stop' : 'Send';
     btn.className   = on ? 'stop' : '';
     if (!on) { Scroll.pin(); Scroll.update(); }
@@ -1373,6 +1457,39 @@ const Agent = (() => {
   }
 
   function handleEvent(evt) {
+    // If server says idle but we think we're running/waiting → clean up
+    if (evt.type === 'connect') {
+      var d = evt.data || {};
+      if (d.session) setSession(d.session);
+      if (d.mode)    Status.mode(d.mode);
+
+      if (d.history && d.history.length) {
+        var pane = document.getElementById('messages');
+        if (!pane.querySelectorAll('.msg').length) {
+          Replay.run(d.history);
+        }
+      }
+
+      if (d.state === 'running' && state === 'idle') {
+        transition('running');
+        Status.set('running\u2026', 'run');
+      } else if (d.state === 'waiting' && state === 'idle') {
+        transition('waiting');
+        Status.set('waiting \u2014 scheduled resume\u2026', 'wait');
+        Messages.sys('\u23f0 Session waiting \u2014 will resume automatically', 'warn');
+      } else if (d.state === 'idle' && state !== 'idle') {
+        // SSE reconnect: server is idle but we're stuck → recover cleanly
+        Stream.finalize();
+        Tools.endGroup();
+        transition('idle');
+        Status.set('done', 'done');
+        Status.iter('');
+        Messages.sys('\u2713 task finished', 'ok');
+        document.getElementById('msg-input').focus();
+      }
+      return;
+    }
+
     if (state === 'waiting' && evt.type !== 'connect') {
       transition('running');
       Tools.reset();
@@ -1380,38 +1497,6 @@ const Agent = (() => {
     }
 
     switch (evt.type) {
-
-      case 'connect': {
-        const d = evt.data || {};
-        if (d.session) setSession(d.session);
-        if (d.mode)    Status.mode(d.mode);
-
-        if (d.history && d.history.length) {
-          const pane = document.getElementById('messages');
-          const hasContent = pane.querySelectorAll('.msg').length > 0;
-          if (!hasContent) {
-            Replay.run(d.history);
-          }
-        }
-
-        if (d.state === 'running' && state === 'idle') {
-          transition('running');
-          Status.set('running\u2026', 'run');
-        } else if (d.state === 'waiting' && state === 'idle') {
-          transition('waiting');
-          Status.set('waiting \u2014 scheduled resume\u2026', 'wait');
-          Messages.sys('\u23f0 Session waiting \u2014 will resume automatically', 'warn');
-        } else if (d.state === 'idle' && state !== 'idle') {
-          Stream.finalize();
-          Tools.endGroup();
-          transition('idle');
-          Status.set('done', 'done');
-          Status.iter('');
-          Messages.sys('\u2713 task finished', 'ok');
-          document.getElementById('msg-input').focus();
-        }
-        break;
-      }
 
       case 'token':
         Tools.endGroup();
@@ -1425,14 +1510,14 @@ const Agent = (() => {
         break;
 
       case 'tool': {
-        const t = evt.data;
+        var t = evt.data;
         if (t.startsWith('\u2713') || t.startsWith('\u2717')) {
           Tools.resolve(t.slice(1).trim(), t.startsWith('\u2713'));
         } else {
           Stream.finalize();
-          const m    = t.match(/^([^(]+)\(?(.*?)\)?$/s);
-          const name = m ? m[1].trim() : t;
-          const args = m ? m[2].trim() : '';
+          var m = t.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
+          var name = m ? m[1].trim() : t;
+          var args = m ? m[2].trim() : '';
           Tools.call(name, args);
           _hadContent = true;
         }
@@ -1444,15 +1529,15 @@ const Agent = (() => {
         break;
 
       case 'iteration': {
-        const m = String(evt.data).match(/(\d+)\/(\d+)/);
-        if (m) {
+        var mi = String(evt.data).match(/(\d+)\/(\d+)/);
+        if (mi) {
           Stream.finalize();
           Tools.endGroup();
           if (_hadContent) {
-            Messages.sys(`\u2014 iteration ${m[1]}/${m[2]} \u2014`, 'info');
+            Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014', 'info');
           }
           _hadContent = false;
-          Status.iter(`${m[1]}/${m[2]}`);
+          Status.iter(mi[1]+'/'+mi[2]);
         }
         break;
       }
@@ -1477,8 +1562,8 @@ const Agent = (() => {
     Tools.endGroup();
     Status.iter('');
 
-    const isWait = String(reason || '').startsWith('waiting');
-    const isErr  = reason === 'error' || reason === 'stopped';
+    var isWait = String(reason || '').startsWith('waiting');
+    var isErr  = reason === 'error' || reason === 'stopped';
 
     if (isWait) {
       transition('waiting');
@@ -1493,7 +1578,9 @@ const Agent = (() => {
           Messages.sys('\u2014 stopped \u2014', 'warn');
         }
       } else {
-        const label = reason && reason !== 'done \u2713' ? reason : 'task finished';
+        // Normalise label — strip trailing " ✓" if already present to avoid dupe
+        var raw   = reason || 'done';
+        var label = raw.replace(/\s*\u2713\s*$/, '').trim() || 'task finished';
         Messages.sys('\u2713 ' + label, 'ok');
       }
 
@@ -1511,17 +1598,17 @@ const Agent = (() => {
     Tools.reset();
     _hadContent = false;
 
-    requestId = `r${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+    requestId = 'r' + Date.now() + Math.random().toString(36).slice(2, 6);
 
     try {
-      const resp = await fetch('/chat', {
+      var resp = await fetch('/chat', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ message: text, session_id: sessionId, request_id: requestId }),
       });
       if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
-        throw new Error(err.error || `HTTP ${resp.status}`);
+        var err = await resp.json().catch(function(){ return { error: 'HTTP ' + resp.status }; });
+        throw new Error(err.error || 'HTTP ' + resp.status);
       }
     } catch (err) {
       Stream.finalize();
@@ -1547,10 +1634,10 @@ const Agent = (() => {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ request_id: requestId }),
-      }).catch(() => {});
+      }).catch(function(){});
       requestId = null;
     }
-    Stream.finalize();
+    Stream.reset();
     Tools.endGroup();
     Messages.sys('\u2014 stopped \u2014', 'warn');
     transition('idle');
@@ -1562,7 +1649,7 @@ const Agent = (() => {
     if (state !== 'idle') { stop(); return; }
     try { await fetch('/new', { method: 'POST' }); } catch (_) {}
     setSession(null);
-    requestId = null;
+    requestId   = null;
     _hadContent = false;
     Tools.reset();
     Stream.reset();
@@ -1578,8 +1665,8 @@ const Agent = (() => {
   }
 
   function _triggerSend() {
-    const inp  = document.getElementById('msg-input');
-    const text = inp.value.trim();
+    var inp  = document.getElementById('msg-input');
+    var text = inp.value.trim();
     if (!text) return;
     inp.value = '';
     inp.style.height = 'auto';
@@ -1600,29 +1687,29 @@ const Agent = (() => {
 // PERSISTENT EVENTSOURCE
 // ═══════════════════════════════════════════════════════════════
 (function initStream() {
-  let es        = null;
-  let retryMs   = 1000;
+  var es      = null;
+  var retryMs = 1000;
 
   function connect() {
     ConnDot.try();
     es = new EventSource('/stream');
 
-    es.onopen = () => {
+    es.onopen = function() {
       ConnDot.ok();
       retryMs = 1000;
     };
 
-    es.onmessage = e => {
+    es.onmessage = function(e) {
       if (!e.data || e.data === '[DONE]') return;
       try {
         Agent._handle(JSON.parse(e.data));
       } catch (_) {}
     };
 
-    es.onerror = () => {
+    es.onerror = function() {
       es.close();
       ConnDot.err();
-      setTimeout(() => connect(), retryMs);
+      setTimeout(connect, retryMs);
       retryMs = Math.min(retryMs * 2, 30000);
     };
   }
@@ -1647,24 +1734,14 @@ const CMDS = [
   { cmd: '/session',  desc: 'Current session ID' },
 ];
 
-const HELP_TEXT = `Slash commands:
-  /help               This text
-  /new                Fresh session
-  /sessions           Browse sessions
-  /tools              Tool list + MCP
-  /status             Config info
-  /mode auto|normal|manual
-  /soul               Agent personality
-  /todo               Current todos
-  /plan               Current plan
-  /session            Session ID`;
+const HELP_TEXT = 'Slash commands:\n  /help               This text\n  /new                Fresh session\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID';
 
 const SlashCmds = (() => {
   async function run(text) {
-    const parts = text.trim().split(/\s+/);
-    const cmd   = parts[0].toLowerCase();
-    const arg   = parts.slice(1).join(' ');
-    const sys   = Messages.sys.bind(Messages);
+    var parts = text.trim().split(/\s+/);
+    var cmd   = parts[0].toLowerCase();
+    var arg   = parts.slice(1).join(' ');
+    var sys   = Messages.sys.bind(Messages);
 
     switch (cmd) {
       case '/help':     sys(HELP_TEXT, 'info'); break;
@@ -1672,49 +1749,49 @@ const SlashCmds = (() => {
       case '/sessions': UI.toggleSessions(); break;
       case '/tools':    UI.toggleTools(); break;
       case '/session':
-        sys(Agent.getSession() ? `Session: ${Agent.getSession()}` : 'No active session.', 'info');
+        sys(Agent.getSession() ? 'Session: ' + Agent.getSession() : 'No active session.', 'info');
         break;
       case '/status':
         try {
-          const s = await fetch('/status').then(r => r.json());
-          sys(`Workspace : ${s.workspace}\nLLM       : ${s.llm_url}\nSession   : ${s.current_session ? s.current_session.slice(-8) : 'none'}\nMode      : ${s.permission_mode}\nMCP       : ${s.mcp_clients} server${s.mcp_clients !== 1 ? 's' : ''}`, 'info');
+          var s = await fetch('/status').then(function(r){ return r.json(); });
+          sys('Workspace : '+s.workspace+'\nLLM       : '+s.llm_url+'\nSession   : '+(s.current_session ? s.current_session.slice(-8) : 'none')+'\nMode      : '+s.permission_mode+'\nMCP       : '+s.mcp_clients+' server'+(s.mcp_clients !== 1 ? 's' : ''), 'info');
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
         break;
       case '/soul':
         try {
-          const r = await fetch('/soul').then(r => r.json());
+          var r = await fetch('/soul').then(function(r){ return r.json(); });
           sys(r.soul || '(no soul config)', 'info');
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
         break;
       case '/mode': {
         if (!arg) { sys('Usage: /mode auto|normal|manual', 'warn'); break; }
         try {
-          const r = await fetch('/mode', {
+          var r2 = await fetch('/mode', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode: arg }),
-          }).then(r => r.json());
-          if (r.ok) { Status.mode(arg); sys(`Mode \u2192 ${arg}`, 'ok'); }
-          else      { sys(`Invalid mode '${arg}'. Use: auto, normal, manual`, 'err'); }
+          }).then(function(r){ return r.json(); });
+          if (r2.ok) { Status.mode(arg); sys('Mode \u2192 ' + arg, 'ok'); }
+          else       { sys('Invalid mode \''+arg+'\'. Use: auto, normal, manual', 'err'); }
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
         break;
       }
       case '/todo':
       case '/plan': {
-        const sid = Agent.getSession();
+        var sid = Agent.getSession();
         if (!sid) { sys('No active session.', 'warn'); break; }
         try {
-          const r = await fetch('/cmd', {
+          var r3 = await fetch('/cmd', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cmd: cmd.slice(1), session_id: sid }),
-          }).then(r => r.json());
-          sys(r.text || '(empty)', 'info');
+          }).then(function(r){ return r.json(); });
+          sys(r3.text || '(empty)', 'info');
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
         break;
       }
       default:
-        sys(`Unknown command: ${cmd}. Type /help for list.`, 'err');
+        sys('Unknown command: ' + cmd + '. Type /help for list.', 'err');
     }
   }
   return { run };
@@ -1725,20 +1802,20 @@ const SlashCmds = (() => {
 // COMMAND PALETTE
 // ═══════════════════════════════════════════════════════════════
 const Palette = (() => {
-  let idx = -1;
-  const pal = () => document.getElementById('palette');
-  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  var idx = -1;
+  var pal = function(){ return document.getElementById('palette'); };
+  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   function build(val) {
-    const q = val.slice(1).toLowerCase();
-    const matches = q === '' ? CMDS : CMDS.filter(c => c.cmd.includes(q) || c.desc.toLowerCase().includes(q));
+    var q = val.slice(1).toLowerCase();
+    var matches = q === '' ? CMDS : CMDS.filter(function(c){ return c.cmd.includes(q) || c.desc.toLowerCase().includes(q); });
     if (!matches.length) { close(); return; }
     pal().innerHTML = '';
-    matches.forEach((c, i) => {
-      const d = document.createElement('div');
+    matches.forEach(function(c, i) {
+      var d = document.createElement('div');
       d.className = 'pi' + (i === idx ? ' sel' : '');
-      d.innerHTML = `<span class="pi-cmd">${esc(c.cmd)}${c.arg ? ' <span style="color:var(--text3)">' + esc(c.arg) + '</span>' : ''}</span><span class="pi-desc">${esc(c.desc)}</span>`;
-      d.onclick = () => select(c.cmd);
+      d.innerHTML = '<span class="pi-cmd">'+_esc(c.cmd)+(c.arg ? ' <span style="color:var(--text3)">'+_esc(c.arg)+'</span>' : '')+'</span><span class="pi-desc">'+_esc(c.desc)+'</span>';
+      d.onclick = function(){ select(c.cmd); };
       pal().appendChild(d);
     });
     pal().classList.add('open');
@@ -1747,7 +1824,7 @@ const Palette = (() => {
   function close() { pal().classList.remove('open'); idx = -1; }
 
   function select(cmd) {
-    const inp = document.getElementById('msg-input');
+    var inp = document.getElementById('msg-input');
     inp.value = cmd === '/mode' ? '/mode ' : cmd;
     close();
     inp.focus();
@@ -1760,12 +1837,12 @@ const Palette = (() => {
   }
 
   function onKey(e) {
-    const p = pal();
+    var p = pal();
     if (p.classList.contains('open')) {
-      const items = p.querySelectorAll('.pi');
-      if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(idx+1, items.length-1); items.forEach((el,i) => el.classList.toggle('sel', i===idx)); return; }
-      if (e.key === 'ArrowUp')   { e.preventDefault(); idx = Math.max(idx-1, 0);              items.forEach((el,i) => el.classList.toggle('sel', i===idx)); return; }
-      if (e.key === 'Tab' || (e.key === 'Enter' && idx >= 0)) { e.preventDefault(); (idx >= 0 ? items[idx] : items[0])?.click(); return; }
+      var items = p.querySelectorAll('.pi');
+      if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(idx+1, items.length-1); items.forEach(function(el,i){ el.classList.toggle('sel', i===idx); }); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); idx = Math.max(idx-1, 0);              items.forEach(function(el,i){ el.classList.toggle('sel', i===idx); }); return; }
+      if (e.key === 'Tab' || (e.key === 'Enter' && idx >= 0)) { e.preventDefault(); (idx >= 0 ? items[idx] : items[0]) && (idx >= 0 ? items[idx] : items[0]).click(); return; }
       if (e.key === 'Escape') { close(); return; }
     }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); Agent.sendOrStop(); }
@@ -1781,29 +1858,29 @@ function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(e
 // SESSIONS PANEL
 // ═══════════════════════════════════════════════════════════════
 const SessionsPanel = (() => {
-  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   async function load() {
-    const list = document.getElementById('sessions-list');
+    var list = document.getElementById('sessions-list');
     list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
     try {
-      const sessions = await fetch('/sessions').then(r => r.json());
+      var sessions = await fetch('/sessions').then(function(r){ return r.json(); });
       list.innerHTML = '';
       if (!sessions.length) { list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">No sessions yet</div>'; return; }
-      for (const s of sessions) {
-        const d = document.createElement('div');
+      sessions.forEach(function(s) {
+        var d = document.createElement('div');
         d.className = 'session-item' + (s.id === Agent.getSession() ? ' active' : '');
-        d.innerHTML = `<div class="si-id">${esc(s.id)}</div><div class="si-task">${esc(s.task||'\u2014')}</div><div class="si-stat ${esc(s.status)}">${esc(s.status)} \u00b7 ${s.iterations} iter</div>`;
-        d.onclick = () => {
+        d.innerHTML = '<div class="si-id">'+_esc(s.id)+'</div><div class="si-task">'+_esc(s.task||'\u2014')+'</div><div class="si-stat '+_esc(s.status)+'">'+_esc(s.status)+' \u00b7 '+s.iterations+' iter</div>';
+        d.onclick = function() {
           if (Agent.running()) return;
           Agent.setSession(s.id);
           UI.closeSessions();
-          Messages.sys(`resumed ${s.id.slice(-8)}`);
+          Messages.sys('resumed ' + s.id.slice(-8));
         };
         list.appendChild(d);
-      }
+      });
     } catch (err) {
-      list.innerHTML = `<div style="padding:10px;color:var(--red);font-size:11px">Error: ${esc(err.message)}</div>`;
+      list.innerHTML = '<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>';
     }
   }
   return { load };
@@ -1814,43 +1891,45 @@ const SessionsPanel = (() => {
 // TOOLS PANEL
 // ═══════════════════════════════════════════════════════════════
 const ToolsPanel = (() => {
-  let data = null;
-  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  var data = null;
+  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   async function load() {
-    const list = document.getElementById('tools-list');
+    var list = document.getElementById('tools-list');
     list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
     try {
-      data = await fetch('/tools').then(r => r.json());
+      data = await fetch('/tools').then(function(r){ return r.json(); });
       render('');
     } catch (err) {
-      list.innerHTML = `<div style="padding:10px;color:var(--red);font-size:11px">Error: ${esc(err.message)}</div>`;
+      list.innerHTML = '<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>';
     }
   }
 
   function render(q) {
-    const list = document.getElementById('tools-list');
+    var list = document.getElementById('tools-list');
     list.innerHTML = '';
-    const qlo = q.toLowerCase();
-    const all = { ...data.builtin, ...(data.mcp || {}) };
-    let shown = false;
-    for (const [cat, tools] of Object.entries(all)) {
-      const filtered = tools.filter(t => !qlo || t.name.includes(qlo) || t.description.toLowerCase().includes(qlo));
-      if (!filtered.length) continue;
+    var qlo  = q.toLowerCase();
+    var all  = Object.assign({}, data.builtin, data.mcp || {});
+    var shown = false;
+    Object.entries(all).forEach(function(entry) {
+      var cat   = entry[0];
+      var tools = entry[1];
+      var filtered = tools.filter(function(t){ return !qlo || t.name.includes(qlo) || t.description.toLowerCase().includes(qlo); });
+      if (!filtered.length) return;
       shown = true;
-      const isMcp = cat.startsWith('MCP');
-      const catEl = document.createElement('div');
+      var isMcp  = cat.startsWith('MCP');
+      var catEl  = document.createElement('div');
       catEl.className = 'tool-cat' + (isMcp ? ' mcp-cat' : '');
-      catEl.innerHTML = `<div class="tool-cat-hdr">${esc(cat)}</div>`;
-      filtered.forEach(t => {
-        const params = t.params.length ? t.params.map(p => t.required.includes(p) ? p : `[${p}]`).join(', ') : '';
-        const entry  = document.createElement('div');
-        entry.className = 'tool-entry';
-        entry.innerHTML = `<div class="te-name">${esc(t.name)}<span class="te-params">${params ? '(' + esc(params) + ')' : ''}</span></div>${t.description ? `<div class="te-desc">${esc(t.description)}</div>` : ''}`;
-        catEl.appendChild(entry);
+      catEl.innerHTML  = '<div class="tool-cat-hdr">'+_esc(cat)+'</div>';
+      filtered.forEach(function(t) {
+        var params = t.params.length ? t.params.map(function(p){ return t.required.includes(p) ? p : '['+p+']'; }).join(', ') : '';
+        var entry2  = document.createElement('div');
+        entry2.className = 'tool-entry';
+        entry2.innerHTML  = '<div class="te-name">'+_esc(t.name)+'<span class="te-params">'+(params ? '('+_esc(params)+')' : '')+'</span></div>'+(t.description ? '<div class="te-desc">'+_esc(t.description)+'</div>' : '');
+        catEl.appendChild(entry2);
       });
       list.appendChild(catEl);
-    }
+    });
     if (!shown) list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">No matching tools</div>';
   }
 
@@ -1863,7 +1942,7 @@ const ToolsPanel = (() => {
 // UI PANEL MANAGEMENT
 // ═══════════════════════════════════════════════════════════════
 const UI = (() => {
-  const overlay = () => document.getElementById('overlay');
+  var overlay = function(){ return document.getElementById('overlay'); };
   function openPanel(id)  { document.getElementById(id).classList.add('open');    overlay().classList.add('show'); }
   function closePanel(id) { document.getElementById(id).classList.remove('open'); overlay().classList.remove('show'); }
   function isOpen(id)     { return document.getElementById(id).classList.contains('open'); }
@@ -1891,9 +1970,9 @@ const UI = (() => {
 // ═══════════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════════
-(async () => {
+(async function() {
   try {
-    const s = await fetch('/status').then(r => r.json());
+    var s = await fetch('/status').then(function(r){ return r.json(); });
     Status.mode(s.permission_mode);
     if (s.current_session) Agent.setSession(s.current_session);
   } catch (_) {}
@@ -2316,7 +2395,7 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "\u2550" * 58)
-    print("  LMAgent Web  v6.5.1")
+    print("  LMAgent Web  v6.5.2")
     print("\u2550" * 58)
     print(f"  Local  \u2192  http://localhost:{port}")
     print(f"  Phone  \u2192  http://{ip}:{port}")
@@ -2324,8 +2403,7 @@ if __name__ == "__main__":
     print(f"  LLM       : {Config.LLM_URL}")
     print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
     print("\u2550" * 58)
-
-    print("  FIX: Agent prose uses readable sans-serif font \u2713")
+    print("  FIX: Non-blocking stream rendering (no more page freeze) \u2713")
     print("\u2550" * 58 + "\n")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
