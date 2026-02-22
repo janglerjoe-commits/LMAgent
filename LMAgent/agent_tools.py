@@ -2,17 +2,12 @@
 """
 agent_tools.py — Tool layer for LMAgent.
 
-Sandbox patch v9.5.0-sandbox:
-  - Re-introduces the shell tool using a cross-platform sandboxed subprocess.
-  - Windows + pywin32  : Windows Job Object (kill_on_job_close, memory limit).
-  - Windows, no pywin32: psutil process-tree kill on timeout.
-  - macOS / Linux      : os.setsid() process group + RLIMIT_AS + RLIMIT_CPU.
-  - All paths still validated through Safety.validate_command() before execution.
-  - sandboxed_shell.py must live in the same directory as this file.
-  - pip install psutil        # all platforms
-  - pip install pywin32       # Windows only — stronger Job Object backend
+Sandbox patch v9.5.1-sandbox-git:
+  - Git commands now routed through run_sandboxed() instead of get_shell_session().
+    This means git runs inside the Docker container (same sandbox as shell tool)
+    and falls back to process-group + rlimits if Docker is unavailable — exactly
+    the same backend selection as the shell tool.
 
-All other behaviour is unchanged from v9.4.0-nosell.
 """
 
 import json
@@ -74,13 +69,19 @@ def _validate_git_ref(name: str) -> Tuple[bool, str]:
 
 # =============================================================================
 # SECURE GIT EXECUTION HELPER  (internal only — not a tool the LLM can call)
+#
+# CHANGED from v9.5.0: now routes through run_sandboxed() so git executes inside
+# the Docker container (or process-group fallback) rather than on the host shell.
+# This closes the bypass where git hooks / submodule URLs could touch the host.
 # =============================================================================
 
 def _git_safe(workspace: Path, cmd: str) -> Tuple[str, int]:
     ok, reason = Safety.validate_command(cmd, workspace)
     if not ok:
         raise ValueError(reason)
-    return get_shell_session(workspace).execute(cmd)
+    # Route through run_sandboxed — same Docker container / fallback as tool_shell.
+    # Git must be available in the container image (see module docstring).
+    return run_sandboxed(cmd=cmd, workspace=workspace)
 
 
 # =============================================================================
@@ -329,7 +330,7 @@ def tool_shell(
 
 
 # =============================================================================
-# TOOL HANDLERS — GIT  (use _git_safe internally; never exposed as raw shell)
+# TOOL HANDLERS — GIT  (now sandboxed via _git_safe → run_sandboxed)
 # =============================================================================
 
 def tool_git_status(workspace: Path) -> Dict[str, Any]:
@@ -1430,6 +1431,8 @@ Shell sandbox backends (selected automatically):
   Windows + pywin32  → Job Object (process tree killed on handle close)
   Windows, no pywin32→ psutil tree-kill
   macOS / Linux      → process group + RLIMIT_AS + RLIMIT_CPU
+
+Git sandbox: same backend as shell — runs inside Docker container when available.
 """
 
 SUB_AGENT_SYSTEM_PROMPT = """You are a precise file-creation agent. One job: create the file exactly as specified.
