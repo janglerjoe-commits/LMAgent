@@ -3,7 +3,57 @@
 
 [![Watch the demo](https://img.youtube.com/vi/GNQP6M53c5A/hqdefault.jpg)](https://www.youtube.com/watch?v=GNQP6M53c5A)
 
-A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible LLM (LM Studio, Ollama, etc.) and can autonomously read and write files, run shell commands, manage git, track todos, coordinate sub-tasks, and much more — all from an interactive terminal REPL or a polished web UI.
+A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible LLM (LM Studio, Ollama, etc.) and can autonomously read and write files, run shell commands, manage git, track todos, coordinate sub-tasks, and much more all from an interactive terminal REPL or a polished web UI.
+
+---
+
+## Security & Sandboxing
+
+LMAgent runs all shell and git commands inside a hardened Docker container. This means the LLM is physically isolated from your host machine it cannot access your files, system settings, or other directories outside the designated workspace folder.
+
+### How it works
+
+A single persistent Docker container is created on first use and reused across sessions. The container is locked down with the following protections:
+
+- **Read-only filesystem** — the container's own system files cannot be modified
+- **Workspace-only write access** — the only folder the LLM can read or write is your designated workspace, mounted at `/workspace` inside the container
+- **All Linux capabilities dropped** — no privileged operations
+- **No privilege escalation** — `no-new-privileges` enforced
+- **PID limit** — fork bombs are capped at 128 processes
+- **Memory cap** — 512 MB by default (configurable up to 2 GB)
+- **CPU cap** — 90% of one core maximum
+- **Git sandboxed** — git commands run inside the same Docker container, not on your host. This prevents malicious git hooks or submodule URLs from touching your host machine.
+
+### The workspace folder
+
+Your workspace folder on Windows (or macOS/Linux) is mounted directly into the container. This is a live two-way link files you drop into the folder instantly appear inside the container, and files the LLM creates instantly appear in your folder. The container itself is disposable; your workspace folder persists independently.
+
+The LLM can only see and touch that one folder on your real machine. Everything else on your PC is completely invisible to it.
+
+### Docker network
+
+By default the container runs with `bridge` network mode, meaning it can make outbound internet connections (required for pip installs, web requests, etc.). If you want full air-gap isolation and don't need internet access inside the container, set `DOCKER_NETWORK = "none"` in `sandboxed_shell.py`. This blocks all external network access from inside the container.
+
+### Fallback mode
+
+If Docker is not running, LMAgent falls back to a process-group sandbox with memory and CPU limits. A loud warning is printed to the terminal when this happens. Start Docker Desktop to restore full isolation.
+
+### Requirements
+
+```bash
+pip install psutil docker
+```
+
+Docker Desktop must be running on Windows. On macOS/Linux, Docker is optional the process-group backend is used by default unless you set `FORCE_DOCKER = True` in `sandboxed_shell.py`.
+
+**Git inside Docker:** `python:3.12-slim` does not include git. To enable git tools inside the container, update the container startup command in `sandboxed_shell.py`:
+
+```python
+# Change this line in sandboxed_shell.py:
+command=["sh", "-c", "apt-get install -y -q git > /dev/null 2>&1; while true; do sleep 3600; done"],
+```
+
+This installs git once when the container first starts. Since the container is persistent it only runs once per session.
 
 ---
 
@@ -15,8 +65,9 @@ A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible
 | `agent_tools.py` | Tool handlers, LLM client, tool registry, system prompts |
 | `agent_main.py` | CLI entrypoint, `run_agent()`, interactive REPL, background scheduler |
 | `agent_web.py` | Flask web UI — place next to the three core files |
+| `sandboxed_shell.py` | Cross-platform sandboxed subprocess execution (Docker + fallback) |
 
-All four files must be in the same directory.
+All five files must be in the same directory.
 
 ---
 
@@ -27,10 +78,14 @@ All four files must be in the same directory.
 LMAgent requires Python 3.10 or later.
 
 ```bash
-pip install requests flask colorama
+pip install requests flask colorama psutil docker
 ```
 
-### 2. Set up your LLM
+### 2. Install and start Docker Desktop
+
+Download and install [Docker Desktop](https://www.docker.com/products/docker-desktop/). Make sure it is running before you launch LMAgent. The sandbox container is created automatically on first use.
+
+### 3. Set up your LLM
 
 LMAgent connects to any OpenAI-compatible API endpoint. The easiest option is [LM Studio](https://lmstudio.ai/):
 
@@ -39,9 +94,9 @@ LMAgent connects to any OpenAI-compatible API endpoint. The easiest option is [L
 3. Go to **Local Server** in LM Studio and click **Start Server**
 4. The server runs at `http://localhost:1234` by default — this is what LMAgent expects out of the box
 
-You can also use Ollama, a remote OpenAI-compatible API, or any other compatible server — just update `LLM_URL` in your config.
+You can also use Ollama, a remote OpenAI-compatible API, or any other compatible server just update `LLM_URL` in your config.
 
-### 3. Create a workspace
+### 4. Create a workspace
 
 Your workspace is the directory LMAgent works inside. It reads and writes files here, and stores all session data in a hidden `.lmagent/` subfolder.
 
@@ -49,9 +104,9 @@ Your workspace is the directory LMAgent works inside. It reads and writes files 
 mkdir ~/lmagent_workspace
 ```
 
-You can use any existing project directory as your workspace too.
+You can use any existing project directory as your workspace too. On Windows, you can just create a regular folder anywhere drop files into it and the LLM will be able to see and work with them instantly.
 
-### 4. Create a `.env` file
+### 5. Create a `.env` file
 
 Create a file called `.env` in the same directory as the agent scripts. This is where all your configuration lives:
 
@@ -71,7 +126,7 @@ PERMISSION_MODE="normal"
 
 If you skip this step entirely, LMAgent will prompt you to enter a workspace path on first launch and offer to save it to `.env` automatically.
 
-### 5. Run it
+### 6. Run it
 
 **Terminal REPL:**
 ```bash
@@ -186,10 +241,10 @@ LMAgent calls these tools autonomously during a task.
 - `mkdir` — create a directory
 
 **Shell**
-- `shell` / `powershell` — run a command (bash on Linux/macOS, PowerShell on Windows); shell state persists across calls within a session
+- `shell` — run a command inside the Docker sandbox (bash on Linux/macOS, cmd on Windows); falls back to process-group isolation if Docker is unavailable
 
 **Git**
-- `git_status`, `git_diff`, `git_add`, `git_commit`, `git_branch`
+- `git_status`, `git_diff`, `git_add`, `git_commit`, `git_branch` — all git operations run inside the Docker sandbox, not on your host machine
 
 **Task management**
 - `todo_add`, `todo_complete`, `todo_update`, `todo_list`
@@ -197,7 +252,7 @@ LMAgent calls these tools autonomously during a task.
 - `task_state_update`, `task_state_get`, `task_reconcile`
 
 **Sub-agents**
-- `task` — delegates single-file creation to an isolated sub-agent
+- `task` — delegates single-file creation to an isolated sub-agent (file tools only, no shell or git access)
 
 **Utilities**
 - `get_time` — current date and time
@@ -260,7 +315,6 @@ Most MCP servers are distributed via npm or pip. You need [Node.js](https://node
 
 **npm-based servers (most common):**
 ```bash
-# Install globally so the command is available system-wide
 npm install -g @modelcontextprotocol/server-filesystem
 npm install -g @modelcontextprotocol/server-brave-search
 npm install -g @modelcontextprotocol/server-puppeteer
@@ -297,8 +351,6 @@ Then create the file `~/lmagent_workspace/.lmagent/mcp.json`:
 
 ### Step 3 — Add more servers
 
-You can register as many servers as you like. Each gets a name, a command to launch it, any arguments it needs, and optional environment variables (useful for API keys):
-
 ```json
 {
   "mcpServers": {
@@ -333,11 +385,11 @@ MCP servers are loaded at startup. Restart `agent_main.py` or `agent_web.py` and
 [INFO] Loaded 2 MCP servers
 ```
 
-MCP tools appear automatically alongside built-in tools. In the web UI you can see them in the **Tools** panel under their own MCP section. The agent will use them just like any other tool.
+MCP tools appear automatically alongside built-in tools. In the web UI you can see them in the **Tools** panel under their own MCP section.
 
 ### Troubleshooting MCP
 
-- **Server won't start** — run the command manually in your terminal first to check for errors (e.g. `npx @modelcontextprotocol/server-filesystem /your/path`). Common causes are Node.js not installed, a missing API key in `env`, or a wrong path.
+- **Server won't start** — run the command manually in your terminal first to check for errors. Common causes are Node.js not installed, a missing API key in `env`, or a wrong path.
 - **Tools not showing up** — check that the server name in `mcp.json` has no typos and that LMAgent restarted after you edited the file.
 - **npm not found** — install Node.js from [nodejs.org](https://nodejs.org/). The LTS version is recommended.
 
@@ -382,8 +434,10 @@ python agent_main.py --resume 20260220_143512_a1b2c3
 
 ## Tips
 
-- **First run slow?** The agent validates the LLM connection at startup. If it fails, check that your LM Studio server is running and that `LLM_URL` in `.env` is correct.
+- **First run slow?** The agent validates the LLM connection at startup. If it fails, check that your LM Studio server is running and that `LLM_URL` in `.env` is correct. The Docker container is also created on first use which may take a moment to pull the image.
+- **Docker not running?** LMAgent will fall back to a process-group sandbox and print a warning. Start Docker Desktop to restore full isolation.
 - **Stuck agent?** The loop detector intervenes after repeated identical tool calls, consecutive errors, or empty iterations. You can also click Stop in the web UI at any time.
 - **Large projects?** The context window compacts automatically once it exceeds `SUMMARIZATION_THRESHOLD` tokens, preserving task-critical messages and summarising older ones.
 - **Thinking models (QwQ, DeepSeek-R1)?** `THINKING_MODEL=true` is on by default — reasoning tokens are stripped from the context window before being fed back to the model.
 - **Multiple sessions at once?** The scheduler, REPL, and web UI can all run simultaneously. Each agent session gets its own thread-local shell process so they never interfere with each other.
+- **Want full air-gap isolation?** Set `DOCKER_NETWORK = "none"` in `sandboxed_shell.py` to block all outbound network access from inside the container. Note this will also disable pip installs and any web requests from within the sandbox.
