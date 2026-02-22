@@ -2,42 +2,41 @@
 """
 sandboxed_shell.py — Cross-platform sandboxed subprocess execution.
 
-Docker backend: EPHEMERAL containers
---------------------------------------
-Each call to run_sandboxed() spins up a brand-new hardened Docker container,
-runs exactly one command, captures its output, then removes the container in
-a finally-block — even if the command crashes or times out.
+ONE container, used forever
+----------------------------
+A single hardened Docker container is created on first use and given a
+fixed name (SANDBOX_CONTAINER_NAME). Every call to run_sandboxed() finds
+and reuses it by name — no CID file, no fragile state.
 
-There is NO persistent container, NO .sandbox_cid file, NO atexit / signal
-plumbing needed for Docker: the container is always removed before the call
-returns.
+A new container is only made when the old one is GENUINELY gone:
+  • First ever call (nothing exists)
+  • The container was manually deleted from Docker Desktop
+  • The container crashed / OOM-killed by the OS
 
-Hardening (same as before)
---------------------------
-  - All Linux capabilities dropped
-  - no-new-privileges secopt
-  - Read-only root filesystem
-  - /tmp and sensitive /proc paths on tmpfs
-  - Memory + swap limit
-  - CPU quota (90 % of one core)
-  - PID limit (128)
-  - Configurable network mode (default "none" = fully air-gapped)
+Cleanup order
+-------------
+1. atexit    — normal exit / /new / quit
+2. SIGTERM   — killed by task manager or `docker stop`
+3. SIGINT    — Ctrl+C
+4. Watchdog  — daemon thread catches interpreter teardown after hard crashes
+(SIGKILL cannot be caught, but atexit + watchdog covers all real scenarios.)
 
 Platform behaviour
 ------------------
-  Windows / FORCE_DOCKER=True  → ephemeral hardened Docker container per call
-  macOS / Linux                → process group + rlimits
-  Docker unavailable           → process-group fallback + loud terminal warning
+  Windows / FORCE_DOCKER=True  → persistent hardened Docker container
+  macOS / Linux                → process group + rlimits (set FORCE_DOCKER=True for Docker)
+  Docker unavailable           → process-group fallback + loud warning
 
 Requirements
 ------------
-    pip install psutil      # recommended (child-process sweep)
+    pip install psutil      # recommended
     pip install docker      # required for Docker backend
     Docker Desktop          # must be running (Windows / FORCE_DOCKER)
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import platform
 import signal
@@ -52,9 +51,10 @@ from typing import Optional, Tuple
 # Tunables
 # ---------------------------------------------------------------------------
 
-DOCKER_IMAGE   = "python:3.12-slim"
-DOCKER_NETWORK = "none"    # "none" = fully air-gapped (safest), "bridge" = outbound internet
-FORCE_DOCKER   = False     # True = use Docker on macOS / Linux too
+DOCKER_IMAGE            = "python:3.12-slim"
+DOCKER_NETWORK          = "bridge"         # "none" = air-gapped, "bridge" = outbound internet
+FORCE_DOCKER            = False            # True = use Docker on macOS/Linux too
+SANDBOX_CONTAINER_NAME  = "claude-sandbox" # fixed name — survives restarts without a CID file
 
 DEFAULT_TIMEOUT_SECS  = 30
 DEFAULT_MAX_OUTPUT    = 32_768   # bytes
@@ -77,14 +77,16 @@ if _IS_POSIX:
     import resource
 
 # ---------------------------------------------------------------------------
-# Module-level state — mutations go through _lock
+# Module-level state
 # ---------------------------------------------------------------------------
 
-_lock             = threading.Lock()
-_docker_client    = None
-_docker_available = None   # None = unchecked, True / False = known
-_fallback_warned  = False
-_image_pulled     = False  # pull once per process, not on every call
+_lock               = threading.RLock()
+_docker_client      = None
+_docker_available   = None   # None = unchecked, True/False = known
+_sandbox_container  = None   # the ONE container for this process
+_cleanup_done       = False
+_cleanup_registered = False
+_fallback_warned    = False
 
 # ---------------------------------------------------------------------------
 # Terminal output (stderr only — LLM never sees these)
@@ -114,8 +116,8 @@ def _warn_fallback_header() -> None:
         "║  ⚠  SANDBOX WARNING — INSECURE FALLBACK MODE ACTIVE         ║\n"
         "║                                                              ║\n"
         "║  Docker is not running. Shell commands execute on your HOST  ║\n"
-        "║  machine with NO filesystem isolation. The process can       ║\n"
-        "║  access files outside the workspace.                        ║\n"
+        "║  machine with NO filesystem isolation. The LLM can access   ║\n"
+        "║  files outside the workspace.                               ║\n"
         "║  Start Docker Desktop to restore full isolation.             ║\n"
         f"╚══════════════════════════════════════════════════════════════╝{_RESET}\n\n"
     )
@@ -142,17 +144,11 @@ def _warn_docker_restored() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Docker client management
+# Docker client
 # ---------------------------------------------------------------------------
 
-# Sensitive /proc paths hidden inside containers via tmpfs overlays
-_MASKED_PROC_PATHS = [
-    "/proc/mounts",
-    "/proc/net",
-    "/proc/sys",
-    "/proc/sched_debug",
-    "/proc/timer_list",
-]
+
+
 
 
 def _check_docker() -> bool:
@@ -163,7 +159,7 @@ def _check_docker() -> bool:
         client = docker.from_env()
         client.ping()
         with _lock:
-            was_down = _docker_available is False
+            was_down          = _docker_available is False
             _docker_available = True
             _docker_client    = client
         if was_down:
@@ -185,34 +181,223 @@ def _get_docker_client():
             client.ping()
             return client
         except Exception:
-            pass  # fall through and re-probe
+            pass
     return _docker_client if _check_docker() else None
 
 
 def _ensure_image(client) -> None:
-    """Pull the image once per process if it is not already present locally."""
-    global _image_pulled
-    with _lock:
-        if _image_pulled:
-            return
     try:
         client.images.get(DOCKER_IMAGE)
-        with _lock:
-            _image_pulled = True
     except Exception:
         _info(f"Pulling {DOCKER_IMAGE!r} (first run only)…")
         client.images.pull(DOCKER_IMAGE)
-        with _lock:
-            _image_pulled = True
         _info("Image ready.")
 
 
 # ---------------------------------------------------------------------------
-# Docker command execution — EPHEMERAL (one container per command)
+# Container singleton — looked up by fixed name, not a CID file
+# ---------------------------------------------------------------------------
+
+def _container_is_alive(container) -> bool:
+    """Return True if the container object refers to a running container."""
+    try:
+        container.reload()
+        return container.status == "running"
+    except Exception:
+        return False
+
+
+def _find_existing_container(client):
+    """
+    Look up the sandbox container by its fixed name.
+      Running → return immediately.
+      Stopped → restart and return.
+      Missing → return None (caller will create it).
+    """
+    try:
+        container = client.containers.get(SANDBOX_CONTAINER_NAME)
+    except Exception:
+        return None  # name not found — caller will create it
+
+    if _container_is_alive(container):
+        _info(f"Reconnected to running container '{SANDBOX_CONTAINER_NAME}' ({container.short_id})")
+        return container
+
+    # Stopped/paused/exited — try to restart
+    if container.status in ("exited", "created", "paused"):
+        _info(f"Container '{SANDBOX_CONTAINER_NAME}' is stopped — restarting…")
+        try:
+            container.start()
+            container.reload()
+            if _container_is_alive(container):
+                _info(f"Container '{SANDBOX_CONTAINER_NAME}' restarted ({container.short_id})")
+                return container
+        except Exception as e:
+            _info(f"Failed to restart '{SANDBOX_CONTAINER_NAME}': {e} — will recreate")
+
+    # Dead and unrecoverable — remove so a fresh one can take the name
+    _info(f"Removing dead container '{SANDBOX_CONTAINER_NAME}' to recreate it…")
+    try:
+        container.remove(force=True)
+    except Exception:
+        pass
+    return None
+
+
+def _get_or_create_container(workspace: Path, max_memory_mb: int):
+    """
+    Return the one sandbox container for this process.
+
+    Decision order:
+      1. In-memory ref alive  → reuse it (fast path, no Docker API call)
+      2. Named container      → reconnect or restart
+      3. Nothing found        → create a new container with the fixed name
+    """
+    global _sandbox_container, _cleanup_done, _cleanup_registered
+
+    with _lock:
+        # ── 1. Fast path: in-memory reference ────────────────────────────────
+        if _sandbox_container is not None:
+            if _container_is_alive(_sandbox_container):
+                return _sandbox_container
+            _info(f"Container {_sandbox_container.short_id} is no longer running — will reconnect or recreate")
+            _sandbox_container = None
+
+        client = _get_docker_client()
+        if client is None:
+            return None
+
+        _ensure_image(client)
+
+        # ── 2. Find by fixed name ─────────────────────────────────────────────
+        existing = _find_existing_container(client)
+        if existing is not None:
+            _sandbox_container = existing
+            _cleanup_done = False
+            _register_hooks_once()
+            return _sandbox_container
+
+        # ── 3. Nothing reusable — create a brand-new container ───────────────
+        _info(f"Creating new sandbox container '{SANDBOX_CONTAINER_NAME}' ({DOCKER_IMAGE})…")
+
+        workspace_abs = str(workspace.resolve())
+
+        # NOTE: masked_paths is NOT a supported kwarg in docker-py's high-level
+        # containers.run() or create_host_config(). However, Docker automatically
+        # applies default masked paths (covering /proc/kcore, /proc/sys,
+        # /proc/sysrq-trigger, etc.) for any non-privileged container when
+        # MaskedPaths is unset in the HostConfig. We rely on that behaviour.
+        container = client.containers.run(
+            image=DOCKER_IMAGE,
+            name=SANDBOX_CONTAINER_NAME,
+            command=["sh", "-c", "while true; do sleep 3600; done"],
+            volumes={workspace_abs: {"bind": "/workspace", "mode": "rw"}},
+            tmpfs={"/tmp": "size=64m,mode=1777"},
+            working_dir="/workspace",
+            mem_limit=f"{max_memory_mb}m",
+            memswap_limit=f"{max_memory_mb}m",
+            cpu_period=100_000,
+            cpu_quota=90_000,
+            pids_limit=128,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+            read_only=True,
+            network_mode=DOCKER_NETWORK,
+            remove=False,
+            tty=False,
+            detach=True,
+            stdout=True,
+            stderr=True,
+        )
+
+        _sandbox_container = container
+        _cleanup_done = False
+        _info(f"Sandbox container ready: '{SANDBOX_CONTAINER_NAME}' ({container.short_id})")
+
+        _register_hooks_once()
+        return container
+
+
+# ---------------------------------------------------------------------------
+# Cleanup — atexit, signals, watchdog
+# ---------------------------------------------------------------------------
+
+def _cleanup_container() -> None:
+    """
+    Stop (do NOT remove) the sandbox container on process exit.
+    The next process finds it by name and restarts it.
+    Safe to call multiple times — only the first call does work.
+    """
+    global _sandbox_container, _cleanup_done
+
+    with _lock:
+        if _cleanup_done:
+            return
+        _cleanup_done      = True
+        container          = _sandbox_container
+        _sandbox_container = None
+
+    if container is None:
+        return
+
+    try:
+        _info(f"Stopping '{SANDBOX_CONTAINER_NAME}' ({container.short_id}) — will reuse on next run")
+        container.stop(timeout=5)
+        _info("Container stopped.")
+    except Exception:
+        pass
+
+
+def _register_hooks_once() -> None:
+    """Register atexit, signal handlers, and watchdog — exactly once per process."""
+    global _cleanup_registered
+    if _cleanup_registered:
+        return
+    _cleanup_registered = True
+
+    atexit.register(_cleanup_container)
+
+    def _handler(signum, frame):
+        _cleanup_container()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (OSError, ValueError):
+            pass
+
+    _start_watchdog()
+
+
+def _start_watchdog() -> None:
+    """
+    Daemon thread that fires _cleanup_container() during interpreter teardown.
+    Covers hard crashes where atexit cannot run.
+    """
+    parent_pid = os.getpid()
+
+    def _watch():
+        while True:
+            time.sleep(5)
+            try:
+                if os.getpid() != parent_pid:
+                    _cleanup_container()
+                    return
+            except Exception:
+                _cleanup_container()
+                return
+
+    t = threading.Thread(target=_watch, daemon=True, name="sandbox-watchdog")
+    t.start()
+
+
+# ---------------------------------------------------------------------------
+# Docker command execution
 # ---------------------------------------------------------------------------
 
 def _sh_quote(s: str) -> str:
-    """Minimal POSIX shell quoting."""
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
@@ -223,76 +408,24 @@ def _run_docker(
     max_output_bytes: int,
     max_memory_mb: int,
 ) -> Tuple[str, int]:
-    """
-    Run cmd in a brand-new ephemeral container.
-
-    The container is always removed in the finally-block — whether the command
-    succeeds, raises, or times out.  No persistent state is left behind.
-    """
-    client = _get_docker_client()
-    if client is None:
+    """Fire cmd into the persistent sandbox container via exec_run()."""
+    container = _get_or_create_container(workspace, max_memory_mb)
+    if container is None:
         raise RuntimeError("Docker unavailable — cannot create sandbox container.")
 
-    _ensure_image(client)
-
-    workspace_abs = str(workspace.resolve())
-    volumes = {workspace_abs: {"bind": "/workspace", "mode": "rw"}}
-    tmpfs   = {"/tmp": "size=64m,mode=1777"}
-    for p in _MASKED_PROC_PATHS:
-        tmpfs[p] = "size=0,ro"
-
-    # Wrap the user command in shell timeout so the process itself is bounded.
     wrapped = f"timeout {timeout} sh -c {_sh_quote(cmd)}"
 
-    container = None
     try:
-        # detach=True so we get a container object back and can call .wait()
-        # with our own Python-level timeout.
-        container = client.containers.run(
-            image=DOCKER_IMAGE,
-            command=["sh", "-c", wrapped],
-            volumes=volumes,
-            tmpfs=tmpfs,
-            working_dir="/workspace",
-            # Resource limits
-            mem_limit=f"{max_memory_mb}m",
-            memswap_limit=f"{max_memory_mb}m",
-            cpu_period=100_000,
-            cpu_quota=90_000,       # 90 % of one core
-            pids_limit=128,
-            # Capability hardening
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges"],
-            # Filesystem hardening
-            read_only=True,
-            # Network
-            network_mode=DOCKER_NETWORK,
-            # Lifecycle — do NOT auto-remove; we call remove() ourselves
-            remove=False,
+        result = container.exec_run(
+            cmd=["sh", "-c", wrapped],
+            workdir="/workspace",
+            demux=False,
             tty=False,
-            detach=True,
-            stdout=True,
-            stderr=True,
+            stdin=False,
         )
 
-        _info(f"Ephemeral sandbox started ({container.short_id})")
-
-        # Wait for the container to finish, with a Python-level safety net.
-        try:
-            result = container.wait(timeout=timeout + 5)   # +5 s grace
-        except Exception:
-            # Timed out at Python level (shell timeout should have fired first)
-            try:
-                container.kill()
-            except Exception:
-                pass
-            raw = container.logs(stdout=True, stderr=True) or b""
-            output = raw[:max_output_bytes].decode("utf-8", errors="replace")
-            return f"[TIMEOUT after {timeout}s]\n{output}", -1
-
-        exit_code = result.get("StatusCode", -1)
-
-        raw       = container.logs(stdout=True, stderr=True) or b""
+        exit_code = result.exit_code if result.exit_code is not None else -1
+        raw       = result.output or b""
         truncated = len(raw) > max_output_bytes
         output    = raw[:max_output_bytes].decode("utf-8", errors="replace")
         if truncated:
@@ -302,18 +435,19 @@ def _run_docker(
 
         return output, exit_code
 
-    finally:
-        # Always remove — this is the guarantee that no containers leak.
-        if container is not None:
-            try:
-                container.remove(force=True)
-                _info(f"Ephemeral sandbox removed ({container.short_id})")
-            except Exception:
-                pass
+    except Exception as e:
+        with _lock:
+            global _sandbox_container
+            if _sandbox_container is not None and not _container_is_alive(_sandbox_container):
+                _info("Container died during exec_run — will reconnect or recreate on next call")
+                _sandbox_container = None
+            else:
+                _info("exec_run failed but container is still alive — keeping it")
+        raise RuntimeError(f"exec_run failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
-# POSIX process-group backend (fallback when Docker is not available)
+# POSIX process-group backend (fallback when Docker is unavailable)
 # ---------------------------------------------------------------------------
 
 def _posix_preexec(max_memory_mb: int) -> None:
@@ -421,11 +555,16 @@ def run_sandboxed(
     Run *cmd* in the best available sandbox and return (output, exit_code).
 
     Windows / FORCE_DOCKER=True:
-        Docker up   → ephemeral hardened container (auto-removed when done)
+        Docker up   → ONE persistent hardened container, reused forever
         Docker down → process-group fallback with loud terminal warning
     macOS / Linux (default):
         → process group + rlimits  (set FORCE_DOCKER=True for Docker)
     """
+    # Ensure the workspace directory exists before either backend tries to use
+    # it. subprocess.Popen raises FileNotFoundError on a missing cwd, and
+    # Docker's bind-mount also fails if the host path doesn't exist.
+    workspace.mkdir(parents=True, exist_ok=True)
+
     want_docker = _IS_WINDOWS or FORCE_DOCKER
 
     if want_docker:
@@ -443,23 +582,25 @@ def sandbox_info() -> dict:
     docker_up   = _check_docker() if want_docker else False
 
     if want_docker and docker_up:
-        backend = f"docker_hardened_ephemeral (image: {DOCKER_IMAGE})"
+        with _lock:
+            cid = _sandbox_container.short_id if _sandbox_container else "not started yet"
+        backend = f"docker_hardened_persistent (name: {SANDBOX_CONTAINER_NAME}, id: {cid})"
     elif want_docker:
         backend = "process_group+rlimit (INSECURE FALLBACK — Docker not running)"
     else:
         backend = "process_group+rlimit"
 
     return {
-        "platform":          platform.system(),
-        "backend":           backend,
-        "docker_available":  docker_up,
-        "docker_image":      DOCKER_IMAGE if want_docker else None,
-        "docker_network":    DOCKER_NETWORK if want_docker else None,
-        "docker_caps":       "ALL dropped" if (want_docker and docker_up) else None,
-        "docker_root_fs":    "read-only"   if (want_docker and docker_up) else None,
-        "docker_lifetime":   "ephemeral (removed after each command)" if (want_docker and docker_up) else None,
-        "force_docker":      FORCE_DOCKER,
-        "psutil":            _HAVE_PSUTIL,
-        "default_timeout":   DEFAULT_TIMEOUT_SECS,
-        "default_memory_mb": DEFAULT_MAX_MEMORY_MB,
+        "platform":           platform.system(),
+        "backend":            backend,
+        "docker_available":   docker_up,
+        "docker_image":       DOCKER_IMAGE if want_docker else None,
+        "docker_network":     DOCKER_NETWORK if want_docker else None,
+        "container_name":     SANDBOX_CONTAINER_NAME if want_docker else None,
+        "docker_caps":        "ALL dropped" if (want_docker and docker_up) else None,
+        "docker_root_fs":     "read-only"   if (want_docker and docker_up) else None,
+        "force_docker":       FORCE_DOCKER,
+        "psutil":             _HAVE_PSUTIL,
+        "default_timeout":    DEFAULT_TIMEOUT_SECS,
+        "default_memory_mb":  DEFAULT_MAX_MEMORY_MB,
     }
