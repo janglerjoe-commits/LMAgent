@@ -46,15 +46,6 @@ pip install psutil docker
 
 Docker Desktop must be running on Windows. On macOS/Linux, Docker is optional the process-group backend is used by default unless you set `FORCE_DOCKER = True` in `sandboxed_shell.py`.
 
-**Git inside Docker:** `python:3.12-slim` does not include git. To enable git tools inside the container, update the container startup command in `sandboxed_shell.py`:
-
-```python
-# Change this line in sandboxed_shell.py:
-command=["sh", "-c", "apt-get install -y -q git > /dev/null 2>&1; while true; do sleep 3600; done"],
-```
-
-This installs git once when the container first starts. Since the container is persistent it only runs once per session.
-
 ---
 
 ## Files
