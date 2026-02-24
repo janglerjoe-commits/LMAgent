@@ -461,7 +461,6 @@ SLASH_COMMANDS: Dict[str, SlashCommand] = {
 # =============================================================================
 # MAIN AGENT
 # =============================================================================
-
 def run_agent(
     task: str,
     workspace: Path,
@@ -471,6 +470,7 @@ def run_agent(
     mode: str = "interactive",
     event_callback: Optional[Callable[[AgentEvent], None]] = None,
     soul: str = "",
+    whisper_fn: Optional[Callable[[], Optional[str]]] = None,  
 ) -> AgentResult:
     # FIX [5]: _hold_lock parameter removed — it was accepted but never read.
     # The scheduler passed _hold_lock=False believing it prevented double-
@@ -728,17 +728,6 @@ def run_agent(
 
             _stream_cb.reset()
 
-            # FIX [2] + [3]: removed the outer `while retries <= max_retries` loop
-            # and the incorrect getattr(Config, "MAX_LLM_RETRIES", 3) lookup.
-            #
-            # LLMClient.call() already implements its own retry loop (up to
-            # Config.LLM_MAX_RETRIES attempts with exponential back-off).
-            # Wrapping it in a second loop compounded into up to 4×3 = 12 LLM
-            # calls per iteration and added up to 14 extra dead seconds of sleep.
-            #
-            # On error, LLMClient.call() returns {"error": "..."} after exhausting
-            # its own retries.  We treat that as a hard failure for this iteration
-            # and surface it immediately.
             response = LLMClient.call(messages, available_tools,
                                       stream_callback=_stream_cb)
 
@@ -749,12 +738,6 @@ def run_agent(
                     final_answer=f"LLM error: {response['error']}",
                     events=events, session_id=session_id, iterations=iteration,
                 )
-
-            # FIX [7]: the "response is None" guard that followed the old retry
-            # loop was unreachable (the loop always assigned response or returned)
-            # and type-unsafe (if response were None, "error" in response would
-            # raise TypeError rather than yielding a clean AgentResult).
-            # It has been removed along with the loop.
 
             content    = response.get("content", "")
             tool_calls = response.get("tool_calls") or []
@@ -791,22 +774,6 @@ def run_agent(
                 )
 
             # ── BUG FIX v9.3.2: execute tool calls BEFORE checking completion ─
-            #
-            # Old order:
-            #   1. detect_completion()   ← triggered early exit on TASK_COMPLETE
-            #   2. append assistant msg
-            #   3. _process_tool_calls() ← never reached
-            #
-            # Thinking models emit TASK_COMPLETE in their reasoning text in the
-            # same response as a tool call, so the old order caused the agent to
-            # exit before the tool ever ran.
-            #
-            # Fixed order:
-            #   1. append assistant msg
-            #   2. _process_tool_calls() ← tools execute first
-            #   3. detect_completion()   ← check after tools have run
-            # ──────────────────────────────────────────────────────────────────
-
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
             if content:    assistant_msg["content"]    = content
             if tool_calls: assistant_msg["tool_calls"] = tool_calls
@@ -820,10 +787,15 @@ def run_agent(
                     emit=emit,
                 )
 
-            # FIX [1]: was tc.get("_had_truncation") — key does not exist.
-            # _parse_stream() sets tc["_truncated"] = True on incomplete args.
-            # The wrong key meant truncated tool calls were silently ignored and
-            # the agent fell through to detect_completion() on garbage arguments.
+                        # ── WHISPER INJECTION ──────────────────────────────────────────────
+            if whisper_fn:
+                nudge = whisper_fn()
+                if nudge:
+                    emit("log", {"message": f"whisper injected: {nudge[:60]}"})
+                    messages.append({"role": "system", "content": f"[User nudge - mid-run instruction]: {nudge}"})
+            # ──────────────────────────────────────────────────────────────────
+
+            # FIX [1]: was tc.get("_had_truncation") — wrong key.
             had_truncation = any(tc.get("_truncated") for tc in tool_calls)
             if had_truncation:
                 emit("warning", {
@@ -833,6 +805,25 @@ def run_agent(
 
             # Now check for completion (tools have already run).
             is_complete, reason = detect_completion(content, bool(tool_calls))
+
+            # ── FIX: treat "Asking for input" as a clean completion ────────────
+            #
+            # Previously, when the LLM replied conversationally (e.g. "hey" → 
+            # "Hello! Ready to help.") detect_completion() returned
+            # (False, "Asking for input") and the loop continued.  The LLM had
+            # nothing new to respond to, so it produced empty responses for 5
+            # iterations until the loop detector killed the run with
+            # "Agent unresponsive".
+            #
+            # The model is now instructed by the system prompt to always output
+            # TASK_COMPLETE after conversational replies, but as a safety net we
+            # also treat "Asking for input" here as a completed run so the agent
+            # exits cleanly regardless of whether the model remembered to comply.
+            # ──────────────────────────────────────────────────────────────────
+            if not is_complete and reason == "Asking for input" and not tool_calls:
+                emit("log", {"message": "Conversational reply detected — closing cleanly"})
+                is_complete = True
+                reason      = "Conversational reply (awaiting next user message)"
 
             if is_complete and task_state_mgr.current_state:
                 s = task_state_mgr.current_state
@@ -899,7 +890,6 @@ def run_agent(
         close_shell_session()       # clean up this thread's shell process
         if mode == "output":
             Log.set_silent(False)
-
 
 # =============================================================================
 # SCHEDULER
