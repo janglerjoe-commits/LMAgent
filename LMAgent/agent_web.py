@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-LMAgent Web — v6.5.2
+LMAgent Web — v6.5.6
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -8,37 +7,21 @@ LMAgent Web — v6.5.2
 
 Place this file next to those three files.
 
-Changes vs v6.5.1:
-  - FIX (critical): Stream.flush() now uses textContent instead of MD.render()
-    during live token streaming — eliminates "Page Unresponsive" freeze caused
-    by the O(n²) Markdown parser running on the full accumulated buffer every
-    35ms.  Full MD rendering is deferred to finalize() and wrapped in
-    requestAnimationFrame() so the browser never blocks.
-  - FIX: Stream.reset() now properly finalises buffered content instead of
-    silently discarding it (was losing the last partial message on Stop).
-  - FIX: Replay token batching wrapped in rAF chunks so replaying a long
-    session history no longer freezes the page.
-  - FIX: flush timer raised 35ms → 60ms to further reduce parse pressure.
-  - FIX: MD.render() guarded with a 400 kB soft cap — oversized text is shown
-    as a preformatted block to prevent any single render from hanging.
-  - FIX: tool-row regex dotAll flag replaced with [\s\S] for older engines.
-  - MINOR: onDone "done ✓" label de-duplicated (was showing twice in some
-    paths).
-
-Previous changes (v6.5.1):
-  - FIX: onDone() appends a visible "✓ done" chat message.
-  - FIX: SSE reconnect handler detects stuck running/waiting state.
-  - FIX: Mojibake sanitization for UTF-8 special chars.
-  - FIX: Agent bubble uses readable sans-serif prose; code stays monospace.
-
-Cross-platform changes (v6.5-cross):
-  - Config.WORKSPACE resolution deferred to after Config.init().
-  - _TOOL_CATEGORIES System list includes "shell" alongside "powershell".
-  - No direct shell calls in this file.
+Changes vs v6.5.5:
+  - FIX: Thinking tokens (<think>…</think>) now reach the frontend.
+    Root cause: agent_tools._parse_stream was routing thinking content to
+    stdout only, never through stream_callback. This file monkey-patches
+    LLMClient._parse_stream to also call _tl.thinking_cb, which accumulates
+    and broadcasts ("thinking", text) SSE events between tool calls.
+  - FIX: Streaming lag. The JS Stream module was using a 60 ms debounce
+    that reset on every token — causing the display to freeze during fast
+    generation. Replaced with requestAnimationFrame batching (~16 ms max).
+  - FEAT: Thinking blocks rendered in frontend as collapsible dimmed blocks.
 """
 
 import json
 import queue
+import re
 import socket
 import sys
 import threading
@@ -49,7 +32,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
-# ── Import the agent — modular 3-file layout ─────────────────────────────────
+# ── Import the agent ──────────────────────────────────────────────────────────
 try:
     import agent_core
     import agent_tools
@@ -57,6 +40,9 @@ try:
 
     from agent_core import (
         Config,
+        Colors,
+        colored,
+        strip_thinking,
         MCPManager,
         PermissionMode,
         PlanManager,
@@ -69,6 +55,8 @@ try:
     )
     from agent_tools import (
         TOOL_SCHEMAS,
+        LLMClient,
+        _REQUIRED_ARG_TOOLS,
         _HeaderStreamCb as _OrigHSC,
     )
     from agent_main import run_agent
@@ -112,6 +100,9 @@ _current_permission_mode = Config.PERMISSION_MODE
 _stop_events:      "dict[str, threading.Event]" = {}
 _stop_events_lock = threading.Lock()
 
+_whisper_store: "list[str]" = []
+_whisper_lock  = threading.Lock()
+
 _agent_state      = "idle"
 _agent_state_lock = threading.Lock()
 
@@ -128,7 +119,185 @@ def _get_agent_state() -> str:
 
 
 # =============================================================================
-# MOJIBAKE FIX  — UTF-8 bytes that were decoded as Latin-1
+# MONKEY-PATCH LLMClient._parse_stream
+#
+# The original _parse_stream in agent_tools.py routes <think>…</think> content
+# to sys.stdout only — it never reaches stream_callback (and therefore never
+# reaches the web frontend). This replacement is identical to the original
+# except it also calls _tl.thinking_cb(part) for thinking tokens, and
+# _tl.thinking_cb(None) as a flush signal when </think> closes.
+# =============================================================================
+
+def _web_parse_stream(resp, stream_callback):
+    content       = ""
+    tool_calls: "dict[int, dict]" = {}
+    next_idx      = 0
+    finish_reason = None
+    in_think      = False
+
+    resp.encoding = "utf-8"
+
+    # Per-thread thinking callback injected by the web layer
+    thinking_cb = getattr(_tl, "thinking_cb", None)
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+        choice = choices[0]
+        delta  = choice.get("delta", {})
+
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+
+        raw_content = delta.get("content")
+        if raw_content:
+            content += raw_content
+            if stream_callback:
+                for part in re.split(r"(</?think>)", raw_content, flags=re.IGNORECASE):
+                    if not part:
+                        continue
+                    if part.lower() == "<think>":
+                        in_think = True
+                    elif part.lower() == "</think>":
+                        in_think = False
+                        # Signal end of a thinking block so the callback can flush
+                        thinking_cb = getattr(_tl, "thinking_cb", None)
+                        if thinking_cb:
+                            thinking_cb(None)
+                    elif in_think:
+                        sys.stdout.write(colored(part, Colors.GRAY))
+                        sys.stdout.flush()
+                        thinking_cb = getattr(_tl, "thinking_cb", None)
+                        if thinking_cb:
+                            thinking_cb(part)
+                    else:
+                        stream_callback(part)
+
+        # Native thinking blocks (Anthropic-style structured thinking)
+        thinking_blocks = delta.get("thinking")
+        if isinstance(thinking_blocks, list):
+            for tb in thinking_blocks:
+                tb_text = tb.get("thinking") if isinstance(tb, dict) else None
+                if tb_text:
+                    sys.stdout.write(colored(tb_text, Colors.GRAY))
+                    sys.stdout.flush()
+                    thinking_cb = getattr(_tl, "thinking_cb", None)
+                    if thinking_cb:
+                        thinking_cb(tb_text)
+                        thinking_cb(None)   # auto-flush each structured block
+
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", next_idx)
+            if idx not in tool_calls:
+                tool_calls[idx] = {
+                    "id":       tc.get("id", f"tc_{idx}"),
+                    "type":     "function",
+                    "function": {"name": None, "arguments": ""},
+                }
+                next_idx += 1
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                tool_calls[idx]["function"]["name"] = fn["name"]
+            if isinstance(fn.get("arguments"), str):
+                tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+    if content and stream_callback:
+        stream_callback("\n")
+
+    calls, incomplete = [], False
+    for i in sorted(tool_calls):
+        tc      = tool_calls[i]
+        fn_name = tc["function"]["name"]
+
+        if not fn_name:
+            Log.warning(f"Tool call {i} missing name — skipping")
+            incomplete = True
+            continue
+
+        args_str = tc["function"]["arguments"]
+        Log.info(f"[PARSE] '{fn_name}' args length={len(args_str)} "
+                 f"first100={repr(args_str[:100])}")
+
+        is_empty = not args_str or not args_str.strip()
+
+        if is_empty or args_str.strip() == "{}":
+            if fn_name in _REQUIRED_ARG_TOOLS:
+                Log.error(f"'{fn_name}' received empty/bare args — "
+                          f"finish_reason={finish_reason!r}")
+                incomplete = True
+                tc["function"]["arguments"] = "{}"
+                tc["_truncated"] = True
+                calls.append(tc)
+                continue
+            tc["function"]["arguments"] = "{}"
+            calls.append(tc)
+            continue
+
+        try:
+            json.loads(args_str)
+            calls.append(tc)
+        except json.JSONDecodeError as parse_err:
+            Log.error(f"[PARSE] '{fn_name}' JSON decode failed at pos "
+                      f"{parse_err.pos}: {parse_err.msg} — "
+                      f"tail={repr(args_str[-80:])}")
+            repaired = False
+            if len(args_str) < 500:
+                opens, closes = args_str.count("{"), args_str.count("}")
+                if opens > closes:
+                    candidate = args_str + "}" * (opens - closes)
+                    try:
+                        json.loads(candidate)
+                        tc["function"]["arguments"] = candidate
+                        Log.info(f"[PARSE] Auto-repaired '{fn_name}': "
+                                 f"added {opens - closes} brace(s)")
+                        incomplete = True
+                        calls.append(tc)
+                        repaired = True
+                    except json.JSONDecodeError:
+                        pass
+            if not repaired:
+                Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
+                          f"({'short' if len(args_str) < 500 else 'large'} payload, "
+                          f"{len(args_str)} chars)")
+                incomplete = True
+                tc["function"]["arguments"] = "{}"
+                tc["_truncated"] = True
+                calls.append(tc)
+
+    if finish_reason == "length":
+        Log.warning("⚠️  Generation stopped: output token limit hit (finish_reason=length)")
+        incomplete = True
+    elif finish_reason == "stop" and incomplete:
+        Log.warning("⚠️  finish_reason=stop but tool calls were incomplete")
+    elif finish_reason is None and incomplete:
+        Log.warning("⚠️  finish_reason=None — stream may have ended prematurely")
+
+    clean_content, _ = strip_thinking(content)
+    return {
+        "content":       clean_content,
+        "tool_calls":    calls or None,
+        "incomplete":    incomplete,
+        "finish_reason": finish_reason,
+    }
+
+
+# Apply the patch — must happen before any agent threads start
+LLMClient._parse_stream = staticmethod(_web_parse_stream)
+
+
+# =============================================================================
+# MOJIBAKE FIX
 # =============================================================================
 
 def _fix_mojibake(s: str) -> str:
@@ -184,7 +353,8 @@ def _unregister_stream_q(q: "queue.Queue") -> None:
 _chat_logs: "dict[str, list]" = defaultdict(list)
 _chat_log_lock = threading.Lock()
 
-_REPLAY_KINDS = {"token", "tool", "status", "iteration", "done", "error", "session"}
+# "thinking" included so thinking blocks survive page refresh / reconnect
+_REPLAY_KINDS = {"token", "thinking", "tool", "status", "iteration", "done", "error", "session"}
 
 
 def _chatlog_session_key() -> str:
@@ -193,7 +363,7 @@ def _chatlog_session_key() -> str:
 
 
 def _chatlog_append(item: tuple) -> None:
-    kind, payload = item
+    kind, _ = item
     if kind not in _REPLAY_KINDS:
         return
     key = _chatlog_session_key()
@@ -231,7 +401,7 @@ class _AgentStopped(BaseException):
 
 
 # =============================================================================
-# _HeaderStreamCb PATCH
+# _HeaderStreamCb PATCH  (routes tokens to _tl.token_cb)
 # =============================================================================
 
 class _PatchedHSC(_OrigHSC):
@@ -253,43 +423,31 @@ _agent_main_mod._HeaderStreamCb = _PatchedHSC
 
 
 # =============================================================================
-# THINKING FILTER
+# THINKING CALLBACK HELPERS
+#
+# Each agent thread creates its own _think_buf and registers _thinking_cb on
+# _tl.thinking_cb.  The callback accumulates text until None (flush signal)
+# is received, then broadcasts the block.  The flush is also called
+# explicitly on tool_call / iteration boundaries via _push_event.
 # =============================================================================
 
-class _ThinkingFilter:
-    def __init__(self):
-        self._buf = ""
-        self._in  = False
+def _make_thinking_helpers():
+    """Return (thinking_cb, flush_thinking) pair backed by a shared buffer."""
+    buf = [""]
 
-    def feed(self, tok: str) -> None:
-        self._buf += tok
-        while True:
-            if self._in:
-                end = self._buf.find("</think>")
-                if end == -1:
-                    if len(self._buf) > 100_000:
-                        self._buf = ""
-                    return
-                self._buf = self._buf[end + len("</think>"):]
-                self._in  = False
-            else:
-                start = self._buf.find("<think>")
-                if start == -1:
-                    safe_len = max(0, len(self._buf) - 6)
-                    if safe_len:
-                        _broadcast(("token", self._buf[:safe_len]))
-                        self._buf = self._buf[safe_len:]
-                    return
-                if start > 0:
-                    _broadcast(("token", self._buf[:start]))
-                self._buf = self._buf[start + len("<think>"):]
-                self._in  = True
+    def flush_thinking():
+        text = buf[0].strip()
+        if text:
+            _broadcast(("thinking", text))
+        buf[0] = ""
 
-    def flush(self) -> None:
-        if not self._in and self._buf:
-            _broadcast(("token", self._buf))
-        self._buf = ""
-        self._in  = False
+    def thinking_cb(part):
+        if part is None:   # flush signal from _parse_stream on </think>
+            flush_thinking()
+        else:
+            buf[0] += part
+
+    return thinking_cb, flush_thinking
 
 
 # =============================================================================
@@ -313,14 +471,14 @@ def _is_noisy(msg: str) -> bool:
 # =============================================================================
 
 def _push_event(event, stop_event: "threading.Event | None", last_status: list,
-                filt: "_ThinkingFilter | None" = None) -> None:
+                flush_thinking=None) -> None:
     if stop_event and stop_event.is_set():
         return
     etype = event.type
     edata = event.data
     if etype == "tool_call":
-        if filt:
-            filt.flush()
+        if flush_thinking:
+            flush_thinking()   # emit any pending thinking before tool row
         name    = edata.get("name", "?")
         preview = edata.get("args_preview", "")[:50]
         _broadcast(("tool", f"{name}({preview})"))
@@ -328,8 +486,8 @@ def _push_event(event, stop_event: "threading.Event | None", last_status: list,
         mark = "✓" if edata.get("success") else "✗"
         _broadcast(("tool", f"{mark} {edata.get('name', '')}"))
     elif etype == "iteration":
-        if filt:
-            filt.flush()
+        if flush_thinking:
+            flush_thinking()   # emit any pending thinking at iteration boundary
         _broadcast(("iteration", f"{edata.get('n')}/{edata.get('max')}"))
     elif etype in ("log", "warning", "error"):
         msg = edata.get("message") or edata.get("error") or ""
@@ -391,14 +549,15 @@ def _build_tools_payload() -> dict:
     for client in _global_mcp.clients:
         if not client.health_check():
             continue
-        tools = []
-        for t in client.tools:
-            tools.append({
+        tools = [
+            {
                 "name":        t.get("name", ""),
                 "description": t.get("description", ""),
                 "params":      list(t.get("inputSchema", {}).get("properties", {}).keys()),
                 "required":    t.get("inputSchema", {}).get("required", []),
-            })
+            }
+            for t in client.tools
+        ]
         if tools:
             mcp_groups[f"MCP · {client.name}"] = tools
 
@@ -416,7 +575,8 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>LMAgent</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<!-- [1] Reduced from 9 variants to 5: dropped mono-500, mono-italic, sans-italic, sans-500 -->
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -577,7 +737,7 @@ header {
   white-space: pre-wrap; line-height: 1.65;
 }
 
-/* ── Agent bubble: readable sans-serif prose ── */
+.msg.agent { position: relative; }
 .msg.agent .msg-body {
   background: var(--agent-bg); border-color: var(--agent-bdr);
   font-family: var(--sans);
@@ -586,7 +746,6 @@ header {
   color: var(--text);
 }
 
-/* streaming state: monospace plain text, no flicker */
 .msg.agent .msg-body.streaming {
   font-family: var(--mono);
   font-size: 13px;
@@ -618,13 +777,11 @@ header {
 }
 .msg.agent .msg-body a:hover { color: var(--amber); }
 
-/* inline code stays monospace */
 .msg.agent .msg-body code {
   background: var(--code-bg); border: 1px solid var(--code-bdr);
   border-radius: 3px; padding: 1px 6px;
   font-family: var(--mono); font-size: .82em; color: var(--amber);
 }
-/* code blocks */
 .msg.agent .msg-body pre {
   background: var(--code-bg); border: 1px solid var(--code-bdr);
   border-radius: 6px; padding: 13px 15px; overflow-x: auto;
@@ -660,7 +817,6 @@ header {
 .msg.agent .msg-body th { background: var(--surface2); color: var(--text2); font-weight: 600; }
 .msg.agent .msg-body tr:nth-child(even) td { background: rgba(255,255,255,.015); }
 
-/* system / status messages */
 .msg.sys .msg-label { display: none; }
 .msg.sys .msg-body {
   background: transparent; border: none;
@@ -676,6 +832,50 @@ header {
   border-left-color: var(--purple); color: var(--text2);
   font-style: normal; font-size: 12px;
 }
+
+/* ── Thinking blocks ───────────────────────────────────────────────────────── */
+.thinking-block {
+  margin: 2px 0 2px 4px;
+  border-left: 2px solid var(--border2);
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text3);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color .15s, opacity .15s;
+  opacity: 0.6;
+  line-height: 1.5;
+}
+.thinking-block:hover { border-left-color: var(--purple); opacity: 0.9; }
+.thinking-block .tb-header {
+  display: flex; align-items: baseline; gap: 6px;
+}
+.thinking-block .tb-arrow {
+  font-size: 9px; color: var(--purple);
+  transition: transform .15s; flex-shrink: 0;
+  display: inline-block;
+}
+.thinking-block.open .tb-arrow { transform: rotate(90deg); }
+.thinking-block .tb-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.thinking-block .tb-body {
+  display: none; white-space: pre-wrap; word-break: break-word;
+  margin-top: 4px; color: var(--text3); line-height: 1.55;
+}
+.thinking-block.open .tb-body { display: block; }
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+.msg-copy {
+  position: absolute; top: 30px; right: 10px;
+  background: var(--surface2); border: 1px solid var(--border2);
+  border-radius: 4px; color: var(--text3); font-size: 10px;
+  padding: 2px 8px; cursor: pointer; opacity: 0; pointer-events: none;
+  transition: opacity .15s, color .12s, border-color .12s;
+  font-family: var(--mono); user-select: none; z-index: 2;
+}
+.msg.agent:hover .msg-copy { opacity: 1; pointer-events: auto; }
+.msg-copy:hover { color: var(--teal); border-color: var(--teal-dim); }
+.msg-copy.copied { color: var(--green); border-color: var(--green); opacity: 1; }
 
 .tool-group { display: flex; flex-direction: column; padding: 2px 0; }
 .tool-row {
@@ -697,6 +897,19 @@ header {
   font-family: var(--mono);
 }
 .tool-more:hover { color: var(--text2); }
+
+.tool-group-summary { display: none; }
+.tool-group.collapsible .tool-group-summary {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 0 2px 8px; font-size: 11px; color: var(--text3);
+  cursor: pointer; user-select: none; font-family: var(--mono);
+  transition: color .12s;
+}
+.tool-group.collapsible .tool-group-summary:hover { color: var(--text2); }
+.tgs-arrow { font-size: 9px; display: inline-block; transition: transform .15s; }
+.tool-group.collapsed .tool-row,
+.tool-group.collapsed .tool-more { display: none !important; }
+.tool-group.collapsed .tgs-arrow { transform: rotate(-90deg); }
 
 .cursor {
   display: inline-block; width: 2px; height: 1em;
@@ -735,6 +948,12 @@ header {
 #status-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #iter-badge  { font-size: 10px; border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; display: none; }
 #mode-badge  { font-size: 10px; border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; color: var(--text3); }
+
+#elapsed-timer {
+  font-size: 10px; color: var(--text3); font-family: var(--mono);
+  display: none; letter-spacing: .03em;
+}
+#elapsed-timer.show { display: inline; }
 
 #input-area {
   display: flex; flex-direction: column;
@@ -842,7 +1061,6 @@ header {
 }
 #overlay.show { display: block; }
 
-/* Replay banner */
 #replay-banner {
   display: none; text-align: center;
   font-size: 11px; color: var(--text3);
@@ -863,7 +1081,7 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.5.2</span>
+      <span class="logo-sub">v6.5.6</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -879,7 +1097,7 @@ header {
     <div id="empty">
       <div class="empty-glyph">&#955;_</div>
       <p>Send a message to start</p>
-      <div class="hint">/ for commands</div>
+      <div class="hint">/ for commands &nbsp;·&nbsp; &uarr;&darr; history</div>
     </div>
   </div>
 
@@ -888,6 +1106,7 @@ header {
   <div id="status-bar">
     <div class="dot" id="dot"></div>
     <span id="status-text">ready</span>
+    <span id="elapsed-timer"></span>
     <span id="iter-badge"></span>
     <span id="mode-badge">auto</span>
   </div>
@@ -922,132 +1141,95 @@ header {
   <div id="tools-list"></div>
 </div>
 
+<!-- [2] marked.js replaces the 180-line custom MD parser -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
 <script>
 'use strict';
 
-// ═══════════════════════════════════════════════════════════════
-// UNICODE SANITIZER  — fix mojibake before rendering
-// ═══════════════════════════════════════════════════════════════
-const _TD = new TextDecoder('utf-8', { fatal: true });
-function fixMojibake(s) {
-  if (!s) return s;
-  return s.replace(
-    /[Â-ß][\x80-\xBF]|[à-ï][\x80-\xBF]{2}|[ð-÷][\x80-\xBF]{3}/g,
-    function(match) {
-      try {
-        var b = new Uint8Array(match.length);
-        for (var i = 0; i < match.length; i++) b[i] = match.charCodeAt(i) & 0xff;
-        return _TD.decode(b);
-      } catch (_) { return match; }
-    }
-  );
+function _esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// [3] REMOVED fixMojibake() — backend runs _fix_mojibake() before every
+// _broadcast(), so strings are already clean when they arrive here.
+// All three call-sites below (Replay.flushTokens, Stream._renderFinal,
+// and the old Replay copy-btn arg) now use the raw buffer directly.
+
+
+// ══════════════════════════════════════════════════════════════
+// THINKING BLOCK WIDGET  (unchanged)
+// ══════════════════════════════════════════════════════════════
+function _makeThinkingBlock(text) {
+  var el = document.createElement('div');
+  el.className = 'thinking-block';
+
+  var firstLine = text.split('\n')[0].slice(0, 120);
+  var multiline = text.length > firstLine.length || text.indexOf('\n') !== -1;
+
+  var hdr = document.createElement('div');
+  hdr.className = 'tb-header';
+
+  var arrow = document.createElement('span');
+  arrow.className = 'tb-arrow';
+  arrow.textContent = '\u25b6';
+
+  var preview = document.createElement('span');
+  preview.className = 'tb-preview';
+  preview.textContent = '\ud83d\udcad ' + firstLine + (multiline ? '\u2026' : '');
+
+  hdr.appendChild(arrow);
+  hdr.appendChild(preview);
+  el.appendChild(hdr);
+
+  var body = document.createElement('div');
+  body.className = 'tb-body';
+  body.textContent = text;
+  el.appendChild(body);
+
+  el.onclick = function() {
+    var open = el.classList.toggle('open');
+    arrow.textContent = open ? '\u25bc' : '\u25b6';
+    preview.textContent = open ? '\ud83d\udcad thinking\u2026' : '\ud83d\udcad ' + firstLine + (multiline ? '\u2026' : '');
+  };
+  return el;
 }
 
 
 // ═══════════════════════════════════════════════════════════════
-// MARKDOWN — safe render with size guard
+// [2] MARKDOWN — thin wrapper around marked.js
+// Replaces the previous 180-line hand-rolled parser.
+// Custom renderers preserve: lang badge on code blocks,
+// target="_blank" on links, max-width on images.
 // ═══════════════════════════════════════════════════════════════
 const MD = (() => {
-  const MAX_RENDER_BYTES = 400000; // ~400 kB — beyond this we show as pre
-  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-
-  function inline(s) {
-    s = s.replace(/`([^`]+)`/g, function(_,c){ return '<code>'+esc(c)+'</code>'; });
-    s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/__(.+?)__/g,     '<strong>$1</strong>');
-    s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    s = s.replace(/_(.+?)_/g,   '<em>$1</em>');
-    s = s.replace(/~~(.+?)~~/g, '<del>$1</del>');
-    s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_,a,src){ return '<img src="'+esc(src)+'" alt="'+esc(a)+'" style="max-width:100%">'; });
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,  function(_,t,href){ return '<a href="'+esc(href)+'" target="_blank" rel="noopener">'+t+'</a>'; });
-    s = s.replace(/(?<!["'>])(https?:\/\/[^\s<>"]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
-    return s;
-  }
-
-  function parse(md) {
-    var lines = md.split('\n');
-    var out   = [];
-    var i = 0;
-    var peek = function(){ return lines[i]; };
-    var take = function(){ return lines[i++]; };
-
-    function listBlock(tag) {
-      var items = [];
-      var base  = ((peek().match(/^(\s*)/) || ['',''])[1]).length;
-      while (i < lines.length) {
-        var l = peek();
-        if (/^\s*$/.test(l)) { take(); break; }
-        var ind = ((l.match(/^(\s*)/) || ['',''])[1]).length;
-        if (ind < base && items.length) break;
-        if (!/^(\s*)([-*+]|\d+\.)\s/.test(l)) break;
-        var content = take().replace(/^\s*([-*+]|\d+\.)\s+/, '');
-        var nested = '';
-        if (i < lines.length) {
-          var ni = ((lines[i].match(/^(\s*)/) || ['',''])[1]).length;
-          if (ni > ind && /^(\s*)([-*+]|\d+\.)\s/.test(lines[i]))
-            nested = listBlock(/^(\s*)([-*+])\s/.test(lines[i]) ? 'ul' : 'ol');
-        }
-        items.push('<li>'+inline(content)+nested+'</li>');
+  marked.use({
+    gfm: true,
+    breaks: true,
+    renderer: {
+      code(code, lang) {
+        var langBadge = lang ? '<span class="lang">' + _esc(lang) + '</span>' : '';
+        return '<pre>' + langBadge + '<code>' + _esc(code) + '</code></pre>\n';
+      },
+      link(href, title, text) {
+        return '<a href="' + _esc(href || '') + '" target="_blank" rel="noopener"'
+          + (title ? ' title="' + _esc(title) + '"' : '') + '>' + text + '</a>';
+      },
+      image(href, title, text) {
+        return '<img src="' + _esc(href || '') + '" alt="' + _esc(text || '') + '"'
+          + ' style="max-width:100%"'
+          + (title ? ' title="' + _esc(title) + '"' : '') + '>';
       }
-      return '<'+tag+'>'+items.join('')+'</'+tag+'>';
     }
+  });
 
-    function tableBlock() {
-      var hdr  = take(); take();
-      var headers = hdr.split('|').map(function(c){ return c.trim(); }).filter(Boolean);
-      var rows = [];
-      while (i < lines.length && /\|/.test(peek()) && !/^\s*$/.test(peek()))
-        rows.push(take().split('|').map(function(c){ return c.trim(); }).filter(Boolean));
-      var ths = headers.map(function(h){ return '<th>'+inline(h)+'</th>'; }).join('');
-      var trs = rows.map(function(r){ return '<tr>'+r.map(function(c){ return '<td>'+inline(c)+'</td>'; }).join('')+'</tr>'; }).join('');
-      return '<table><thead><tr>'+ths+'</tr></thead><tbody>'+trs+'</tbody></table>';
-    }
-
-    while (i < lines.length) {
-      var line = peek();
-      if (/^```/.test(line)) {
-        var lang = line.slice(3).trim(); take();
-        var code = [];
-        while (i < lines.length && !/^```/.test(peek())) code.push(esc(take()));
-        if (i < lines.length) take();
-        out.push('<pre>'+(lang ? '<span class="lang">'+esc(lang)+'</span>' : '')+'<code>'+code.join('\n')+'</code></pre>');
-        continue;
-      }
-      if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(line)) { take(); out.push('<hr>'); continue; }
-      var hm = line.match(/^(#{1,6})\s+(.+)/);
-      if (hm) { take(); out.push('<h'+hm[1].length+'>'+inline(hm[2])+'</h'+hm[1].length+'>'); continue; }
-      if (/^>\s?/.test(line)) {
-        var q = [];
-        while (i < lines.length && /^>\s?/.test(peek())) q.push(take().replace(/^>\s?/, ''));
-        out.push('<blockquote>'+parse(q.join('\n'))+'</blockquote>');
-        continue;
-      }
-      if (/^(\s*)([-*+])\s/.test(line)) { out.push(listBlock('ul')); continue; }
-      if (/^(\s*)\d+\.\s/.test(line))   { out.push(listBlock('ol')); continue; }
-      if (/\|/.test(line) && i+1 < lines.length && /^\|?[\s:|-]+\|/.test(lines[i+1])) {
-        out.push(tableBlock()); continue;
-      }
-      if (/^\s*$/.test(line)) { take(); continue; }
-      var para = [];
-      while (i < lines.length) {
-        var ll = peek();
-        if (/^\s*$/.test(ll)) break;
-        if (/^(#{1,6}\s|```|>\s?|[-*+]\s|\d+\.\s|(\*{3,}|-{3,}|_{3,})\s*$)/.test(ll)) break;
-        para.push(take());
-      }
-      if (para.length) out.push('<p>'+inline(para.join(' '))+'</p>');
-    }
-    return out.join('\n');
-  }
+  var MAX_RENDER_BYTES = 400000;
 
   function render(md) {
     if (!md || !md.trim()) return '';
-    // Guard: if text is enormous, skip expensive parse and show as preformatted
-    if (md.length > MAX_RENDER_BYTES) {
-      return '<pre style="white-space:pre-wrap;word-break:break-word">' + esc(md) + '</pre>';
-    }
-    return parse(md);
+    if (md.length > MAX_RENDER_BYTES)
+      return '<pre style="white-space:pre-wrap;word-break:break-word">' + _esc(md) + '</pre>';
+    try { return marked.parse(md); }
+    catch (_) { return '<pre style="white-space:pre-wrap">' + _esc(md) + '</pre>'; }
   }
 
   return { render };
@@ -1055,12 +1237,12 @@ const MD = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// SCROLL
+// SCROLL  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Scroll = (() => {
-  const pane = function(){ return document.getElementById('messages'); };
-  const btn  = function(){ return document.getElementById('scroll-btn'); };
   var pinned = true;
+  var pane   = function(){ return document.getElementById('messages'); };
+  var btn    = function(){ return document.getElementById('scroll-btn'); };
 
   function atBottom() {
     var el = pane();
@@ -1070,8 +1252,7 @@ const Scroll = (() => {
   function maybe()  { if (pinned) pane().scrollTop = pane().scrollHeight; }
   function jump()   { pinned = true; pane().scrollTop = pane().scrollHeight; update(); }
   function onScroll() {
-    if (atBottom()) pinned = true;
-    else if (Agent.running()) pinned = false;
+    pinned = atBottom() ? true : Agent.running() ? false : pinned;
     update();
   }
   pane().addEventListener('scroll', onScroll, { passive: true });
@@ -1080,31 +1261,53 @@ const Scroll = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// STATUS BAR
+// STATUS BAR  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Status = (() => {
-  var dot  = function(){ return document.getElementById('dot'); };
-  var text = function(){ return document.getElementById('status-text'); };
-  var iter = function(){ return document.getElementById('iter-badge'); };
-  var mode = function(){ return document.getElementById('mode-badge'); };
   return {
     set: function(msg, state) {
-      state = state || '';
-      text().textContent = msg || '';
-      dot().className = 'dot ' + state;
+      document.getElementById('status-text').textContent = msg || '';
+      document.getElementById('dot').className = 'dot ' + (state || '');
     },
     iter: function(v) {
-      var el = iter();
+      var el = document.getElementById('iter-badge');
       el.textContent = v || '';
       el.style.display = v ? '' : 'none';
     },
-    mode: function(v) { mode().textContent = v || 'auto'; },
+    mode: function(v) { document.getElementById('mode-badge').textContent = v || 'auto'; },
   };
 })();
 
 
 // ═══════════════════════════════════════════════════════════════
-// CONNECTION DOT
+// ELAPSED TIMER  (unchanged)
+// ═══════════════════════════════════════════════════════════════
+const ElapsedTimer = (() => {
+  var _t = null, _start = 0;
+  var el = function(){ return document.getElementById('elapsed-timer'); };
+
+  function _fmt(ms) {
+    var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
+    s = s % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+  function start() {
+    stop();
+    _start = Date.now();
+    el().classList.add('show');
+    _t = setInterval(function(){ el().textContent = _fmt(Date.now() - _start); }, 500);
+  }
+  function stop() {
+    if (_t) { clearInterval(_t); _t = null; }
+    el().classList.remove('show');
+    el().textContent = '';
+  }
+  return { start, stop };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+// CONNECTION DOT  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const ConnDot = (() => {
   var el = function(){ return document.getElementById('conn-dot'); };
@@ -1117,15 +1320,62 @@ const ConnDot = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// CHAT LOG REPLAY  — chunked to avoid blocking
+// INPUT HISTORY  (unchanged)
+// ═══════════════════════════════════════════════════════════════
+const InputHistory = (() => {
+  var _hist = [], _idx = -1, _draft = '';
+
+  function _set(inp, val) {
+    inp.value = val;
+    inp.style.height = 'auto';
+    inp.style.height = Math.min(inp.scrollHeight, 140) + 'px';
+    setTimeout(function(){ inp.selectionStart = inp.selectionEnd = inp.value.length; }, 0);
+  }
+
+  function push(text) {
+    if (!text || (_hist.length && _hist[_hist.length - 1] === text)) return;
+    _hist.push(text);
+    if (_hist.length > 200) _hist.shift();
+    _idx = -1;
+  }
+  function up(inp) {
+    if (!_hist.length) return;
+    if (_idx === -1) { _draft = inp.value; _idx = _hist.length; }
+    if (_idx > 0) _set(inp, _hist[--_idx]);
+  }
+  function down(inp) {
+    if (_idx === -1) return;
+    _idx++;
+    _set(inp, _idx >= _hist.length ? (_idx = -1, _draft) : _hist[_idx]);
+  }
+  function reset() { _idx = -1; }
+  return { push, up, down, reset };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+// CHAT LOG REPLAY
+// [3] Removed fixMojibake() calls — backend already cleans encoding
 // ═══════════════════════════════════════════════════════════════
 const Replay = (() => {
-  function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function _addCopyBtn(wrap, rawText) {
+    var btn = document.createElement('button');
+    btn.className = 'msg-copy';
+    btn.textContent = 'copy';
+    btn.title = 'Copy response';
+    btn.onclick = function(e) {
+      e.stopPropagation();
+      navigator.clipboard.writeText(rawText || wrap.querySelector('.msg-body').innerText || '').then(function() {
+        btn.textContent = 'copied!'; btn.classList.add('copied');
+        setTimeout(function(){ btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+      }).catch(function(){});
+    };
+    wrap.appendChild(btn);
+  }
 
   function _applyEvents(events) {
-    var tokenBuf       = '';
-    var toolGroupItems = [];
-    var pane           = document.getElementById('messages');
+    var tokenBuf = '', toolGroupItems = [];
+    var pane     = document.getElementById('messages');
 
     function flushTokens() {
       if (!tokenBuf.trim()) { tokenBuf = ''; return; }
@@ -1133,9 +1383,10 @@ const Replay = (() => {
       var wrap = document.createElement('div');
       wrap.className = 'msg agent';
       wrap.innerHTML = '<div class="msg-label">Agent</div><div class="msg-body"></div>';
-      var body = wrap.querySelector('.msg-body');
-      var fixed = fixMojibake(tokenBuf);
-      body.innerHTML = MD.render(fixed) || _esc(fixed);
+      var body  = wrap.querySelector('.msg-body');
+      // [3] No fixMojibake — data is already clean from backend
+      body.innerHTML = MD.render(tokenBuf) || _esc(tokenBuf);
+      _addCopyBtn(wrap, tokenBuf);
       pane.appendChild(wrap);
       tokenBuf = '';
     }
@@ -1151,43 +1402,47 @@ const Replay = (() => {
         row.className = 'tool-row';
         var ok  = t.ok;
         row.dataset.s = ok === null ? 'pending' : (ok ? 'ok' : 'fail');
-        var icon    = ok === null ? '\u25cc' : (ok ? '\u2713' : '\u2717');
         var preview = t.args ? (t.args.slice(0,50) + (t.args.length > 50 ? '\u2026' : '')) : '';
-        row.innerHTML = '<span class="tr-icon">'+icon+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(preview ? '<span class="tr-args">('+_esc(preview)+')</span>' : '');
+        row.innerHTML = '<span class="tr-icon">'+(ok === null ? '\u25cc' : (ok ? '\u2713' : '\u2717'))+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(preview ? '<span class="tr-args">('+_esc(preview)+')</span>' : '');
         group.appendChild(row);
       }
+      _finaliseToolGroup(group, toolGroupItems.length);
       pane.appendChild(group);
       toolGroupItems = [];
     }
 
+    function _sysMsg(text, variant) {
+      var d = document.createElement('div');
+      d.className = 'msg sys ' + (variant || '');
+      d.innerHTML = '<div class="msg-label"></div><div class="msg-body"></div>';
+      d.querySelector('.msg-body').textContent = text;
+      pane.appendChild(d);
+    }
+
     var lastWasToken = false;
-
     for (var ei = 0; ei < events.length; ei++) {
-      var kind    = events[ei][0];
-      var payload = events[ei][1];
-
+      var kind = events[ei][0], payload = events[ei][1];
       if (kind === 'token') {
-        if (!lastWasToken) { flushTools(); }
-        tokenBuf += payload;
-        lastWasToken = true;
+        if (!lastWasToken) flushTools();
+        tokenBuf += payload; lastWasToken = true;
+      } else if (kind === 'thinking') {
+        flushTokens(); flushTools(); lastWasToken = false;
+        document.getElementById('empty') && document.getElementById('empty').remove();
+        pane.appendChild(_makeThinkingBlock(payload));
       } else if (kind === 'tool') {
-        if (lastWasToken) { flushTokens(); }
+        if (lastWasToken) flushTokens();
         lastWasToken = false;
-        var t2 = payload;
-        if (t2.startsWith('\u2713') || t2.startsWith('\u2717')) {
-          var name2 = t2.slice(1).trim();
+        if (payload.startsWith('\u2713') || payload.startsWith('\u2717')) {
+          var name2 = payload.slice(1).trim();
           for (var ri = toolGroupItems.length - 1; ri >= 0; ri--) {
             if (toolGroupItems[ri].name === name2 && toolGroupItems[ri].ok === null) {
-              toolGroupItems[ri].ok = t2.startsWith('\u2713');
-              break;
+              toolGroupItems[ri].ok = payload.startsWith('\u2713'); break;
             }
           }
         } else {
           flushTokens();
-          var m2   = t2.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
-          var n2   = m2 ? m2[1].trim() : t2;
-          var a2   = m2 ? m2[2].trim() : '';
-          toolGroupItems.push({ name: n2, args: a2, ok: null });
+          var m2 = payload.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
+          toolGroupItems.push({ name: m2 ? m2[1].trim() : payload, args: m2 ? m2[2].trim() : '', ok: null });
         }
       } else if (kind === 'iteration') {
         flushTokens(); flushTools(); lastWasToken = false;
@@ -1204,24 +1459,13 @@ const Replay = (() => {
     flushTools();
   }
 
-  function _sysMsg(text, variant) {
-    var d = document.createElement('div');
-    d.className = 'msg sys ' + (variant || '');
-    d.innerHTML = '<div class="msg-label"></div><div class="msg-body"></div>';
-    d.querySelector('.msg-body').textContent = text;
-    document.getElementById('messages').appendChild(d);
-  }
-
   function run(events) {
     if (!events || !events.length) return;
     var banner = document.getElementById('replay-banner');
     banner.textContent = '\u21a9 restored ' + events.length + ' events from this session';
     banner.classList.add('show');
     setTimeout(function(){ banner.classList.remove('show'); }, 3000);
-
-    // Chunk replay over multiple rAF frames to avoid blocking
-    var CHUNK = 200;
-    var offset = 0;
+    var CHUNK = 200, offset = 0;
     function nextChunk() {
       var slice = events.slice(offset, offset + CHUNK);
       if (!slice.length) { Scroll.jump(); return; }
@@ -1237,7 +1481,35 @@ const Replay = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// MESSAGES
+// COLLAPSIBLE TOOL GROUP HELPER  (unchanged)
+// ═══════════════════════════════════════════════════════════════
+function _finaliseToolGroup(group, totalCount) {
+  if (totalCount < 3) return;
+  var okCount   = group.querySelectorAll('.tool-row[data-s="ok"]').length;
+  var failCount = group.querySelectorAll('.tool-row[data-s="fail"]').length;
+
+  function _label(collapsed) {
+    if (collapsed) return '\u25b6 ' + totalCount + ' tool call' + (totalCount !== 1 ? 's' : '') + ' \u2014 click to expand';
+    var parts = [totalCount + ' tool call' + (totalCount !== 1 ? 's' : '')];
+    if (okCount)   parts.push(okCount + ' ok');
+    if (failCount) parts.push(failCount + ' failed');
+    return '\u25bc ' + parts.join(', ') + ' \u2014 click to collapse';
+  }
+
+  var summary = document.createElement('div');
+  summary.className   = 'tool-group-summary';
+  summary.textContent = _label(false);
+  group.insertBefore(summary, group.firstChild);
+  group.classList.add('collapsible');
+  summary.onclick = function() {
+    var c = group.classList.toggle('collapsed');
+    summary.textContent = _label(c);
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// MESSAGES  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Messages = (() => {
   var pane = function(){ return document.getElementById('messages'); };
@@ -1249,101 +1521,104 @@ const Messages = (() => {
     var d = document.createElement('div');
     d.className = 'msg ' + role + (extra ? ' ' + extra : '');
     var labels = { user: 'You', agent: 'Agent' };
-    d.innerHTML = '<div class="msg-label">'+(labels[role] || '')+'</div><div class="msg-body"></div>';
+    d.innerHTML = '<div class="msg-label">'+(labels[role]||'')+'</div><div class="msg-body"></div>';
     pane().appendChild(d);
     var body = d.querySelector('.msg-body');
-    if (html) {
-      if (asHtml) body.innerHTML = html;
-      else        body.textContent = html;
-    }
+    if (html) { if (asHtml) body.innerHTML = html; else body.textContent = html; }
     Scroll.maybe();
     return body;
   }
 
   function sys(text, variant) { add('sys', text, variant || ''); }
-  return { add, sys, pane };
+  return { add, sys, pane, hideEmpty };
 })();
 
 
 // ═══════════════════════════════════════════════════════════════
 // STREAMING AGENT MESSAGE
-// ─────────────────────────────────────────────────────────────
-// KEY FIX: flush() uses textContent (O(1)) so the main thread
-// never blocks during streaming.  Full MD.render() is deferred
-// to finalize(), wrapped in requestAnimationFrame() to yield
-// control back to the browser before doing the parse.
+// [4] Cursor node is created once in start() and reattached in
+//     flush() rather than being destroyed and recreated on every
+//     requestAnimationFrame (~60x/sec during streaming).
+// [3] Removed fixMojibake() from _renderFinal — not needed.
 // ═══════════════════════════════════════════════════════════════
 const Stream = (() => {
-  var el    = null;
-  var buf   = '';
-  var timer = null;
+  var el = null, buf = '', _rafPending = false, _cursor = null;
 
-  function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-  function _addCursor(body) {
-    body.appendChild(Object.assign(document.createElement('span'), { className: 'cursor' }));
+  function _attachCopyBtn(wrap, rawText) {
+    var btn = document.createElement('button');
+    btn.className = 'msg-copy'; btn.textContent = 'copy'; btn.title = 'Copy response';
+    btn.onclick = function(e) {
+      e.stopPropagation();
+      var copy = function() {
+        btn.textContent = 'copied!'; btn.classList.add('copied');
+        setTimeout(function(){ btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+      };
+      navigator.clipboard.writeText(rawText).then(copy).catch(function() {
+        var ta = document.createElement('textarea');
+        ta.value = rawText; document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); ta.remove(); copy();
+      });
+    };
+    wrap.appendChild(btn);
   }
 
-  function start() {
-    buf = '';
-    el  = Messages.add('agent', '');
-    el.classList.add('streaming');
-    _addCursor(el);
-  }
-
-  function token(tok) {
-    buf += tok;
-    clearTimeout(timer);
-    timer = setTimeout(flush, 60);
-  }
-
-  // Lightweight flush — plain text only, no markdown parsing
-  function flush() {
-    if (!el) return;
-    el.textContent = buf;   // fast O(1), never blocks
-    _addCursor(el);
-    Scroll.maybe();
-  }
-
-  // Full markdown render, deferred via rAF so browser stays responsive
   function _renderFinal(body, rawBuf) {
     requestAnimationFrame(function() {
-      var fixed = fixMojibake(rawBuf);
-      if (!fixed.trim()) {
-        var wrap = body.closest('.msg');
+      var wrap = body.closest('.msg');
+      if (!rawBuf.trim()) {
         if (wrap) wrap.remove();
       } else {
         body.classList.remove('streaming');
-        body.innerHTML = MD.render(fixed) || _esc(fixed);
+        // [3] Removed fixMojibake() — backend already cleaned encoding
+        body.innerHTML = MD.render(rawBuf) || _esc(rawBuf);
+        if (wrap) _attachCopyBtn(wrap, rawBuf);
       }
       Scroll.maybe();
     });
   }
 
-  function finalize() {
-    clearTimeout(timer);
+  function start() {
+    buf = ''; el = Messages.add('agent', '');
+    el.classList.add('streaming');
+    // [4] Create cursor once; flush() reattaches the same node
+    _cursor = document.createElement('span');
+    _cursor.className = 'cursor';
+    el.appendChild(_cursor);
+  }
+
+  function flush() {
+    _rafPending = false;
     if (!el) return;
-    var body   = el;
-    var rawBuf = buf;
-    el  = null;
-    buf = '';
+    // [4] el.textContent clears all children (including the cursor node),
+    //     then we reattach the existing cursor — zero new allocations per tick
+    el.textContent = buf;
+    el.appendChild(_cursor);
+    Scroll.maybe();
+  }
+
+  function token(tok) {
+    buf += tok;
+    if (!_rafPending) {
+      _rafPending = true;
+      requestAnimationFrame(flush);
+    }
+  }
+
+  function finalize() {
+    _rafPending = false;
+    if (!el) return;
+    var body = el, rawBuf = buf;
+    el = null; buf = ''; _cursor = null;
     _renderFinal(body, rawBuf);
   }
 
-  // reset() called on Stop — still render what we have rather than discard
   function reset() {
-    clearTimeout(timer);
+    _rafPending = false;
     if (!el) return;
-    var body   = el;
-    var rawBuf = buf;
-    el  = null;
-    buf = '';
-    if (rawBuf.trim()) {
-      _renderFinal(body, rawBuf);
-    } else {
-      var wrap = body.closest('.msg');
-      if (wrap) wrap.remove();
-    }
+    var body = el, rawBuf = buf;
+    el = null; buf = ''; _cursor = null;
+    if (rawBuf.trim()) _renderFinal(body, rawBuf);
+    else { var wrap = body.closest('.msg'); if (wrap) wrap.remove(); }
   }
 
   function active() { return el !== null; }
@@ -1352,14 +1627,10 @@ const Stream = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// TOOL ROWS
+// TOOL ROWS  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Tools = (() => {
-  var MAX = 12;
-  var group     = null;
-  var count     = 0;
-  var pending   = new Map();
-  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+  var MAX = 12, group = null, count = 0, pending = new Map();
 
   function ensureGroup() {
     if (group) return group;
@@ -1371,12 +1642,14 @@ const Tools = (() => {
     return group;
   }
 
-  function endGroup() { group = null; count = 0; }
+  function endGroup() {
+    if (group && count > 0) _finaliseToolGroup(group, count);
+    group = null; count = 0;
+  }
 
   function makeRow(name, args) {
-    var row     = document.createElement('div');
-    row.className = 'tool-row';
-    row.dataset.s = 'pending';
+    var row = document.createElement('div');
+    row.className = 'tool-row'; row.dataset.s = 'pending';
     var preview = args ? (args.slice(0, 50) + (args.length > 50 ? '\u2026' : '')) : '';
     row.innerHTML = '<span class="tr-icon">\u25cc</span><span class="tr-name">'+_esc(name)+'</span>'+(preview ? '<span class="tr-args">('+_esc(preview)+')</span>' : '');
     if (!pending.has(name)) pending.set(name, []);
@@ -1385,8 +1658,7 @@ const Tools = (() => {
   }
 
   function call(name, args) {
-    var g = ensureGroup();
-    count++;
+    var g = ensureGroup(); count++;
     if (count > MAX) {
       var more = g.querySelector('.tool-more');
       if (!more) {
@@ -1424,13 +1696,26 @@ const Tools = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// AGENT STATE MACHINE
+// WHISPER  (unchanged)
+// ═══════════════════════════════════════════════════════════════
+const Whisper = (() => {
+  function queue(text) {
+    if (!Agent.running()) { Messages.sys('Agent is not running — whisper ignored.', 'warn'); return; }
+    fetch('/whisper', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text }),
+    }).catch(function(){});
+  }
+  return { queue };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+// AGENT STATE MACHINE  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Agent = (() => {
-  var state     = 'idle';
-  var sessionId = null;
-  var requestId = null;
-  var _hadContent = false;
+  var state = 'idle', sessionId = null, requestId = null, _hadContent = false;
 
   function setSession(id) {
     sessionId = id;
@@ -1443,8 +1728,10 @@ const Agent = (() => {
   function running()    { return state !== 'idle'; }
 
   function lockUI(on) {
-    document.getElementById('msg-input').disabled = on;
+    var inp = document.getElementById('msg-input');
     var btn = document.getElementById('send-btn');
+    inp.disabled    = false;
+    inp.placeholder = on ? 'Whisper to agent\u2026 (nudge mid-run, Enter to send)' : 'Message or /command\u2026';
     btn.textContent = on ? 'Stop' : 'Send';
     btn.className   = on ? 'stop' : '';
     if (!on) { Scroll.pin(); Scroll.update(); }
@@ -1454,36 +1741,25 @@ const Agent = (() => {
     state = next;
     lockUI(next !== 'idle');
     Scroll.update();
+    if (next !== 'idle') ElapsedTimer.start(); else ElapsedTimer.stop();
   }
 
   function handleEvent(evt) {
-    // If server says idle but we think we're running/waiting → clean up
     if (evt.type === 'connect') {
       var d = evt.data || {};
       if (d.session) setSession(d.session);
       if (d.mode)    Status.mode(d.mode);
-
-      if (d.history && d.history.length) {
-        var pane = document.getElementById('messages');
-        if (!pane.querySelectorAll('.msg').length) {
-          Replay.run(d.history);
-        }
-      }
-
+      if (d.history && d.history.length && !document.getElementById('messages').querySelectorAll('.msg').length)
+        Replay.run(d.history);
       if (d.state === 'running' && state === 'idle') {
-        transition('running');
-        Status.set('running\u2026', 'run');
+        transition('running'); Status.set('running\u2026', 'run');
       } else if (d.state === 'waiting' && state === 'idle') {
         transition('waiting');
         Status.set('waiting \u2014 scheduled resume\u2026', 'wait');
         Messages.sys('\u23f0 Session waiting \u2014 will resume automatically', 'warn');
       } else if (d.state === 'idle' && state !== 'idle') {
-        // SSE reconnect: server is idle but we're stuck → recover cleanly
-        Stream.finalize();
-        Tools.endGroup();
-        transition('idle');
-        Status.set('done', 'done');
-        Status.iter('');
+        Stream.finalize(); Tools.endGroup(); transition('idle');
+        Status.set('done', 'done'); Status.iter('');
         Messages.sys('\u2713 task finished', 'ok');
         document.getElementById('msg-input').focus();
       }
@@ -1491,19 +1767,26 @@ const Agent = (() => {
     }
 
     if (state === 'waiting' && evt.type !== 'connect') {
-      transition('running');
-      Tools.reset();
-      Stream.reset();
+      transition('running'); Tools.reset(); Stream.reset();
     }
 
     switch (evt.type) {
-
       case 'token':
         Tools.endGroup();
         if (!Stream.active()) Stream.start();
         Stream.token(evt.data);
         _hadContent = true;
         break;
+
+      case 'thinking': {
+        Stream.finalize();
+        Tools.endGroup();
+        Messages.hideEmpty();
+        Messages.pane().appendChild(_makeThinkingBlock(evt.data));
+        Scroll.maybe();
+        _hadContent = true;
+        break;
+      }
 
       case 'session':
         setSession(evt.data);
@@ -1516,9 +1799,7 @@ const Agent = (() => {
         } else {
           Stream.finalize();
           var m = t.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
-          var name = m ? m[1].trim() : t;
-          var args = m ? m[2].trim() : '';
-          Tools.call(name, args);
+          Tools.call(m ? m[1].trim() : t, m ? m[2].trim() : '');
           _hadContent = true;
         }
         break;
@@ -1531,11 +1812,8 @@ const Agent = (() => {
       case 'iteration': {
         var mi = String(evt.data).match(/(\d+)\/(\d+)/);
         if (mi) {
-          Stream.finalize();
-          Tools.endGroup();
-          if (_hadContent) {
-            Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014', 'info');
-          }
+          Stream.finalize(); Tools.endGroup();
+          if (_hadContent) Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014', 'info');
           _hadContent = false;
           Status.iter(mi[1]+'/'+mi[2]);
         }
@@ -1547,24 +1825,17 @@ const Agent = (() => {
         break;
 
       case 'error':
-        Stream.finalize();
-        Tools.endGroup();
+        Stream.finalize(); Tools.endGroup();
         Messages.sys('\u26a0 ' + evt.data, 'err');
-        transition('idle');
-        Status.set('error', 'err');
-        Status.iter('');
+        transition('idle'); Status.set('error', 'err'); Status.iter('');
         break;
     }
   }
 
   function onDone(reason) {
-    Stream.finalize();
-    Tools.endGroup();
-    Status.iter('');
-
+    Stream.finalize(); Tools.endGroup(); Status.iter('');
     var isWait = String(reason || '').startsWith('waiting');
     var isErr  = reason === 'error' || reason === 'stopped';
-
     if (isWait) {
       transition('waiting');
       Status.set('waiting \u2014 will resume automatically', 'wait');
@@ -1572,111 +1843,87 @@ const Agent = (() => {
     } else {
       transition('idle');
       Status.set(reason || 'done', isErr ? 'err' : 'done');
-
-      if (isErr) {
-        if (reason === 'stopped') {
-          Messages.sys('\u2014 stopped \u2014', 'warn');
-        }
-      } else {
-        // Normalise label — strip trailing " ✓" if already present to avoid dupe
-        var raw   = reason || 'done';
-        var label = raw.replace(/\s*\u2713\s*$/, '').trim() || 'task finished';
-        Messages.sys('\u2713 ' + label, 'ok');
-      }
-
+      if (reason === 'stopped') Messages.sys('\u2014 stopped \u2014', 'warn');
+      else if (!isErr) Messages.sys('\u2713 ' + ((reason||'').replace(/\s*\u2713\s*$/,'').trim() || 'task finished'), 'ok');
       document.getElementById('msg-input').focus();
     }
   }
 
   async function send(text) {
     if (state !== 'idle') return;
-
     Messages.add('user', text);
-    Scroll.pin();
-    transition('running');
-    Status.set('thinking\u2026', 'run');
-    Tools.reset();
-    _hadContent = false;
-
+    Scroll.pin(); transition('running'); Status.set('thinking\u2026', 'run');
+    Tools.reset(); _hadContent = false;
     requestId = 'r' + Date.now() + Math.random().toString(36).slice(2, 6);
-
     try {
       var resp = await fetch('/chat', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ message: text, session_id: sessionId, request_id: requestId }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, session_id: sessionId, request_id: requestId }),
       });
       if (!resp.ok) {
         var err = await resp.json().catch(function(){ return { error: 'HTTP ' + resp.status }; });
         throw new Error(err.error || 'HTTP ' + resp.status);
       }
     } catch (err) {
-      Stream.finalize();
-      Tools.endGroup();
+      Stream.finalize(); Tools.endGroup();
       Messages.sys('Failed to send: ' + err.message, 'err');
-      transition('idle');
-      Status.set('error', 'err');
-      Status.iter('');
+      transition('idle'); Status.set('error', 'err'); Status.iter('');
     }
   }
 
   function stop() {
     if (state === 'waiting') {
-      transition('idle');
-      Status.set('wait dismissed', '');
-      Messages.sys('\u2014 wait dismissed (session saved) \u2014', 'warn');
-      return;
+      transition('idle'); Status.set('wait dismissed', '');
+      Messages.sys('\u2014 wait dismissed (session saved) \u2014', 'warn'); return;
     }
     if (state !== 'running') return;
-
     if (requestId) {
       fetch('/stop', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ request_id: requestId }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request_id: requestId }),
       }).catch(function(){});
       requestId = null;
     }
-    Stream.reset();
-    Tools.endGroup();
+    Stream.reset(); Tools.endGroup();
     Messages.sys('\u2014 stopped \u2014', 'warn');
-    transition('idle');
-    Status.set('stopped', '');
-    Status.iter('');
+    transition('idle'); Status.set('stopped', ''); Status.iter('');
   }
 
   async function newSession() {
     if (state !== 'idle') { stop(); return; }
     try { await fetch('/new', { method: 'POST' }); } catch (_) {}
-    setSession(null);
-    requestId   = null;
-    _hadContent = false;
-    Tools.reset();
-    Stream.reset();
+    sessionId = null; requestId = null; _hadContent = false;
+    setSession(null); Tools.reset(); Stream.reset();
     document.getElementById('messages').innerHTML =
-      '<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">&#955;_</div><p>Send a message to start</p><div class="hint">/ for commands</div></div>';
-    Status.set('ready', '');
-    Status.iter('');
+      '<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">&#955;_</div><p>Send a message to start</p><div class="hint">/ for commands &nbsp;&middot;&nbsp; &uarr;&darr; history</div></div>';
+    Status.set('ready', ''); Status.iter('');
     document.getElementById('msg-input').focus();
   }
 
   function sendOrStop() {
-    if (state !== 'idle') stop(); else _triggerSend();
+    if (state !== 'idle') {
+      var inp  = document.getElementById('msg-input');
+      var text = inp.value.trim();
+      if (text) {
+        inp.value = ''; inp.style.height = 'auto';
+        Whisper.queue(text);
+        Messages.sys('\ud83d\udcac whisper sent \u2014 agent will receive it on next iteration', 'ok');
+      } else {
+        stop();
+      }
+    } else {
+      _triggerSend();
+    }
   }
 
   function _triggerSend() {
     var inp  = document.getElementById('msg-input');
     var text = inp.value.trim();
     if (!text) return;
-    inp.value = '';
-    inp.style.height = 'auto';
-    Palette.close();
-    if (text.startsWith('/')) {
-      Messages.add('user', text);
-      SlashCmds.run(text);
-    } else {
-      send(text);
-    }
+    inp.value = ''; inp.style.height = 'auto';
+    Palette.close(); InputHistory.reset();
+    if (text.startsWith('/')) { Messages.add('user', text); SlashCmds.run(text); }
+    else { InputHistory.push(text); send(text); }
   }
 
   return { sendOrStop, newSession, running, getSession, setSession, _handle: handleEvent };
@@ -1684,42 +1931,30 @@ const Agent = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// PERSISTENT EVENTSOURCE
+// PERSISTENT EVENTSOURCE  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 (function initStream() {
-  var es      = null;
-  var retryMs = 1000;
-
+  var es = null, retryMs = 1000;
   function connect() {
     ConnDot.try();
     es = new EventSource('/stream');
-
-    es.onopen = function() {
-      ConnDot.ok();
-      retryMs = 1000;
-    };
-
+    es.onopen  = function() { ConnDot.ok(); retryMs = 1000; };
     es.onmessage = function(e) {
       if (!e.data || e.data === '[DONE]') return;
-      try {
-        Agent._handle(JSON.parse(e.data));
-      } catch (_) {}
+      try { Agent._handle(JSON.parse(e.data)); } catch (_) {}
     };
-
     es.onerror = function() {
-      es.close();
-      ConnDot.err();
+      es.close(); ConnDot.err();
       setTimeout(connect, retryMs);
       retryMs = Math.min(retryMs * 2, 30000);
     };
   }
-
   connect();
 })();
 
 
 // ═══════════════════════════════════════════════════════════════
-// SLASH COMMANDS
+// SLASH COMMANDS  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const CMDS = [
   { cmd: '/help',     desc: 'Show commands' },
@@ -1732,9 +1967,10 @@ const CMDS = [
   { cmd: '/todo',     desc: 'Session todos' },
   { cmd: '/plan',     desc: 'Active plan' },
   { cmd: '/session',  desc: 'Current session ID' },
+  { cmd: '/whisper',  desc: 'Inject a nudge to the running agent', arg: '<message>' },
 ];
 
-const HELP_TEXT = 'Slash commands:\n  /help               This text\n  /new                Fresh session\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID';
+const HELP_TEXT = 'Slash commands:\n  /help               This text\n  /new                Fresh session\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID\n  /whisper <text>     Inject mid-run nudge\n\nKeyboard shortcuts:\n  \u2191 / \u2193             Cycle input history\n  Ctrl+L           New session\n  Enter            Send\n  Shift+Enter      New line';
 
 const SlashCmds = (() => {
   async function run(text) {
@@ -1749,8 +1985,7 @@ const SlashCmds = (() => {
       case '/sessions': UI.toggleSessions(); break;
       case '/tools':    UI.toggleTools(); break;
       case '/session':
-        sys(Agent.getSession() ? 'Session: ' + Agent.getSession() : 'No active session.', 'info');
-        break;
+        sys(Agent.getSession() ? 'Session: ' + Agent.getSession() : 'No active session.', 'info'); break;
       case '/status':
         try {
           var s = await fetch('/status').then(function(r){ return r.json(); });
@@ -1767,13 +2002,18 @@ const SlashCmds = (() => {
         if (!arg) { sys('Usage: /mode auto|normal|manual', 'warn'); break; }
         try {
           var r2 = await fetch('/mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode: arg }),
           }).then(function(r){ return r.json(); });
           if (r2.ok) { Status.mode(arg); sys('Mode \u2192 ' + arg, 'ok'); }
           else       { sys('Invalid mode \''+arg+'\'. Use: auto, normal, manual', 'err'); }
         } catch (e) { sys('Failed: ' + e.message, 'err'); }
+        break;
+      }
+      case '/whisper': {
+        if (!arg) { sys('Usage: /whisper <message>', 'warn'); break; }
+        Whisper.queue(arg);
+        sys('Whisper queued \u2192 agent will receive it on next iteration.', 'ok');
         break;
       }
       case '/todo':
@@ -1782,8 +2022,7 @@ const SlashCmds = (() => {
         if (!sid) { sys('No active session.', 'warn'); break; }
         try {
           var r3 = await fetch('/cmd', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cmd: cmd.slice(1), session_id: sid }),
           }).then(function(r){ return r.json(); });
           sys(r3.text || '(empty)', 'info');
@@ -1799,12 +2038,11 @@ const SlashCmds = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// COMMAND PALETTE
+// COMMAND PALETTE  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const Palette = (() => {
   var idx = -1;
   var pal = function(){ return document.getElementById('palette'); };
-  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   function build(val) {
     var q = val.slice(1).toLowerCase();
@@ -1825,19 +2063,19 @@ const Palette = (() => {
 
   function select(cmd) {
     var inp = document.getElementById('msg-input');
-    inp.value = cmd === '/mode' ? '/mode ' : cmd;
-    close();
-    inp.focus();
+    inp.value = (cmd === '/mode' || cmd === '/whisper') ? cmd + ' ' : cmd;
+    close(); inp.focus();
   }
 
   function onInput(el) {
     autoResize(el);
-    if (el.value.startsWith('/')) build(el.value);
-    else close();
+    InputHistory.reset();
+    if (el.value.startsWith('/')) build(el.value); else close();
   }
 
   function onKey(e) {
-    var p = pal();
+    var inp = document.getElementById('msg-input');
+    var p   = pal();
     if (p.classList.contains('open')) {
       var items = p.querySelectorAll('.pi');
       if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(idx+1, items.length-1); items.forEach(function(el,i){ el.classList.toggle('sel', i===idx); }); return; }
@@ -1845,21 +2083,37 @@ const Palette = (() => {
       if (e.key === 'Tab' || (e.key === 'Enter' && idx >= 0)) { e.preventDefault(); (idx >= 0 ? items[idx] : items[0]) && (idx >= 0 ? items[idx] : items[0]).click(); return; }
       if (e.key === 'Escape') { close(); return; }
     }
+    if (e.key === 'ArrowUp' && !p.classList.contains('open')) {
+      if (inp.value.slice(0, inp.selectionStart).split('\n').length <= 1) { e.preventDefault(); InputHistory.up(inp); return; }
+    }
+    if (e.key === 'ArrowDown' && !p.classList.contains('open')) {
+      if (inp.value.slice(inp.selectionEnd).split('\n').length <= 1) { e.preventDefault(); InputHistory.down(inp); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); Agent.sendOrStop(); }
   }
 
   return { onInput, onKey, close };
 })();
 
-function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; }
+// [5] Wrapped in requestAnimationFrame — avoids the two forced reflows
+//     (one from height='auto', one from reading scrollHeight) that the
+//     previous synchronous version caused on every keystroke.
+function autoResize(el) {
+  requestAnimationFrame(function() {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+  });
+}
+
+document.addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'l') { e.preventDefault(); Agent.newSession(); }
+});
 
 
 // ═══════════════════════════════════════════════════════════════
-// SESSIONS PANEL
+// SESSIONS PANEL  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const SessionsPanel = (() => {
-  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
-
   async function load() {
     var list = document.getElementById('sessions-list');
     list.innerHTML = '<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
@@ -1873,8 +2127,7 @@ const SessionsPanel = (() => {
         d.innerHTML = '<div class="si-id">'+_esc(s.id)+'</div><div class="si-task">'+_esc(s.task||'\u2014')+'</div><div class="si-stat '+_esc(s.status)+'">'+_esc(s.status)+' \u00b7 '+s.iterations+' iter</div>';
         d.onclick = function() {
           if (Agent.running()) return;
-          Agent.setSession(s.id);
-          UI.closeSessions();
+          Agent.setSession(s.id); UI.closeSessions();
           Messages.sys('resumed ' + s.id.slice(-8));
         };
         list.appendChild(d);
@@ -1888,11 +2141,10 @@ const SessionsPanel = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// TOOLS PANEL
+// TOOLS PANEL  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const ToolsPanel = (() => {
   var data = null;
-  var _esc = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
 
   async function load() {
     var list = document.getElementById('tools-list');
@@ -1908,24 +2160,22 @@ const ToolsPanel = (() => {
   function render(q) {
     var list = document.getElementById('tools-list');
     list.innerHTML = '';
-    var qlo  = q.toLowerCase();
-    var all  = Object.assign({}, data.builtin, data.mcp || {});
+    var qlo = q.toLowerCase();
+    var all = Object.assign({}, data.builtin, data.mcp || {});
     var shown = false;
     Object.entries(all).forEach(function(entry) {
-      var cat   = entry[0];
-      var tools = entry[1];
+      var cat = entry[0], tools = entry[1];
       var filtered = tools.filter(function(t){ return !qlo || t.name.includes(qlo) || t.description.toLowerCase().includes(qlo); });
       if (!filtered.length) return;
       shown = true;
-      var isMcp  = cat.startsWith('MCP');
-      var catEl  = document.createElement('div');
-      catEl.className = 'tool-cat' + (isMcp ? ' mcp-cat' : '');
-      catEl.innerHTML  = '<div class="tool-cat-hdr">'+_esc(cat)+'</div>';
+      var catEl = document.createElement('div');
+      catEl.className = 'tool-cat' + (cat.startsWith('MCP') ? ' mcp-cat' : '');
+      catEl.innerHTML = '<div class="tool-cat-hdr">'+_esc(cat)+'</div>';
       filtered.forEach(function(t) {
         var params = t.params.length ? t.params.map(function(p){ return t.required.includes(p) ? p : '['+p+']'; }).join(', ') : '';
-        var entry2  = document.createElement('div');
+        var entry2 = document.createElement('div');
         entry2.className = 'tool-entry';
-        entry2.innerHTML  = '<div class="te-name">'+_esc(t.name)+'<span class="te-params">'+(params ? '('+_esc(params)+')' : '')+'</span></div>'+(t.description ? '<div class="te-desc">'+_esc(t.description)+'</div>' : '');
+        entry2.innerHTML = '<div class="te-name">'+_esc(t.name)+'<span class="te-params">'+(params ? '('+_esc(params)+')' : '')+'</span></div>'+(t.description ? '<div class="te-desc">'+_esc(t.description)+'</div>' : '');
         catEl.appendChild(entry2);
       });
       list.appendChild(catEl);
@@ -1939,7 +2189,7 @@ const ToolsPanel = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-// UI PANEL MANAGEMENT
+// UI PANEL MANAGEMENT  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 const UI = (() => {
   var overlay = function(){ return document.getElementById('overlay'); };
@@ -1949,26 +2199,21 @@ const UI = (() => {
 
   async function toggleSessions() {
     if (isOpen('sessions-panel')) { closeSessions(); return; }
-    closeTools();
-    await SessionsPanel.load();
-    openPanel('sessions-panel');
+    closeTools(); await SessionsPanel.load(); openPanel('sessions-panel');
   }
-  function closeSessions() { closePanel('sessions-panel'); }
-
   async function toggleTools() {
     if (isOpen('tools-panel')) { closeTools(); return; }
-    closeSessions();
-    await ToolsPanel.load();
-    openPanel('tools-panel');
+    closeSessions(); await ToolsPanel.load(); openPanel('tools-panel');
   }
-  function closeTools() { closePanel('tools-panel'); }
-  function closeAll()   { closeSessions(); closeTools(); }
+  function closeSessions() { closePanel('sessions-panel'); }
+  function closeTools()    { closePanel('tools-panel'); }
+  function closeAll()      { closeSessions(); closeTools(); }
   return { toggleSessions, closeSessions, toggleTools, closeTools, closeAll };
 })();
 
 
 // ═══════════════════════════════════════════════════════════════
-// INIT
+// INIT  (unchanged)
 // ═══════════════════════════════════════════════════════════════
 (async function() {
   try {
@@ -1991,7 +2236,7 @@ def _scheduler_loop():
 
     state_mgr   = StateManager(WORKSPACE)
     session_mgr = SessionManager(WORKSPACE)
-    _running: set = set()
+    _running:      set = set()
     _running_lock = threading.Lock()
 
     def _run_wake(sid: str):
@@ -2004,15 +2249,17 @@ def _scheduler_loop():
         def _do_run():
             global _current_session_id
             _set_agent_state("running")
-            _filt = _ThinkingFilter()
+
+            thinking_cb, flush_thinking = _make_thinking_helpers()
+            _tl.thinking_cb = thinking_cb
 
             def _token_cb(tok: str) -> None:
-                _filt.feed(tok)
+                _broadcast(("token", tok))
 
             _tl.token_cb = _token_cb
 
             def _event_cb(event):
-                _push_event(event, None, last_status, filt=_filt)
+                _push_event(event, None, last_status, flush_thinking=flush_thinking)
 
             try:
                 saved = state_mgr.load(sid)
@@ -2037,13 +2284,9 @@ def _scheduler_loop():
                 with _session_lock:
                     _current_session_id = result.session_id
                 _chatlog_merge_keys(old_key, result.session_id)
-
                 _broadcast(("session", result.session_id))
 
-                if result.status == "waiting":
-                    _set_agent_state("waiting")
-                else:
-                    _set_agent_state("idle")
+                _set_agent_state("waiting" if result.status == "waiting" else "idle")
 
                 label = {
                     "completed":      "done \u2713",
@@ -2052,7 +2295,7 @@ def _scheduler_loop():
                     "error":          "error",
                     "interrupted":    "interrupted",
                 }.get(result.status, result.status)
-                _filt.flush()
+                flush_thinking()
                 _broadcast(("done", label))
 
             except Exception as exc:
@@ -2060,7 +2303,8 @@ def _scheduler_loop():
                 _broadcast(("done", "error"))
                 _set_agent_state("idle")
             finally:
-                _tl.token_cb = None
+                _tl.token_cb    = None
+                _tl.thinking_cb = None
                 with _running_lock:
                     _running.discard(sid)
 
@@ -2127,17 +2371,15 @@ def stream():
         with _session_lock:
             sid = _current_session_id
 
-        history = _chatlog_get(sid)
-
         connect_payload = {
             "state":   ag_state,
             "session": sid,
             "mode":    _current_permission_mode,
-            "history": history,
+            "history": _chatlog_get(sid),
         }
         yield f"data: {json.dumps({'type': 'connect', 'data': connect_payload}, ensure_ascii=False)}\n\n"
 
-        KA   = 15
+        KA = 15
         last = time.time()
         try:
             while True:
@@ -2174,8 +2416,6 @@ def chat():
     with _session_lock:
         session_id = req_sid or _current_session_id
 
-    _chatlog_append(("user_msg", user_msg))
-
     stop_event = threading.Event()
     with _stop_events_lock:
         _stop_events[rid] = stop_event
@@ -2185,17 +2425,37 @@ def chat():
     def run_in_thread():
         global _current_session_id
         _set_agent_state("running")
-        _filt = _ThinkingFilter()
+
+        thinking_cb, flush_thinking = _make_thinking_helpers()
+        _tl.thinking_cb = thinking_cb
 
         def _token_cb(tok: str) -> None:
             if stop_event.is_set():
                 raise _AgentStopped("stopped by user")
-            _filt.feed(tok)
+            _broadcast(("token", tok))
 
         _tl.token_cb = _token_cb
 
         def event_cb(event):
-            _push_event(event, stop_event, last_status, filt=_filt)
+            if stop_event.is_set():
+                raise _AgentStopped("stopped by user")
+            _push_event(event, stop_event, last_status, flush_thinking=flush_thinking)
+
+        _captured_sid: list = [session_id]
+
+        def _whisper_fn() -> "str | None":
+            with _whisper_lock:
+                return _whisper_store.pop(0) if _whisper_store else None
+
+        def _finalize_session(sid: "str | None") -> None:
+            global _current_session_id
+            if not sid:
+                return
+            old_key = _current_session_id
+            with _session_lock:
+                _current_session_id = sid
+            _chatlog_merge_keys(old_key, sid)
+            _broadcast(("session", sid))
 
         try:
             result = run_agent(
@@ -2206,20 +2466,13 @@ def chat():
                 mode            = "interactive",
                 event_callback  = event_cb,
                 soul            = soul,
+                whisper_fn      = _whisper_fn,
             )
+            _captured_sid[0] = result.session_id
 
             if not stop_event.is_set():
-                old_key = _current_session_id
-                with _session_lock:
-                    _current_session_id = result.session_id
-                _chatlog_merge_keys(old_key, result.session_id)
-
-                _broadcast(("session", result.session_id))
-
-                if result.status == "waiting":
-                    _set_agent_state("waiting")
-                else:
-                    _set_agent_state("idle")
+                _finalize_session(result.session_id)
+                _set_agent_state("waiting" if result.status == "waiting" else "idle")
 
                 label = {
                     "completed":      "done \u2713",
@@ -2229,18 +2482,15 @@ def chat():
                     "interrupted":    "interrupted",
                     "cancelled":      "cancelled",
                 }.get(result.status, result.status)
-                _filt.flush()
+                flush_thinking()
                 _broadcast(("done", label))
             else:
-                old_key = _current_session_id
-                with _session_lock:
-                    _current_session_id = result.session_id
-                _chatlog_merge_keys(old_key, result.session_id)
-                _broadcast(("session", result.session_id))
+                _finalize_session(result.session_id)
                 _set_agent_state("idle")
                 _broadcast(("done", "stopped"))
 
         except _AgentStopped:
+            _finalize_session(_captured_sid[0])
             _set_agent_state("idle")
             _broadcast(("done", "stopped"))
 
@@ -2249,7 +2499,8 @@ def chat():
                 _broadcast(("error", str(exc)[:200]))
             _set_agent_state("idle")
         finally:
-            _tl.token_cb = None
+            _tl.token_cb    = None
+            _tl.thinking_cb = None
             with _stop_events_lock:
                 _stop_events.pop(rid, None)
 
@@ -2266,13 +2517,24 @@ def chat():
             run_in_thread()
         finally:
             _AGENT_LOCK.release()
-
         if _get_agent_state() == "running":
             _set_agent_state("idle")
             _broadcast(("done", "error"))
 
     threading.Thread(target=locked_run, daemon=True, name="agent-chat").start()
     return jsonify({"ok": True, "request_id": rid})
+
+
+@app.route("/whisper", methods=["POST"])
+def whisper():
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "text required"})
+    with _whisper_lock:
+        _whisper_store.clear()
+        _whisper_store.append(text)
+    return jsonify({"ok": True})
 
 
 @app.route("/sessions")
@@ -2395,7 +2657,7 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "\u2550" * 58)
-    print("  LMAgent Web  v6.5.2")
+    print("  LMAgent Web  v6.5.6")
     print("\u2550" * 58)
     print(f"  Local  \u2192  http://localhost:{port}")
     print(f"  Phone  \u2192  http://{ip}:{port}")
@@ -2403,7 +2665,9 @@ if __name__ == "__main__":
     print(f"  LLM       : {Config.LLM_URL}")
     print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
     print("\u2550" * 58)
-    print("  FIX: Non-blocking stream rendering (no more page freeze) \u2713")
+    print("  FIX: Thinking blocks now visible in frontend \u2713")
+    print("  FIX: Streaming lag eliminated (rAF batching) \u2713")
+    print("  FEAT: Whisper — /whisper <text> to nudge the agent \u2713")
     print("\u2550" * 58 + "\n")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
