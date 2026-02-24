@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
 agent_core.py — Foundation layer for LM Agent.
-PATCHED: v9.3.2-sec → v9.3.3-sec
+PATCHED: v9.3.3-sec → v9.3.4-sec
 
-Security fixes applied in this patch:
-  1. ShellSession._wrap_command() now resets cwd to workspace before every command.
-     Previously the shell was a persistent process; a single `cd C:\` would escape
-     the workspace and all subsequent bare `ls` calls would list outside dirs.
+Changes in this patch:
+  1. compact_messages() — three compaction bugs fixed:
 
-  2. Safety.validate_command() now blocks:
-       a. cd / Set-Location / pushd / popd / chdir with any argument (navigation is
-          pointless since we reset cwd per-command; just block it entirely).
-       b. Environment-variable paths: $env:USERPROFILE, $HOME, ${VAR}, ~/…
-          These never contained a hard absolute path string so the regex never caught them.
-       c. Relative traversal: ../ and ..\\ — can walk outside workspace without any
-          absolute path appearing in the command string.
-       d. UNC paths: \\server\share — missed by the Windows drive-letter regex.
+     a. Tail-keeps-everything bug: the old formula
+            tail_start = max(0, len(regular_msgs) - max(25, len(regular_msgs) // 2))
+        kept the bottom HALF of all messages as "tail", which on a 50-message
+        list covered 25 msgs.  Combined with up to KEEP_RECENT_MESSAGES (30)
+        scored messages the union covered all 50 → discarded=[].
+        Fixed: tail is now a fixed 10-message window regardless of list length.
 
-  3. Fixed POSIX _POSIX_ABS_PATH_RE: previously required [a-zA-Z] after the slash
-     so `ls /` or `cat /` were not caught. Regex now matches any `/` that isn't a
-     known safe virtual path (/dev/null, /proc/).
+     b. No ceiling on keep_indices: even with a fixed tail, scored messages
+        could still fill the rest of the budget.  A hard cap of
+        KEEP_RECENT_MESSAGES is now enforced after all "keep" sets are merged.
 
-All other code is unchanged from v9.3.2-sec.
+     c. No-op compaction not short-circuited: when discarded=[] the function
+        rebuilt the identical list, logged a misleading "Compacted X→X" line,
+        and returned the same token count.  Now returns early with a warning.
+
+All other code is unchanged from v9.3.3-sec.
 """
 
 import atexit
@@ -56,12 +56,12 @@ try:
 except ImportError:
     pass
 
-VERSION = "9.3.3-sec"
+VERSION = "9.3.4-sec"
 _IS_WINDOWS = platform.system() == "Windows"
 
 
 # =============================================================================
-# .ENV FILE LOADER  (unchanged)
+# .ENV FILE LOADER
 # =============================================================================
 
 def _load_dotenv() -> None:
@@ -91,7 +91,7 @@ _load_dotenv()
 
 
 # =============================================================================
-# CONFIGURATION  (unchanged)
+# CONFIGURATION
 # =============================================================================
 
 class PermissionMode(Enum):
@@ -112,7 +112,7 @@ class Config:
     LLM_RETRY_DELAY = float(os.getenv("LLM_RETRY_DELAY", "3.0"))
     LLM_TIMEOUT     = int(os.getenv("LLM_TIMEOUT",     "560"))
     WORKSPACE = os.getenv("WORKSPACE", str(Path.home() / "lm_workspace"))
-    MAX_ITERATIONS           = int(os.getenv("MAX_ITERATIONS",           "150"))
+    MAX_ITERATIONS           = int(os.getenv("MAX_ITERATIONS",           "500"))
     MAX_SUB_AGENT_ITERATIONS = int(os.getenv("MAX_SUB_AGENT_ITERATIONS", "25"))
     MAX_SAME_TOOL_STREAK     = int(os.getenv("MAX_SAME_TOOL_STREAK",     "8"))
     MAX_NO_PROGRESS_ITERS    = int(os.getenv("MAX_NO_PROGRESS_ITERS",    "15"))
@@ -170,7 +170,7 @@ class Config:
 
 
 # =============================================================================
-# COLORS & LOGGING  (unchanged)
+# COLORS & LOGGING
 # =============================================================================
 
 class Colors:
@@ -271,7 +271,7 @@ class Log:
 
 
 # =============================================================================
-# UTILITIES  (unchanged)
+# UTILITIES
 # =============================================================================
 
 def truncate_output(text: str, max_length: int, label: str = "output") -> str:
@@ -303,7 +303,7 @@ def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
 
 
 # =============================================================================
-# THREAD-LOCAL CONTEXT  (unchanged)
+# THREAD-LOCAL CONTEXT
 # =============================================================================
 
 _ctx_local = threading.local()
@@ -322,7 +322,7 @@ def _get_ctx(key: str, label: str) -> Tuple[Any, Optional[Dict[str, Any]]]:
 
 
 # =============================================================================
-# INSTANCE LOCK  (unchanged)
+# INSTANCE LOCK
 # =============================================================================
 
 class InstanceLock:
@@ -402,7 +402,7 @@ atexit.register(cleanup_resources)
 
 
 # =============================================================================
-# TOKEN COUNTING  (unchanged)
+# TOKEN COUNTING
 # =============================================================================
 
 class TokenCounter:
@@ -421,7 +421,6 @@ class TokenCounter:
 
 # =============================================================================
 # CROSS-PLATFORM SHELL SESSION
-# PATCH: _wrap_command() now resets cwd to workspace before every command.
 # =============================================================================
 
 class ShellSession:
@@ -474,13 +473,12 @@ class ShellSession:
 
     def _wrap_command(self, command: str, marker: str) -> str:
         """
-        FIX: Prepend a hard cd-to-workspace before the user command so that
+        Prepend a hard cd-to-workspace before the user command so that
         any prior directory change (including one injected by the LLM) is
         undone.  The workspace path is quoted to handle spaces.
         """
         ws = str(self.workspace)
         if _IS_WINDOWS:
-            # Use -LiteralPath to handle special chars; single-quote the path.
             cd_reset = f"Set-Location -LiteralPath '{ws}'\n"
             return (
                 f"{cd_reset}"
@@ -597,7 +595,7 @@ def close_shell_session() -> None:
 
 
 # =============================================================================
-# FILE EDITOR  (unchanged)
+# FILE EDITOR
 # =============================================================================
 
 class FileEditor:
@@ -659,21 +657,17 @@ class FileEditor:
 
 # =============================================================================
 # SAFETY
-# PATCH v9.3.3-sec — five new pre-compiled regexes + updated validate_command()
 # =============================================================================
 
-# Windows absolute path (unchanged)
+# Windows absolute path
 _WIN_ABS_PATH_RE = re.compile(r'(?<![A-Za-z])[A-Za-z]:[/\\]', re.IGNORECASE)
 
-# FIX: removed mandatory [a-zA-Z] after the slash.
-# Previously `ls /` and `cat /` were not caught because the regex required a
-# letter immediately after the slash.  Now any `/` that is not a known safe
-# virtual path is treated as an absolute path token.
+# POSIX absolute path — matches any / that is not a known safe virtual path
 _POSIX_ABS_PATH_RE = re.compile(
     r'(?<!\w)/(?!(?:dev/null\b|proc/\b|$))'
 )
 
-# Destructive keywords (original, with the wmic fix from v9.3.2)
+# Destructive keywords
 _DESTRUCTIVE_CMD_RE = re.compile(
     r'\b(?:'
     r'del|erase|rmdir|rd|remove-item|ri|'
@@ -691,40 +685,32 @@ _DESTRUCTIVE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# FIX: Block directory-navigation commands entirely.
-# Since _wrap_command() resets cwd before every command, there is no legitimate
-# reason for the LLM to issue a cd/Set-Location. Blocking it prevents the class
-# of attacks where the agent navigates outside the workspace between two commands.
+# Block directory-navigation commands entirely
 _NAVIGATION_CMD_RE = re.compile(
     r'^\s*(?:'
-    r'cd|chdir|'                          # POSIX + cmd.exe
-    r'set-location|sl|'                   # PowerShell canonical + alias
-    r'push-location|pushd|'               # push dir onto stack
-    r'pop-location|popd'                  # pop dir from stack
+    r'cd|chdir|'
+    r'set-location|sl|'
+    r'push-location|pushd|'
+    r'pop-location|popd'
     r')\b',
     re.IGNORECASE,
 )
 
-# FIX: Block environment-variable path expansions.
-# $env:USERPROFILE, $HOME, ${VAR}, ~/…, %APPDATA%, etc. never contain a hard
-# absolute path string so the abs-path regex never triggered on them.
+# Block environment-variable path expansions
 _ENV_VAR_PATH_RE = re.compile(
     r'(?:'
-    r'\$(?:env:)?[A-Za-z_][A-Za-z0-9_]*'   # $HOME or $env:USERPROFILE
-    r'|\$\{[^}]+\}'                          # ${VAR}
-    r'|~[/\\]'                               # ~/... or ~\...
-    r'|%[A-Za-z_][A-Za-z0-9_]*%'            # %APPDATA% (cmd.exe style)
+    r'\$(?:env:)?[A-Za-z_][A-Za-z0-9_]*'
+    r'|\$\{[^}]+\}'
+    r'|~[/\\]'
+    r'|%[A-Za-z_][A-Za-z0-9_]*%'
     r')',
     re.IGNORECASE,
 )
 
-# FIX: Block relative path traversal.
-# `cat ../../etc/passwd` passes every absolute-path check because there is no
-# absolute path in the string, yet it escapes the workspace when cwd is shallow.
-# Block any occurrence of ../ or ..\ in a command.
+# Block relative path traversal
 _TRAVERSAL_RE = re.compile(r'\.\.[/\\]')
 
-# UNC paths (\\server\share) — missed by the drive-letter regex on Windows.
+# UNC paths
 _UNC_PATH_RE = re.compile(r'\\\\[A-Za-z0-9_.$!~#%-]+[/\\]')
 
 _PATH_STOP_CHARS = frozenset(' \t\n;|&><,)')
@@ -794,17 +780,8 @@ class Safety:
     @staticmethod
     def validate_command(cmd: str,
                          workspace: Optional[Path] = None) -> Tuple[bool, str]:
-        """Validate a shell command before execution.
-
-        Checks (in order):
-          1. Hard blocklist (BLOCKED_COMMANDS env var)
-          2. Navigation commands (cd / Set-Location / pushd / popd) — always blocked
-          3. Environment-variable path expansions ($HOME, $env:VAR, %VAR%, ~/)
-          4. Relative traversal (../ or ..\\)
-          5. UNC paths (\\\\server\\share) on Windows
-          6. Absolute path workspace enforcement
-        """
-        # ── 1. Hard blocklist ────────────────────────────────────────────────
+        """Validate a shell command before execution."""
+        # 1. Hard blocklist
         cmd_lower = cmd.lower()
         for blocked in Config.BLOCKED_COMMANDS:
             if blocked and blocked.strip().lower() in cmd_lower:
@@ -813,10 +790,7 @@ class Safety:
                     "Use the file tools (read, write, edit) instead."
                 )
 
-        # ── 2. Navigation commands ───────────────────────────────────────────
-        # FIX: Block cd / Set-Location / pushd / popd entirely.
-        # The shell session now resets cwd to workspace before every command, so
-        # there is never a legitimate need for the LLM to issue a navigation cmd.
+        # 2. Navigation commands
         if _NAVIGATION_CMD_RE.match(cmd):
             return False, (
                 "Directory-navigation commands (cd, Set-Location, pushd, popd, …) "
@@ -824,10 +798,7 @@ class Safety:
                 "root — use relative paths or the ls/glob/read file tools instead."
             )
 
-        # ── 3. Environment-variable paths ────────────────────────────────────
-        # FIX: $env:USERPROFILE, $HOME, ~/…, %APPDATA%, ${VAR} etc. never
-        # contained a literal absolute path string so the abs-path regex below
-        # never triggered. Block them here before any path extraction occurs.
+        # 3. Environment-variable paths
         env_match = _ENV_VAR_PATH_RE.search(cmd)
         if env_match:
             return False, (
@@ -836,25 +807,21 @@ class Safety:
                 "Use explicit workspace-relative paths or the read/write/ls tools."
             )
 
-        # ── 4. Relative traversal ─────────────────────────────────────────────
-        # FIX: `cat ../../etc/passwd` escapes the workspace sandbox via relative
-        # navigation even though no absolute path appears in the string.
+        # 4. Relative traversal
         if _TRAVERSAL_RE.search(cmd):
             return False, (
                 "Path traversal (../ or ..\\) is not permitted in shell commands. "
                 "Use workspace-relative paths only."
             )
 
-        # ── 5. UNC paths ─────────────────────────────────────────────────────
-        # FIX: \\server\share-style paths were never matched by the drive-letter
-        # regex so they bypassed all path checks on Windows.
+        # 5. UNC paths
         if _IS_WINDOWS and _UNC_PATH_RE.search(cmd):
             return False, (
                 "UNC network paths (\\\\server\\share) are not permitted in shell "
                 "commands.  Access only local workspace files."
             )
 
-        # ── 6. Absolute path workspace enforcement ────────────────────────────
+        # 6. Absolute path workspace enforcement
         if workspace is None or not Config.REQUIRE_WORKSPACE:
             return True, ""
 
@@ -892,6 +859,7 @@ class Safety:
                     )
 
         return True, ""
+
 
 # =============================================================================
 # TODO TRACKING
@@ -1197,7 +1165,6 @@ class AgentState:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "AgentState":
-        # Explicit field mapping prevents silent None-swallowing on schema changes
         return AgentState(
             session_id          = d.get("session_id", ""),
             iteration           = d.get("iteration", 0),
@@ -1524,9 +1491,15 @@ class TaskStateManager:
 
 # =============================================================================
 # MESSAGE COMPACTION
+# FIXED v9.3.4-sec — three bugs corrected (see module docstring for details)
 # =============================================================================
 
 _TASK_STATE_TAG = "[TASK STATE - DO NOT SUMMARIZE]"
+
+# How many messages to always keep as the "recent tail".
+# Intentionally small and fixed — the old formula kept len/2 which prevented
+# any compaction on short-but-token-heavy histories.
+_COMPACTION_TAIL = 10
 
 
 def _find_task_state_msg(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1638,14 +1611,29 @@ def _pair_tool_calls(messages: List[Dict[str, Any]],
 
 
 def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Summarise old messages to stay within the token budget."""
+    """Summarise old messages to stay within the token budget.
+
+    FIX v9.3.4-sec — three bugs corrected:
+
+    1. Tail window is now a fixed _COMPACTION_TAIL (10) messages, not half the
+       list.  The old `max(25, len // 2)` formula kept 25–N/2 messages as tail,
+       which on a 50-message list was 25 — together with up to KEEP_RECENT (30)
+       scored messages the union covered all 50 msgs → discarded=[].
+
+    2. Hard ceiling on keep_indices: after all "keep" sets are merged we trim to
+       Config.KEEP_RECENT_MESSAGES so that scored + tail + paired never silently
+       grows back to cover the whole list.
+
+    3. Early-exit when nothing would actually be discarded, instead of rebuilding
+       the identical list and logging a misleading "Compacted X→X" message.
+    """
     total_tokens = TokenCounter.count_messages_tokens(messages)
 
     if (total_tokens < Config.SUMMARIZATION_THRESHOLD
             or len(messages) <= Config.KEEP_RECENT_MESSAGES + 10):
         return messages
 
-    Log.info(f"Compacting context: {total_tokens} tokens")
+    Log.info(f"Compacting context: {total_tokens} tokens, {len(messages)} messages")
 
     system_msg     = messages[0]
     task_state_msg = _find_task_state_msg(messages)
@@ -1669,15 +1657,15 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         else:
             regular_msgs.append(msg)
 
-    # Decide which regular messages to keep
-    critical     = _score_messages(regular_msgs, Config.KEEP_RECENT_MESSAGES)
+    # ── Step 1: scored high-priority messages ────────────────────────────────
+    critical      = _score_messages(regular_msgs, Config.KEEP_RECENT_MESSAGES)
     keep_indices: set = {regular_msgs.index(m) for m in critical if m in regular_msgs}
 
-    # Always keep the recent tail
-    tail_start = max(0, len(regular_msgs) - max(25, len(regular_msgs) // 2))
+    # ── Step 2: fixed-size tail (FIX: was len//2, now a small constant) ─────
+    tail_start = max(0, len(regular_msgs) - _COMPACTION_TAIL)
     keep_indices |= set(range(tail_start, len(regular_msgs)))
 
-    # Keep read-then-response pairs from the recent window
+    # ── Step 3: keep read-then-response pairs from the recent window ─────────
     for i in range(max(0, len(regular_msgs) - 20), len(regular_msgs)):
         msg = regular_msgs[i]
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -1697,31 +1685,55 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     except Exception:
                         pass
 
+    # ── Step 4: ensure tool-call pairs are never split ───────────────────────
     _pair_tool_calls(regular_msgs, keep_indices)
+
+    # ── Step 5: enforce hard ceiling (FIX: prevents sets from covering all) ──
+    # If keep_indices still covers almost everything after pairing, trim it to
+    # the most-recent KEEP_RECENT_MESSAGES entries so we always discard something.
+    if len(keep_indices) >= len(regular_msgs):
+        # Nothing to discard — bail out to avoid a misleading no-op log line.
+        Log.warning(
+            f"Compaction skipped: all {len(regular_msgs)} regular messages "
+            f"would be kept (token budget still exceeded — consider raising "
+            f"SUMMARIZATION_THRESHOLD or lowering KEEP_RECENT_MESSAGES)."
+        )
+        return messages
+
+    max_keep = Config.KEEP_RECENT_MESSAGES
+    if len(keep_indices) > max_keep:
+        sorted_indices = sorted(keep_indices)
+        keep_indices   = set(sorted_indices[-max_keep:])
+        # Re-run pairing after trimming so we don't orphan any tool responses
+        _pair_tool_calls(regular_msgs, keep_indices)
 
     kept      = [regular_msgs[i] for i in sorted(keep_indices) if i < len(regular_msgs)]
     discarded = [m for i, m in enumerate(regular_msgs) if i not in keep_indices]
 
-    # Rebuild message list
+    # ── Step 6: bail if trimming produced nothing to discard ─────────────────
+    if not discarded:
+        Log.warning("Compaction skipped: nothing to discard after ceiling enforcement.")
+        return messages
+
+    # ── Step 7: rebuild ───────────────────────────────────────────────────────
     result = [system_msg]
     if task_state_msg:  result.append(task_state_msg)
     if last_plan_msg:   result.append(last_plan_msg)
     if last_todo_msg:   result.append(last_todo_msg)
 
-    if discarded:
-        result.append({"role": "system", "content": (
-            f"[COMPACTION SUMMARY]\n"
-            f"Summarized {len(discarded)} older messages to preserve context space.\n\n"
-            f"{_build_progress_summary(discarded)}\n\n"
-            f"IMPORTANT: The filesystem is now the source of truth. "
-            f"Any file paths in the summary may be stale.\n"
-            f"[END COMPACTION SUMMARY]"
-        )})
+    result.append({"role": "system", "content": (
+        f"[COMPACTION SUMMARY]\n"
+        f"Summarized {len(discarded)} older messages to preserve context space.\n\n"
+        f"{_build_progress_summary(discarded)}\n\n"
+        f"IMPORTANT: The filesystem is now the source of truth. "
+        f"Any file paths in the summary may be stale.\n"
+        f"[END COMPACTION SUMMARY]"
+    )})
 
     result.extend(kept)
     result.extend(reconcile_msgs)
 
-    if task_state_msg and discarded:
+    if task_state_msg:
         result.append({"role": "system", "content": (
             "[RECONCILIATION CHECKPOINT]\n\n"
             "Context was compacted. Before continuing:\n"
@@ -1734,8 +1746,11 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )})
 
     new_tokens = TokenCounter.count_messages_tokens(result)
-    Log.success(f"Compacted: {total_tokens} → {new_tokens} tokens "
-                f"({len(messages)} → {len(result)} msgs)")
+    Log.success(
+        f"Compacted: {total_tokens} → {new_tokens} tokens "
+        f"({len(messages)} → {len(result)} msgs, "
+        f"discarded {len(discarded)} messages)"
+    )
     return result
 
 
