@@ -1,5 +1,5 @@
 """
-LMAgent Web — v6.5.6
+LMAgent Web — v6.5.7
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -7,16 +7,15 @@ LMAgent Web — v6.5.6
 
 Place this file next to those three files.
 
-Changes vs v6.5.5:
-  - FIX: Thinking tokens (<think>…</think>) now reach the frontend.
-    Root cause: agent_tools._parse_stream was routing thinking content to
-    stdout only, never through stream_callback. This file monkey-patches
-    LLMClient._parse_stream to also call _tl.thinking_cb, which accumulates
-    and broadcasts ("thinking", text) SSE events between tool calls.
-  - FIX: Streaming lag. The JS Stream module was using a 60 ms debounce
-    that reset on every token — causing the display to freeze during fast
-    generation. Replaced with requestAnimationFrame batching (~16 ms max).
-  - FEAT: Thinking blocks rendered in frontend as collapsible dimmed blocks.
+Changes vs v6.5.6:
+  - FIX: Stop button now immediately cuts the LM Studio connection.
+    Root cause: setting stop_event only raised _AgentStopped on the NEXT
+    token — but LM Studio kept streaming, so tokens kept arriving until
+    generation finished naturally.  Fix: _web_parse_stream stores the live
+    response object in _tl.current_resp and checks the stop flag on every
+    SSE line, calling resp.close() to tear down the TCP connection instantly.
+    _token_cb also closes the connection before raising _AgentStopped so
+    either path kills the stream immediately.
 """
 
 import json
@@ -121,11 +120,14 @@ def _get_agent_state() -> str:
 # =============================================================================
 # MONKEY-PATCH LLMClient._parse_stream
 #
-# The original _parse_stream in agent_tools.py routes <think>…</think> content
-# to sys.stdout only — it never reaches stream_callback (and therefore never
-# reaches the web frontend). This replacement is identical to the original
-# except it also calls _tl.thinking_cb(part) for thinking tokens, and
-# _tl.thinking_cb(None) as a flush signal when </think> closes.
+# FIX v6.5.7: Three stop-related changes versus v6.5.6:
+#   1. resp is stored in _tl.current_resp so the stop handler can close it
+#      from _token_cb (which runs in the same thread).
+#   2. stop_event is read from _tl.stop_event (set by run_in_thread before
+#      the LLM call begins).
+#   3. At the top of every SSE line iteration we check stop_event and call
+#      resp.close() — this tears down the TCP connection to LM Studio
+#      immediately rather than waiting for generation to finish naturally.
 # =============================================================================
 
 def _web_parse_stream(resp, stream_callback):
@@ -137,10 +139,23 @@ def _web_parse_stream(resp, stream_callback):
 
     resp.encoding = "utf-8"
 
-    # Per-thread thinking callback injected by the web layer
+    # FIX: store so _token_cb can close the connection on stop.
+    _tl.current_resp = resp
+
+    # Per-thread callbacks injected by the web layer.
     thinking_cb = getattr(_tl, "thinking_cb", None)
+    stop_event  = getattr(_tl, "stop_event",  None)
 
     for line in resp.iter_lines(decode_unicode=True):
+        # FIX: check stop flag on EVERY line and kill the connection
+        # immediately — don't wait for the model to finish generating.
+        if stop_event and stop_event.is_set():
+            try:
+                resp.close()
+            except Exception:
+                pass
+            break
+
         if not line or not line.startswith("data: "):
             continue
         data = line[6:].strip()
@@ -171,7 +186,6 @@ def _web_parse_stream(resp, stream_callback):
                         in_think = True
                     elif part.lower() == "</think>":
                         in_think = False
-                        # Signal end of a thinking block so the callback can flush
                         thinking_cb = getattr(_tl, "thinking_cb", None)
                         if thinking_cb:
                             thinking_cb(None)
@@ -195,7 +209,7 @@ def _web_parse_stream(resp, stream_callback):
                     thinking_cb = getattr(_tl, "thinking_cb", None)
                     if thinking_cb:
                         thinking_cb(tb_text)
-                        thinking_cb(None)   # auto-flush each structured block
+                        thinking_cb(None)
 
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", next_idx)
@@ -353,7 +367,6 @@ def _unregister_stream_q(q: "queue.Queue") -> None:
 _chat_logs: "dict[str, list]" = defaultdict(list)
 _chat_log_lock = threading.Lock()
 
-# "thinking" included so thinking blocks survive page refresh / reconnect
 _REPLAY_KINDS = {"token", "thinking", "tool", "status", "iteration", "done", "error", "session"}
 
 
@@ -424,11 +437,6 @@ _agent_main_mod._HeaderStreamCb = _PatchedHSC
 
 # =============================================================================
 # THINKING CALLBACK HELPERS
-#
-# Each agent thread creates its own _think_buf and registers _thinking_cb on
-# _tl.thinking_cb.  The callback accumulates text until None (flush signal)
-# is received, then broadcasts the block.  The flush is also called
-# explicitly on tool_call / iteration boundaries via _push_event.
 # =============================================================================
 
 def _make_thinking_helpers():
@@ -442,7 +450,7 @@ def _make_thinking_helpers():
         buf[0] = ""
 
     def thinking_cb(part):
-        if part is None:   # flush signal from _parse_stream on </think>
+        if part is None:
             flush_thinking()
         else:
             buf[0] += part
@@ -478,7 +486,7 @@ def _push_event(event, stop_event: "threading.Event | None", last_status: list,
     edata = event.data
     if etype == "tool_call":
         if flush_thinking:
-            flush_thinking()   # emit any pending thinking before tool row
+            flush_thinking()
         name    = edata.get("name", "?")
         preview = edata.get("args_preview", "")[:50]
         _broadcast(("tool", f"{name}({preview})"))
@@ -487,7 +495,7 @@ def _push_event(event, stop_event: "threading.Event | None", last_status: list,
         _broadcast(("tool", f"{mark} {edata.get('name', '')}"))
     elif etype == "iteration":
         if flush_thinking:
-            flush_thinking()   # emit any pending thinking at iteration boundary
+            flush_thinking()
         _broadcast(("iteration", f"{edata.get('n')}/{edata.get('max')}"))
     elif etype in ("log", "warning", "error"):
         msg = edata.get("message") or edata.get("error") or ""
@@ -575,7 +583,6 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>LMAgent</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<!-- [1] Reduced from 9 variants to 5: dropped mono-500, mono-italic, sans-italic, sans-500 -->
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -746,13 +753,6 @@ header {
   color: var(--text);
 }
 
-.msg.agent .msg-body.streaming {
-  font-family: var(--mono);
-  font-size: 13px;
-  white-space: pre-wrap;
-  color: var(--text2);
-}
-
 .msg.agent .msg-body h1,.msg.agent .msg-body h2,
 .msg.agent .msg-body h3,.msg.agent .msg-body h4 {
   font-family: var(--sans); font-weight: 600;
@@ -863,7 +863,6 @@ header {
   margin-top: 4px; color: var(--text3); line-height: 1.55;
 }
 .thinking-block.open .tb-body { display: block; }
-/* ─────────────────────────────────────────────────────────────────────────── */
 
 .msg-copy {
   position: absolute; top: 30px; right: 10px;
@@ -1081,7 +1080,7 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.5.6</span>
+      <span class="logo-sub">v6.5.7</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -1141,7 +1140,6 @@ header {
   <div id="tools-list"></div>
 </div>
 
-<!-- [2] marked.js replaces the 180-line custom MD parser -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
 <script>
 'use strict';
@@ -1150,42 +1148,26 @@ function _esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// [3] REMOVED fixMojibake() — backend runs _fix_mojibake() before every
-// _broadcast(), so strings are already clean when they arrive here.
-// All three call-sites below (Replay.flushTokens, Stream._renderFinal,
-// and the old Replay copy-btn arg) now use the raw buffer directly.
-
-
-// ══════════════════════════════════════════════════════════════
-// THINKING BLOCK WIDGET  (unchanged)
-// ══════════════════════════════════════════════════════════════
 function _makeThinkingBlock(text) {
   var el = document.createElement('div');
   el.className = 'thinking-block';
-
   var firstLine = text.split('\n')[0].slice(0, 120);
   var multiline = text.length > firstLine.length || text.indexOf('\n') !== -1;
-
   var hdr = document.createElement('div');
   hdr.className = 'tb-header';
-
   var arrow = document.createElement('span');
   arrow.className = 'tb-arrow';
   arrow.textContent = '\u25b6';
-
   var preview = document.createElement('span');
   preview.className = 'tb-preview';
   preview.textContent = '\ud83d\udcad ' + firstLine + (multiline ? '\u2026' : '');
-
   hdr.appendChild(arrow);
   hdr.appendChild(preview);
   el.appendChild(hdr);
-
   var body = document.createElement('div');
   body.className = 'tb-body';
   body.textContent = text;
   el.appendChild(body);
-
   el.onclick = function() {
     var open = el.classList.toggle('open');
     arrow.textContent = open ? '\u25bc' : '\u25b6';
@@ -1194,13 +1176,6 @@ function _makeThinkingBlock(text) {
   return el;
 }
 
-
-// ═══════════════════════════════════════════════════════════════
-// [2] MARKDOWN — thin wrapper around marked.js
-// Replaces the previous 180-line hand-rolled parser.
-// Custom renderers preserve: lang badge on code blocks,
-// target="_blank" on links, max-width on images.
-// ═══════════════════════════════════════════════════════════════
 const MD = (() => {
   marked.use({
     gfm: true,
@@ -1221,9 +1196,7 @@ const MD = (() => {
       }
     }
   });
-
   var MAX_RENDER_BYTES = 400000;
-
   function render(md) {
     if (!md || !md.trim()) return '';
     if (md.length > MAX_RENDER_BYTES)
@@ -1231,19 +1204,13 @@ const MD = (() => {
     try { return marked.parse(md); }
     catch (_) { return '<pre style="white-space:pre-wrap">' + _esc(md) + '</pre>'; }
   }
-
   return { render };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// SCROLL  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Scroll = (() => {
   var pinned = true;
   var pane   = function(){ return document.getElementById('messages'); };
   var btn    = function(){ return document.getElementById('scroll-btn'); };
-
   function atBottom() {
     var el = pane();
     return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -1259,10 +1226,6 @@ const Scroll = (() => {
   return { maybe, jump, pin: function(){ pinned = true; }, update };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// STATUS BAR  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Status = (() => {
   return {
     set: function(msg, state) {
@@ -1278,14 +1241,9 @@ const Status = (() => {
   };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// ELAPSED TIMER  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const ElapsedTimer = (() => {
   var _t = null, _start = 0;
   var el = function(){ return document.getElementById('elapsed-timer'); };
-
   function _fmt(ms) {
     var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
     s = s % 60;
@@ -1305,10 +1263,6 @@ const ElapsedTimer = (() => {
   return { start, stop };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// CONNECTION DOT  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const ConnDot = (() => {
   var el = function(){ return document.getElementById('conn-dot'); };
   return {
@@ -1318,20 +1272,14 @@ const ConnDot = (() => {
   };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// INPUT HISTORY  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const InputHistory = (() => {
   var _hist = [], _idx = -1, _draft = '';
-
   function _set(inp, val) {
     inp.value = val;
     inp.style.height = 'auto';
     inp.style.height = Math.min(inp.scrollHeight, 140) + 'px';
     setTimeout(function(){ inp.selectionStart = inp.selectionEnd = inp.value.length; }, 0);
   }
-
   function push(text) {
     if (!text || (_hist.length && _hist[_hist.length - 1] === text)) return;
     _hist.push(text);
@@ -1352,11 +1300,6 @@ const InputHistory = (() => {
   return { push, up, down, reset };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// CHAT LOG REPLAY
-// [3] Removed fixMojibake() calls — backend already cleans encoding
-// ═══════════════════════════════════════════════════════════════
 const Replay = (() => {
   function _addCopyBtn(wrap, rawText) {
     var btn = document.createElement('button');
@@ -1384,7 +1327,6 @@ const Replay = (() => {
       wrap.className = 'msg agent';
       wrap.innerHTML = '<div class="msg-label">Agent</div><div class="msg-body"></div>';
       var body  = wrap.querySelector('.msg-body');
-      // [3] No fixMojibake — data is already clean from backend
       body.innerHTML = MD.render(tokenBuf) || _esc(tokenBuf);
       _addCopyBtn(wrap, tokenBuf);
       pane.appendChild(wrap);
@@ -1479,15 +1421,10 @@ const Replay = (() => {
   return { run };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// COLLAPSIBLE TOOL GROUP HELPER  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 function _finaliseToolGroup(group, totalCount) {
   if (totalCount < 3) return;
   var okCount   = group.querySelectorAll('.tool-row[data-s="ok"]').length;
   var failCount = group.querySelectorAll('.tool-row[data-s="fail"]').length;
-
   function _label(collapsed) {
     if (collapsed) return '\u25b6 ' + totalCount + ' tool call' + (totalCount !== 1 ? 's' : '') + ' \u2014 click to expand';
     var parts = [totalCount + ' tool call' + (totalCount !== 1 ? 's' : '')];
@@ -1495,7 +1432,6 @@ function _finaliseToolGroup(group, totalCount) {
     if (failCount) parts.push(failCount + ' failed');
     return '\u25bc ' + parts.join(', ') + ' \u2014 click to collapse';
   }
-
   var summary = document.createElement('div');
   summary.className   = 'tool-group-summary';
   summary.textContent = _label(false);
@@ -1507,14 +1443,9 @@ function _finaliseToolGroup(group, totalCount) {
   };
 }
 
-
-// ═══════════════════════════════════════════════════════════════
-// MESSAGES  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Messages = (() => {
   var pane = function(){ return document.getElementById('messages'); };
   function hideEmpty() { var e = document.getElementById('empty'); if (e) e.remove(); }
-
   function add(role, html, extra, asHtml) {
     hideEmpty();
     Tools.endGroup();
@@ -1528,19 +1459,10 @@ const Messages = (() => {
     Scroll.maybe();
     return body;
   }
-
   function sys(text, variant) { add('sys', text, variant || ''); }
   return { add, sys, pane, hideEmpty };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// STREAMING AGENT MESSAGE
-// [4] Cursor node is created once in start() and reattached in
-//     flush() rather than being destroyed and recreated on every
-//     requestAnimationFrame (~60x/sec during streaming).
-// [3] Removed fixMojibake() from _renderFinal — not needed.
-// ═══════════════════════════════════════════════════════════════
 const Stream = (() => {
   var el = null, buf = '', _rafPending = false, _cursor = null;
 
@@ -1568,8 +1490,6 @@ const Stream = (() => {
       if (!rawBuf.trim()) {
         if (wrap) wrap.remove();
       } else {
-        body.classList.remove('streaming');
-        // [3] Removed fixMojibake() — backend already cleaned encoding
         body.innerHTML = MD.render(rawBuf) || _esc(rawBuf);
         if (wrap) _attachCopyBtn(wrap, rawBuf);
       }
@@ -1579,8 +1499,6 @@ const Stream = (() => {
 
   function start() {
     buf = ''; el = Messages.add('agent', '');
-    el.classList.add('streaming');
-    // [4] Create cursor once; flush() reattaches the same node
     _cursor = document.createElement('span');
     _cursor.className = 'cursor';
     el.appendChild(_cursor);
@@ -1589,9 +1507,7 @@ const Stream = (() => {
   function flush() {
     _rafPending = false;
     if (!el) return;
-    // [4] el.textContent clears all children (including the cursor node),
-    //     then we reattach the existing cursor — zero new allocations per tick
-    el.textContent = buf;
+    el.innerHTML = MD.render(buf) || _esc(buf);
     el.appendChild(_cursor);
     Scroll.maybe();
   }
@@ -1625,10 +1541,6 @@ const Stream = (() => {
   return { start, token, finalize, reset, active };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// TOOL ROWS  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Tools = (() => {
   var MAX = 12, group = null, count = 0, pending = new Map();
 
@@ -1694,13 +1606,9 @@ const Tools = (() => {
   return { call, resolve, endGroup, reset };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// WHISPER  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Whisper = (() => {
   function queue(text) {
-    if (!Agent.running()) { Messages.sys('Agent is not running — whisper ignored.', 'warn'); return; }
+    if (!Agent.running()) { Messages.sys('Agent is not running \u2014 whisper ignored.', 'warn'); return; }
     fetch('/whisper', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1710,10 +1618,6 @@ const Whisper = (() => {
   return { queue };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// AGENT STATE MACHINE  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Agent = (() => {
   var state = 'idle', sessionId = null, requestId = null, _hadContent = false;
 
@@ -1929,10 +1833,6 @@ const Agent = (() => {
   return { sendOrStop, newSession, running, getSession, setSession, _handle: handleEvent };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// PERSISTENT EVENTSOURCE  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 (function initStream() {
   var es = null, retryMs = 1000;
   function connect() {
@@ -1952,10 +1852,6 @@ const Agent = (() => {
   connect();
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// SLASH COMMANDS  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const CMDS = [
   { cmd: '/help',     desc: 'Show commands' },
   { cmd: '/new',      desc: 'Start a fresh session' },
@@ -2036,10 +1932,6 @@ const SlashCmds = (() => {
   return { run };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// COMMAND PALETTE  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const Palette = (() => {
   var idx = -1;
   var pal = function(){ return document.getElementById('palette'); };
@@ -2095,9 +1987,6 @@ const Palette = (() => {
   return { onInput, onKey, close };
 })();
 
-// [5] Wrapped in requestAnimationFrame — avoids the two forced reflows
-//     (one from height='auto', one from reading scrollHeight) that the
-//     previous synchronous version caused on every keystroke.
 function autoResize(el) {
   requestAnimationFrame(function() {
     el.style.height = 'auto';
@@ -2109,10 +1998,6 @@ document.addEventListener('keydown', function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'l') { e.preventDefault(); Agent.newSession(); }
 });
 
-
-// ═══════════════════════════════════════════════════════════════
-// SESSIONS PANEL  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const SessionsPanel = (() => {
   async function load() {
     var list = document.getElementById('sessions-list');
@@ -2139,10 +2024,6 @@ const SessionsPanel = (() => {
   return { load };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// TOOLS PANEL  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const ToolsPanel = (() => {
   var data = null;
 
@@ -2187,10 +2068,6 @@ const ToolsPanel = (() => {
   return { load, filter };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// UI PANEL MANAGEMENT  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 const UI = (() => {
   var overlay = function(){ return document.getElementById('overlay'); };
   function openPanel(id)  { document.getElementById(id).classList.add('open');    overlay().classList.add('show'); }
@@ -2211,10 +2088,6 @@ const UI = (() => {
   return { toggleSessions, closeSessions, toggleTools, closeTools, closeAll };
 })();
 
-
-// ═══════════════════════════════════════════════════════════════
-// INIT  (unchanged)
-// ═══════════════════════════════════════════════════════════════
 (async function() {
   try {
     var s = await fetch('/status').then(function(r){ return r.json(); });
@@ -2429,8 +2302,20 @@ def chat():
         thinking_cb, flush_thinking = _make_thinking_helpers()
         _tl.thinking_cb = thinking_cb
 
+        # FIX v6.5.7: register stop_event in thread-local so _web_parse_stream
+        # can check it on every SSE line and close the connection immediately.
+        _tl.stop_event  = stop_event
+
         def _token_cb(tok: str) -> None:
             if stop_event.is_set():
+                # FIX v6.5.7: also close the active LM Studio connection so
+                # iter_lines() exits without waiting for generation to finish.
+                active_resp = getattr(_tl, "current_resp", None)
+                if active_resp is not None:
+                    try:
+                        active_resp.close()
+                    except Exception:
+                        pass
                 raise _AgentStopped("stopped by user")
             _broadcast(("token", tok))
 
@@ -2499,8 +2384,11 @@ def chat():
                 _broadcast(("error", str(exc)[:200]))
             _set_agent_state("idle")
         finally:
-            _tl.token_cb    = None
-            _tl.thinking_cb = None
+            # FIX v6.5.7: clean up all thread-locals including the new ones.
+            _tl.token_cb     = None
+            _tl.thinking_cb  = None
+            _tl.stop_event   = None
+            _tl.current_resp = None
             with _stop_events_lock:
                 _stop_events.pop(rid, None)
 
@@ -2657,7 +2545,7 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
 
     print("\n" + "\u2550" * 58)
-    print("  LMAgent Web  v6.5.6")
+    print("  LMAgent Web  v6.5.7")
     print("\u2550" * 58)
     print(f"  Local  \u2192  http://localhost:{port}")
     print(f"  Phone  \u2192  http://{ip}:{port}")
@@ -2665,7 +2553,8 @@ if __name__ == "__main__":
     print(f"  LLM       : {Config.LLM_URL}")
     print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
     print("\u2550" * 58)
-    print("  FIX: Thinking blocks now visible in frontend \u2713")
+    print("  FIX: Stop now kills LM Studio connection immediately \u2713")
+    print("  FIX: Thinking blocks visible in frontend \u2713")
     print("  FIX: Streaming lag eliminated (rAF batching) \u2713")
     print("  FEAT: Whisper — /whisper <text> to nudge the agent \u2713")
     print("\u2550" * 58 + "\n")
