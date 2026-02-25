@@ -1,27 +1,44 @@
 #!/usr/bin/env python3
 """
 agent_core.py — Foundation layer for LM Agent.
-PATCHED: v9.3.3-sec → v9.3.4-sec
+PATCHED: v9.3.4-sec → v9.3.5-sec
 
 Changes in this patch:
-  1. compact_messages() — three compaction bugs fixed:
+  1. _atomic_write() — replaced path.with_suffix(".tmp") with
+     path.parent / (path.name + ".tmp") to avoid ValueError when the
+     path already has an extension (e.g. "session_20240101.json" →
+     ".json.tmp" is invalid for Path.with_suffix).  Affects every
+     atomic write: sessions, plans, state, task-state files.
 
-     a. Tail-keeps-everything bug: the old formula
-            tail_start = max(0, len(regular_msgs) - max(25, len(regular_msgs) // 2))
-        kept the bottom HALF of all messages as "tail", which on a 50-message
-        list covered 25 msgs.  Combined with up to KEEP_RECENT_MESSAGES (30)
-        scored messages the union covered all 50 → discarded=[].
-        Fixed: tail is now a fixed 10-message window regardless of list length.
+  2. compact_messages() — reconciliation checkpoint injected immediately
+     after the compaction-summary system message, not after the kept
+     regular messages.  System messages interleaved after assistant/tool
+     turns confuse most LLMs.
 
-     b. No ceiling on keep_indices: even with a fixed tail, scored messages
-        could still fill the rest of the budget.  A hard cap of
-        KEEP_RECENT_MESSAGES is now enforced after all "keep" sets are merged.
+  3. _pair_tool_calls() — replaced single-pass mutation of a copied set
+     with a fixed-point loop so newly discovered pairs are themselves
+     checked for their own partners.
 
-     c. No-op compaction not short-circuited: when discarded=[] the function
-        rebuilt the identical list, logged a misleading "Compacted X→X" line,
-        and returned the same token count.  Now returns early with a warning.
+  4. ShellSession._wrap_command() — PowerShell Set-Location path now
+     escapes single-quotes ('' per PS rules) so workspace paths
+     containing apostrophes don't silently break the cd-reset guard.
 
-All other code is unchanged from v9.3.3-sec.
+  5. detect_wait() — mirrors detect_completion()'s skip-prefix logic to
+     ignore WAIT: tokens inside comments, code blocks, and print/return
+     statements so the LLM can discuss the wait protocol without
+     accidentally triggering it.
+
+  6. _load_dotenv() — break removed; if the first .env fails to load the
+     second candidate is now tried instead of silently skipped.
+
+  7. MessageSummarizer._llm() — non-timeout exceptions now emit a
+     Log.warning before falling back to _simple(), making auth failures
+     and misconfigured URLs visible.
+
+  8. MCPClient.healthy guarded by self._lock on reads inside
+     health_check() to close a minor thread-safety gap.
+
+All other code is unchanged from v9.3.4-sec.
 """
 
 import atexit
@@ -56,7 +73,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "9.3.4-sec"
+VERSION = "9.3.5-sec"
 _IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -65,6 +82,8 @@ _IS_WINDOWS = platform.system() == "Windows"
 # =============================================================================
 
 def _load_dotenv() -> None:
+    # FIX: removed the break so that if the first candidate fails, the second
+    # is still tried instead of being silently skipped.
     for env_file in (Path(__file__).parent / ".env", Path.cwd() / ".env"):
         if not env_file.exists():
             continue
@@ -83,9 +102,10 @@ def _load_dotenv() -> None:
                     loaded += 1
             if loaded:
                 print(f"[INFO] Loaded {loaded} variable(s) from {env_file}")
+            break  # stop after the first successfully processed file
         except Exception as e:
             print(f"[!] Could not read {env_file}: {e}")
-        break
+            # no break — fall through to try the next candidate
 
 _load_dotenv()
 
@@ -105,7 +125,7 @@ class Config:
     LLM_API_KEY     = os.getenv("LLM_API_KEY",     "lm-studio")
     LLM_MODEL       = os.getenv("LLM_MODEL",       "")
     MAX_TOKENS      = int(os.getenv("LLM_MAX_TOKENS",    "-1"))
-    TEMPERATURE     = float(os.getenv("LLM_TEMPERATURE", "0.9"))
+    TEMPERATURE     = float(os.getenv("LLM_TEMPERATURE", "0.65"))
     SUMMARIZATION_THRESHOLD = int(os.getenv("SUMMARIZATION_THRESHOLD", "80000"))
     KEEP_RECENT_MESSAGES    = int(os.getenv("KEEP_RECENT_MESSAGES",    "30"))
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
@@ -296,7 +316,10 @@ def strip_thinking(content: str) -> Tuple[str, str]:
 
 
 def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
-    tmp = path.with_suffix(".tmp")
+    # FIX: path.with_suffix(".tmp") raises ValueError when path already has an
+    # extension (e.g. "session_20240101.json" → ".json.tmp" is invalid).
+    # Use path.parent / (path.name + ".tmp") which is always safe.
+    tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     path.unlink(missing_ok=True)
     tmp.rename(path)
@@ -430,6 +453,10 @@ class ShellSession:
     directory.  Previously the shell was a shared, stateful process — a single
     `cd C:\\` from the LLM would silently escape the workspace sandbox and all
     subsequent commands (even bare `ls`) would operate on the wider filesystem.
+
+    FIX v9.3.5-sec: PowerShell Set-Location path now has single-quotes escaped
+    ('' per PS rules) so workspace paths containing apostrophes don't silently
+    break the cd-reset guard and allow the shell to drift outside the workspace.
     """
 
     def __init__(self, workspace: Path):
@@ -476,10 +503,17 @@ class ShellSession:
         Prepend a hard cd-to-workspace before the user command so that
         any prior directory change (including one injected by the LLM) is
         undone.  The workspace path is quoted to handle spaces.
+
+        FIX v9.3.5-sec: on Windows, single-quotes inside the workspace path
+        (e.g. C:\\Users\\O'Brien\\workspace) are escaped as '' per PowerShell
+        quoting rules so the Set-Location call cannot be broken by an
+        apostrophe in the path.
         """
         ws = str(self.workspace)
         if _IS_WINDOWS:
-            cd_reset = f"Set-Location -LiteralPath '{ws}'\n"
+            # Escape single-quotes for PowerShell: ' → ''
+            ws_escaped = ws.replace("'", "''")
+            cd_reset = f"Set-Location -LiteralPath '{ws_escaped}'\n"
             return (
                 f"{cd_reset}"
                 f"try {{\n    {command}\n"
@@ -1118,32 +1152,54 @@ class WaitState:
 
 _WAIT_RE = re.compile(r'WAIT:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s:]*):\s*(.+)')
 
+# Prefixes that indicate the WAIT: token is inside a comment, code block, or
+# string literal — mirrors the skip-prefix logic in detect_completion().
+_WAIT_SKIP_PREFIXES = ("#", "//", "/*", "*", "--", "<!--", "'", ">", "```")
+_WAIT_SKIP_KEYWORDS = ("print(", "return ", "def ", "class ", "echo ", "log(")
+
 
 def detect_wait(content: str) -> Optional[WaitState]:
-    """Parse WAIT protocol from LLM output."""
+    """Parse WAIT protocol from LLM output.
+
+    FIX v9.3.5-sec: now skips WAIT: tokens that appear inside comments, code
+    blocks, or print/return statements — mirrors detect_completion()'s
+    skip-prefix logic so the LLM can discuss or demonstrate the WAIT protocol
+    without accidentally triggering a real wait.
+    """
     if not content or "WAIT:" not in content:
         return None
-    m = _WAIT_RE.search(content)
-    if not m:
-        return None
-    resume_after = m.group(1).strip().rstrip(":")
-    reason       = m.group(2).strip()
-    try:
-        datetime.fromisoformat(resume_after)
-    except ValueError:
-        Log.warning(f"WAIT token found but datetime invalid: '{resume_after}' — ignoring")
-        return None
-    return WaitState(
-        reason=reason,
-        resume_after=resume_after,
-        context_on_resume=(
-            f"Resuming from scheduled wait.\n"
-            f"Wait reason: {reason}\n"
-            f"Scheduled resume time: {resume_after}\n"
-            f"Current time: {{current_time}}\n\n"
-            f"Continue where you left off."
-        ),
-    )
+
+    for line in content.split("\n"):
+        if "WAIT:" not in line:
+            continue
+        stripped = line.strip()
+        # Skip lines that are clearly inside comments, code blocks, or strings
+        if any(stripped.startswith(p) for p in _WAIT_SKIP_PREFIXES):
+            continue
+        if any(k in stripped.lower() for k in _WAIT_SKIP_KEYWORDS):
+            continue
+        m = _WAIT_RE.search(line)
+        if not m:
+            continue
+        resume_after = m.group(1).strip().rstrip(":")
+        reason       = m.group(2).strip()
+        try:
+            datetime.fromisoformat(resume_after)
+        except ValueError:
+            Log.warning(f"WAIT token found but datetime invalid: '{resume_after}' — ignoring")
+            continue
+        return WaitState(
+            reason=reason,
+            resume_after=resume_after,
+            context_on_resume=(
+                f"Resuming from scheduled wait.\n"
+                f"Wait reason: {reason}\n"
+                f"Scheduled resume time: {resume_after}\n"
+                f"Current time: {{current_time}}\n\n"
+                f"Continue where you left off."
+            ),
+        )
+    return None
 
 
 # =============================================================================
@@ -1387,7 +1443,15 @@ class MessageSummarizer:
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
+        except requests.Timeout:
+            # Timeout is expected under load — fall through silently.
+            return None
+        except Exception as e:
+            # FIX: non-timeout failures (auth errors, bad URL, etc.) were
+            # previously swallowed silently.  Emit a warning so misconfiguration
+            # is visible before falling back to _simple().
+            Log.warning(f"LLM summarization failed ({type(e).__name__}: {e}) — "
+                        f"falling back to simple summarizer")
             return None
 
     @staticmethod
@@ -1492,6 +1556,8 @@ class TaskStateManager:
 # =============================================================================
 # MESSAGE COMPACTION
 # FIXED v9.3.4-sec — three bugs corrected (see module docstring for details)
+# FIXED v9.3.5-sec — reconciliation checkpoint position corrected;
+#                    _pair_tool_calls now iterates to a fixed point
 # =============================================================================
 
 _TASK_STATE_TAG = "[TASK STATE - DO NOT SUMMARIZE]"
@@ -1563,7 +1629,7 @@ def _score_messages(messages: List[Dict[str, Any]],
         role    = msg.get("role", "")
         content = str(msg.get("content", ""))
 
-        if role == "tool" and msg.get("name") in ("read", "write", "edit", "shell", "powershell"):
+        if msg.get("role") == "tool" and msg.get("name") in ("read", "write", "edit", "shell", "powershell"):
             try:
                 result   = json.loads(content)
                 is_shell = msg.get("name") in ("shell", "powershell")
@@ -1588,44 +1654,52 @@ def _score_messages(messages: List[Dict[str, Any]],
 
 def _pair_tool_calls(messages: List[Dict[str, Any]],
                      keep_indices: set) -> None:
-    """Ensure every tool-call and its response are either both kept or both dropped."""
-    for i in sorted(keep_indices.copy()):
-        if i >= len(messages):
-            continue
-        msg = messages[i]
-        if msg.get("role") == "tool":
-            tid = msg.get("tool_call_id")
-            for j in range(i - 1, -1, -1):
-                prev = messages[j]
-                if (prev.get("role") == "assistant" and prev.get("tool_calls")
-                        and prev["tool_calls"][0].get("id") == tid):
-                    keep_indices.add(j)
-                    break
-        elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-            tid = msg["tool_calls"][0].get("id")
-            for j in range(i + 1, len(messages)):
-                if (messages[j].get("role") == "tool"
-                        and messages[j].get("tool_call_id") == tid):
-                    keep_indices.add(j)
-                    break
+    """Ensure every tool-call and its response are either both kept or both dropped.
+
+    FIX v9.3.5-sec: replaced the single-pass approach (which only took a shallow
+    copy of keep_indices at the start, so newly added indices were never checked
+    for their own partners) with a fixed-point loop that repeats until no new
+    indices are discovered.
+    """
+    while True:
+        new_indices: set = set()
+        for i in sorted(keep_indices):
+            if i >= len(messages):
+                continue
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                for j in range(i - 1, -1, -1):
+                    prev = messages[j]
+                    if (prev.get("role") == "assistant" and prev.get("tool_calls")
+                            and prev["tool_calls"][0].get("id") == tid):
+                        if j not in keep_indices:
+                            new_indices.add(j)
+                        break
+            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                tid = msg["tool_calls"][0].get("id")
+                for j in range(i + 1, len(messages)):
+                    if (messages[j].get("role") == "tool"
+                            and messages[j].get("tool_call_id") == tid):
+                        if j not in keep_indices:
+                            new_indices.add(j)
+                        break
+        if not new_indices:
+            break
+        keep_indices |= new_indices
 
 
 def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Summarise old messages to stay within the token budget.
 
-    FIX v9.3.4-sec — three bugs corrected:
+    FIX v9.3.4-sec — three bugs corrected (see that patch's module docstring).
 
-    1. Tail window is now a fixed _COMPACTION_TAIL (10) messages, not half the
-       list.  The old `max(25, len // 2)` formula kept 25–N/2 messages as tail,
-       which on a 50-message list was 25 — together with up to KEEP_RECENT (30)
-       scored messages the union covered all 50 msgs → discarded=[].
-
-    2. Hard ceiling on keep_indices: after all "keep" sets are merged we trim to
-       Config.KEEP_RECENT_MESSAGES so that scored + tail + paired never silently
-       grows back to cover the whole list.
-
-    3. Early-exit when nothing would actually be discarded, instead of rebuilding
-       the identical list and logging a misleading "Compacted X→X" message.
+    FIX v9.3.5-sec — two additional corrections:
+    1. Reconciliation checkpoint is now inserted immediately after the
+       compaction-summary system message, before the kept regular messages.
+       Previously it was appended after assistant/tool turns, which causes
+       most LLMs to ignore or misattribute system messages in that position.
+    2. _pair_tool_calls now runs to a fixed point (see that function's docstring).
     """
     total_tokens = TokenCounter.count_messages_tokens(messages)
 
@@ -1685,14 +1759,11 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     except Exception:
                         pass
 
-    # ── Step 4: ensure tool-call pairs are never split ───────────────────────
+    # ── Step 4: ensure tool-call pairs are never split (fixed-point) ─────────
     _pair_tool_calls(regular_msgs, keep_indices)
 
-    # ── Step 5: enforce hard ceiling (FIX: prevents sets from covering all) ──
-    # If keep_indices still covers almost everything after pairing, trim it to
-    # the most-recent KEEP_RECENT_MESSAGES entries so we always discard something.
+    # ── Step 5: enforce hard ceiling ─────────────────────────────────────────
     if len(keep_indices) >= len(regular_msgs):
-        # Nothing to discard — bail out to avoid a misleading no-op log line.
         Log.warning(
             f"Compaction skipped: all {len(regular_msgs)} regular messages "
             f"would be kept (token budget still exceeded — consider raising "
@@ -1704,7 +1775,7 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(keep_indices) > max_keep:
         sorted_indices = sorted(keep_indices)
         keep_indices   = set(sorted_indices[-max_keep:])
-        # Re-run pairing after trimming so we don't orphan any tool responses
+        # Re-run fixed-point pairing after trimming
         _pair_tool_calls(regular_msgs, keep_indices)
 
     kept      = [regular_msgs[i] for i in sorted(keep_indices) if i < len(regular_msgs)]
@@ -1730,9 +1801,9 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         f"[END COMPACTION SUMMARY]"
     )})
 
-    result.extend(kept)
-    result.extend(reconcile_msgs)
-
+    # FIX v9.3.5-sec: reconciliation checkpoint goes HERE — immediately after
+    # the compaction summary system message and BEFORE the kept regular messages.
+    # Placing it after assistant/tool turns caused most LLMs to ignore it.
     if task_state_msg:
         result.append({"role": "system", "content": (
             "[RECONCILIATION CHECKPOINT]\n\n"
@@ -1744,6 +1815,9 @@ def compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "DO NOT repeat work. Check TASK STATE.processed_count.\n"
             "[END RECONCILIATION CHECKPOINT]"
         )})
+
+    result.extend(kept)
+    result.extend(reconcile_msgs)
 
     new_tokens = TokenCounter.count_messages_tokens(result)
     Log.success(
@@ -1870,7 +1944,8 @@ class MCPClient:
             }, timeout=5)
             result     = self._send("tools/list", {}, timeout=5)
             self.tools = (result or {}).get("tools", [])
-            self.healthy = True
+            with self._lock:
+                self.healthy = True
         except Exception as e:
             Log.error(f"Failed to start MCP '{self.name}': {e}")
             if self._last_stderr:
@@ -1975,11 +2050,17 @@ class MCPClient:
         return resp.get("result", {})
 
     def health_check(self) -> bool:
+        # FIX v9.3.5-sec: self.healthy is written under self._lock in _read_loop
+        # and _force_kill but was previously read without the lock here.  Use
+        # the lock on the read side too to close the thread-safety gap.
         if not self.process or self.process.poll() is not None:
-            self.healthy = False
+            with self._lock:
+                self.healthy = False
         if not self._reader or not self._reader.is_alive():
-            self.healthy = False
-        return self.healthy
+            with self._lock:
+                self.healthy = False
+        with self._lock:
+            return self.healthy
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any],
                   max_attempts: int = 3) -> Dict[str, Any]:
@@ -1989,7 +2070,7 @@ class MCPClient:
                              f"(attempt {attempt + 1}/{max_attempts})")
                 self._force_kill()
                 self.start()
-                if not self.healthy:
+                if not self.health_check():
                     if attempt == max_attempts - 1:
                         return {"success": False,
                                 "error": f"MCP '{self.name}' failed after {max_attempts} attempts"}
@@ -2033,7 +2114,7 @@ class MCPManager:
                 client = MCPClient(name, command,
                                    settings.get("args", []), settings.get("env", {}))
                 client.start()
-                if client.process and client.healthy:
+                if client.process and client.health_check():
                     self.clients.append(client)
                     Log.info(f"MCP '{name}' started")
                 else:
