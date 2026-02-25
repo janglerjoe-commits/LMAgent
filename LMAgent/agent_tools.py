@@ -18,6 +18,22 @@ Sandbox patch v9.5.1-sandbox-git:
   - All other behaviour is unchanged from v9.5.0-sandbox.
 
 All other behaviour is unchanged from v9.4.0-nosell.
+
+Fixes applied (v9.5.1-fixed):
+  - BUG FIX: tool_write and tool_edit: replaced fp.with_suffix(fp.suffix + ".tmp")
+    with fp.parent / (fp.name + ".tmp") to avoid ValueError on files with extensions
+    (e.g. script.py, style.css). Path.with_suffix() raises ValueError if the
+    resulting suffix contains more than one dot.
+  - BUG FIX: tool_grep: hidden-file filter now uses f.relative_to(workspace).parts
+    instead of f.parts, so absolute path components (e.g. "/home") don't
+    accidentally match the startswith(".") check.
+  - BUG FIX: tool_git_diff: git command now uses the Safety-resolved path
+    (relative to workspace) rather than the raw user-supplied string, preventing
+    path-traversal inconsistencies.
+  - CLEANUP: _process_tool_calls: removed the dead had_rename_op bool from the
+    return value. Callers now receive only updated_permission_mode. Update any
+    callers that previously unpacked two values to unpack one:
+        current_permission_mode = _process_tool_calls(...)
 """
 
 import json
@@ -158,7 +174,10 @@ def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
     try:
         existed = fp.exists()
         fp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        # FIX: fp.with_suffix(fp.suffix + ".tmp") raises ValueError for any file
+        # that already has an extension (e.g. ".py" + ".tmp" → ".py.tmp" is
+        # invalid for Path.with_suffix). Use fp.parent / (fp.name + ".tmp") instead.
+        tmp = fp.parent / (fp.name + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         os.replace(str(tmp), str(fp))
         return {"success": True,
@@ -178,7 +197,8 @@ def tool_edit(workspace: Path, path: str, search: str, replace: str) -> Dict[str
         success, new_content, msg = FileEditor.search_replace(content, search, replace)
         if not success:
             return {"success": False, "error": truncate_output(msg, 500)}
-        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        # FIX: same as tool_write — avoid ValueError from with_suffix on dotted names.
+        tmp = fp.parent / (fp.name + ".tmp")
         tmp.write_text(new_content, encoding="utf-8")
         os.replace(str(tmp), str(fp))
         return {"success": True,
@@ -218,9 +238,15 @@ def tool_grep(workspace: Path, pattern: str,
                     if fp.exists():
                         search_files.append(fp)
         else:
-            search_files = [f for f in workspace.rglob("*")
-                            if f.is_file()
-                            and not any(p.startswith(".") for p in f.parts)]
+            # FIX: use f.relative_to(workspace).parts instead of f.parts so that
+            # absolute path components like "/home" or "/usr" don't accidentally
+            # satisfy startswith("."), and hidden dirs like .git are correctly
+            # excluded — consistent with tool_ls and tool_glob behaviour.
+            search_files = [
+                f for f in workspace.rglob("*")
+                if f.is_file()
+                and not any(p.startswith(".") for p in f.relative_to(workspace).parts)
+            ]
         matches: List[Dict[str, Any]] = []
         for fp in search_files[:100]:
             try:
@@ -372,15 +398,20 @@ def tool_git_status(workspace: Path) -> Dict[str, Any]:
 
 def tool_git_diff(workspace: Path, path: str = "", staged: bool = False) -> Dict[str, Any]:
     try:
+        resolved_path = ""
         if path:
             ok, err, resolved = Safety.validate_path(workspace, path)
             if not ok:
                 return {"success": False, "error": f"Invalid diff path: {err}"}
+            # FIX: use the Safety-resolved path relative to workspace in the git
+            # command rather than the raw user-supplied string. This prevents
+            # path-traversal inconsistencies between validation and execution.
+            resolved_path = str(resolved.relative_to(workspace))
         cmd = "git diff"
         if staged:
             cmd += " --staged"
-        if path:
-            cmd += f" -- {_shell_quote(path)}"
+        if resolved_path:
+            cmd += f" -- {_shell_quote(resolved_path)}"
         output, code = _git_safe(workspace, cmd)
         if code != 0:
             return {"success": False, "error": "Git diff failed"}
@@ -1708,11 +1739,15 @@ def _process_tool_calls(
     messages: List[Dict],
     current_permission_mode: PermissionMode,
     emit: Callable,
-) -> Tuple[bool, PermissionMode]:
+) -> PermissionMode:
     """Execute all tool calls for one agent iteration.
-    Returns (had_rename_op, updated_permission_mode).
-    had_rename_op is always False — shell sandbox captures stdout rather than
-    parsing it for rename operations; git tools handle their own rename logic.
+
+    Returns the (possibly updated) permission mode.
+
+    FIX: removed the dead had_rename_op bool that was always returned as False.
+    Update callers that previously unpacked two values:
+        _, current_permission_mode = _process_tool_calls(...)   # old
+        current_permission_mode    = _process_tool_calls(...)   # new
     """
     todo_op_count = 0
     total_calls   = len(tool_calls)
@@ -1814,7 +1849,7 @@ def _process_tool_calls(
                     ),
                 })
 
-    return False, current_permission_mode
+    return current_permission_mode
 
 
 # =============================================================================
