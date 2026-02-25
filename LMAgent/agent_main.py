@@ -787,12 +787,22 @@ def run_agent(
                     emit=emit,
                 )
 
-                        # ── WHISPER INJECTION ──────────────────────────────────────────────
+            # ── WHISPER INJECTION ──────────────────────────────────────────────
+            # FIX: track whether a whisper was injected this iteration.
+            # If it was, we must defer completion so the LLM actually sees
+            # and responds to the nudge — otherwise a TASK_COMPLETE in the
+            # current response would exit the loop before the whisper is
+            # ever processed.
+            whisper_injected = False
             if whisper_fn:
                 nudge = whisper_fn()
                 if nudge:
                     emit("log", {"message": f"whisper injected: {nudge[:60]}"})
-                    messages.append({"role": "system", "content": f"[User nudge - mid-run instruction]: {nudge}"})
+                    messages.append({
+                        "role":    "system",
+                        "content": f"[User nudge - mid-run instruction]: {nudge}",
+                    })
+                    whisper_injected = True
             # ──────────────────────────────────────────────────────────────────
 
             # FIX [1]: was tc.get("_had_truncation") — wrong key.
@@ -806,9 +816,18 @@ def run_agent(
             # Now check for completion (tools have already run).
             is_complete, reason = detect_completion(content, bool(tool_calls))
 
+            # ── FIX: defer completion when a whisper is pending ────────────────
+            # The LLM's TASK_COMPLETE was emitted before it could see the
+            # whisper.  Force one more iteration so it gets the nudge in
+            # context and can act on it (or re-complete if it chooses to).
+            if is_complete and whisper_injected:
+                emit("log", {"message": "whisper pending — deferring completion for one iteration"})
+                is_complete = False
+            # ──────────────────────────────────────────────────────────────────
+
             # ── FIX: treat "Asking for input" as a clean completion ────────────
             #
-            # Previously, when the LLM replied conversationally (e.g. "hey" → 
+            # Previously, when the LLM replied conversationally (e.g. "hey" →
             # "Hello! Ready to help.") detect_completion() returned
             # (False, "Asking for input") and the loop continued.  The LLM had
             # nothing new to respond to, so it produced empty responses for 5
@@ -890,179 +909,6 @@ def run_agent(
         close_shell_session()       # clean up this thread's shell process
         if mode == "output":
             Log.set_silent(False)
-
-# =============================================================================
-# SCHEDULER
-# =============================================================================
-
-def run_scheduler(
-    workspace: Path,
-    poll_interval: Optional[int] = None,
-    soul: str = "",
-):
-    # FIX [9]: soul is now passed in from main() rather than reloaded from disk
-    # on every worker spawn.  SoulConfig.load() is a file read — no need to
-    # repeat it for every scheduled task when the value never changes during a
-    # single process run.
-    #
-    # FIX [8]: _running and its lock are both local to this function.  The old
-    # code had _running_lock at module level but _running as a local set, so a
-    # second call to run_scheduler() (tests, restart) would create a fresh set
-    # while still sharing the module-level lock, losing track of any sessions
-    # the previous call was managing.  Both are local now.
-    _running:      set              = set()
-    _running_lock: threading.Lock  = threading.Lock()
-
-    poll_interval = poll_interval or Config.SCHEDULER_POLL_INTERVAL
-    session_mgr   = SessionManager(workspace)
-    state_mgr     = StateManager(workspace)
-    inbox         = workspace / ".lmagent" / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-
-    Log.info(f"Scheduler live — polling every {poll_interval}s")
-    Log.info(f"Workspace : {workspace}")
-    Log.info(f"Inbox     : {inbox}  (drop a .task file to submit work)")
-
-    def _is_running(sid: str) -> bool:
-        with _running_lock:
-            return sid in _running
-
-    def _mark_done(sid: str) -> None:
-        with _running_lock:
-            _running.discard(sid)
-
-    def _run_in_thread(label: str, sid: Optional[str], task_text: str) -> None:
-        if sid:
-            with _running_lock:
-                if sid in _running:
-                    return
-                _running.add(sid)
-
-        def _worker() -> None:
-            try:
-                result = run_agent(
-                    task=task_text,
-                    workspace=workspace,
-                    permission_mode=PermissionMode.AUTO,
-                    resume_session=sid,
-                    mode="interactive",
-                    soul=soul,
-                )
-                Log.info(f"[{label}] finished — {result.status}")
-                if result.status == "waiting":
-                    Log.wait(f"[{label}] back to sleep until {result.wait_until}")
-            except Exception as e:
-                Log.error(f"[{label}] agent error: {e}")
-            finally:
-                if sid:
-                    _mark_done(sid)
-                if _repl_prompt_fn is not None:
-                    try:
-                        _repl_prompt_fn()
-                    except Exception:
-                        pass
-
-        threading.Thread(
-            target=_worker, name=f"agent-{label}", daemon=True
-        ).start()
-
-    try:
-        while True:
-            try:
-                # ── inbox: new one-shot tasks ─────────────────────────────────
-                for task_file in sorted(inbox.glob("*.task")):
-                    try:
-                        task_text = task_file.read_text(encoding="utf-8").strip()
-                        if not task_text:
-                            task_file.unlink()
-                            continue
-                        label = task_file.stem[:20]
-                        Log.info(f"[inbox] {label} — {task_text[:60]}")
-                        task_file.unlink()
-                        _run_in_thread(label, None, task_text)
-                    except Exception as e:
-                        Log.error(f"[inbox] failed to read {task_file.name}: {e}")
-                        try:
-                            task_file.rename(task_file.with_suffix(".failed"))
-                        except Exception:
-                            pass
-
-                # ── wake sleeping sessions ────────────────────────────────────
-                next_wake_secs: Optional[float] = None
-
-                for session in session_mgr.list_recent(200):
-                    if session.get("status") != "waiting":
-                        continue
-                    sid = session["id"]
-                    if _is_running(sid):
-                        continue
-
-                    saved_state = state_mgr.load(sid)
-
-                    if not saved_state or not saved_state.wait_state:
-                        Log.warning(
-                            f"[{sid[-8:]}] stuck in 'waiting' with no wait_state — rescuing"
-                        )
-                        try:
-                            data = session_mgr.load(sid)
-                            if data:
-                                msgs, meta = data
-                                meta["status"] = "idle"
-                                session_mgr.save(sid, msgs, meta)
-                        except Exception as rescue_err:
-                            Log.error(f"[{sid[-8:]}] rescue failed: {rescue_err}")
-                        continue
-
-                    ws = WaitState.from_dict(saved_state.wait_state)
-
-                    if not ws.is_ready():
-                        try:
-                            remaining = (
-                                datetime.fromisoformat(ws.resume_after) - datetime.now()
-                            ).total_seconds()
-                            if remaining > 0:
-                                next_wake_secs = (
-                                    remaining if next_wake_secs is None
-                                    else min(next_wake_secs, remaining)
-                                )
-                            Log.info(
-                                f"[{sid[-8:]}] sleeping — {max(0, remaining):.0f}s left  "
-                                f"({ws.reason[:50]})"
-                            )
-                        except Exception:
-                            pass
-                        continue
-
-                    Log.info(f"[{sid[-8:]}] waking — {ws.reason}")
-                    _run_in_thread(sid[-8:], sid, "Continue from scheduled wake-up")
-
-            except Exception as e:
-                Log.error(f"Scheduler poll error: {e}")
-
-            sleep_for = (
-                max(0.5, next_wake_secs + 0.25)
-                if next_wake_secs is not None and next_wake_secs < poll_interval
-                else poll_interval
-            )
-            if sleep_for < poll_interval:
-                Log.info(
-                    f"Scheduler: sleeping {sleep_for:.1f}s "
-                    f"(next wake-up in ~{next_wake_secs:.0f}s)"
-                )
-            time.sleep(sleep_for)
-
-    except KeyboardInterrupt:
-        Log.info("Scheduler stopping — waiting for active agents…")
-        deadline = time.time() + 10
-        while True:
-            with _running_lock:
-                if not _running:
-                    break
-            if time.time() > deadline:
-                break
-            time.sleep(0.5)
-        Log.info("Scheduler exited.")
-
 
 # =============================================================================
 # BANNER
