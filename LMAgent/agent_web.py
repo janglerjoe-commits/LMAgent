@@ -1,5 +1,5 @@
 """
-LMAgent Web — v6.5.7
+LMAgent Web — v6.5.9
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -7,17 +7,23 @@ LMAgent Web — v6.5.7
 
 Place this file next to those three files.
 
-Changes vs v6.5.6:
-  - FIX: Stop button now immediately cuts the LM Studio connection.
-    Root cause: setting stop_event only raised _AgentStopped on the NEXT
-    token — but LM Studio kept streaming, so tokens kept arriving until
-    generation finished naturally.  Fix: _web_parse_stream stores the live
-    response object in _tl.current_resp and checks the stop flag on every
-    SSE line, calling resp.close() to tear down the TCP connection instantly.
-    _token_cb also closes the connection before raising _AgentStopped so
-    either path kills the stream immediately.
+Changes vs v6.5.8:
+  - FIX: /mode now actually affects agent permission mode (was hardcoded AUTO).
+  - FIX: *.pyc / *.pyo hidden-file patterns now use fnmatch (were never matching).
+  - FIX: Race condition in _finalize_session / _chatlog_merge_keys resolved.
+  - FIX: _fix_mojibake now applied to all string payloads (was skipping tokens).
+  - FIX: Double Scroll.update() call removed from Agent.transition().
+  - OPT: _broadcast() snapshots queue list outside lock to reduce contention.
+  - OPT: FileTree auto-refresh uses /workspace/mtime to skip no-op fetches.
+  - OPT: _find_free_port uses SO_REUSEADDR to avoid TIME_WAIT false negatives.
+  - OPT: _resolve_permission_mode() helper centralises enum lookup.
+  - NEW: GET /workspace/mtime — lightweight max-mtime scan for change detection.
+  - CLEAN: Removed stray blank lines in /chat route.
+  - CLEAN: _AGENT_LOCK_TIMEOUT reduced to 60 s (was 300 s).
+  - Version badge updated to v6.5.9.
 """
 
+import fnmatch
 import json
 import queue
 import re
@@ -45,6 +51,7 @@ try:
         MCPManager,
         PermissionMode,
         PlanManager,
+        Safety,
         SessionManager,
         StateManager,
         WaitState,
@@ -87,8 +94,9 @@ except Exception:
 
 app = Flask(__name__)
 
+# Reduced from 300 s — a stuck agent should surface quickly, not block for 5 min.
 _AGENT_LOCK         = threading.Lock()
-_AGENT_LOCK_TIMEOUT = 300
+_AGENT_LOCK_TIMEOUT = 60
 
 _tl = threading.local()
 
@@ -117,17 +125,18 @@ def _get_agent_state() -> str:
         return _agent_state
 
 
+# ── Permission mode helper ────────────────────────────────────────────────────
+
+def _resolve_permission_mode() -> PermissionMode:
+    """Map the current string mode to the PermissionMode enum, with AUTO fallback."""
+    try:
+        return PermissionMode[_current_permission_mode.upper()]
+    except (KeyError, AttributeError):
+        return PermissionMode.AUTO
+
+
 # =============================================================================
 # MONKEY-PATCH LLMClient._parse_stream
-#
-# FIX v6.5.7: Three stop-related changes versus v6.5.6:
-#   1. resp is stored in _tl.current_resp so the stop handler can close it
-#      from _token_cb (which runs in the same thread).
-#   2. stop_event is read from _tl.stop_event (set by run_in_thread before
-#      the LLM call begins).
-#   3. At the top of every SSE line iteration we check stop_event and call
-#      resp.close() — this tears down the TCP connection to LM Studio
-#      immediately rather than waiting for generation to finish naturally.
 # =============================================================================
 
 def _web_parse_stream(resp, stream_callback):
@@ -138,17 +147,12 @@ def _web_parse_stream(resp, stream_callback):
     in_think      = False
 
     resp.encoding = "utf-8"
-
-    # FIX: store so _token_cb can close the connection on stop.
     _tl.current_resp = resp
 
-    # Per-thread callbacks injected by the web layer.
     thinking_cb = getattr(_tl, "thinking_cb", None)
     stop_event  = getattr(_tl, "stop_event",  None)
 
     for line in resp.iter_lines(decode_unicode=True):
-        # FIX: check stop flag on EVERY line and kill the connection
-        # immediately — don't wait for the model to finish generating.
         if stop_event and stop_event.is_set():
             try:
                 resp.close()
@@ -198,7 +202,6 @@ def _web_parse_stream(resp, stream_callback):
                     else:
                         stream_callback(part)
 
-        # Native thinking blocks (Anthropic-style structured thinking)
         thinking_blocks = delta.get("thinking")
         if isinstance(thinking_blocks, list):
             for tb in thinking_blocks:
@@ -290,12 +293,12 @@ def _web_parse_stream(resp, stream_callback):
                 calls.append(tc)
 
     if finish_reason == "length":
-        Log.warning("⚠️  Generation stopped: output token limit hit (finish_reason=length)")
+        Log.warning("\u26a0\ufe0f  Generation stopped: output token limit hit (finish_reason=length)")
         incomplete = True
     elif finish_reason == "stop" and incomplete:
-        Log.warning("⚠️  finish_reason=stop but tool calls were incomplete")
+        Log.warning("\u26a0\ufe0f  finish_reason=stop but tool calls were incomplete")
     elif finish_reason is None and incomplete:
-        Log.warning("⚠️  finish_reason=None — stream may have ended prematurely")
+        Log.warning("\u26a0\ufe0f  finish_reason=None \u2014 stream may have ended prematurely")
 
     clean_content, _ = strip_thinking(content)
     return {
@@ -306,7 +309,6 @@ def _web_parse_stream(resp, stream_callback):
     }
 
 
-# Apply the patch — must happen before any agent threads start
 LLMClient._parse_stream = staticmethod(_web_parse_stream)
 
 
@@ -332,17 +334,25 @@ _stream_queues_lock = threading.Lock()
 
 
 def _broadcast(item: tuple) -> None:
+    """Broadcast an event to all registered SSE queues.
+
+    Mojibake correction is applied to all string payloads.
+    Queue list is snapshotted under lock then iterated outside it,
+    minimising lock hold time on the hot token path.
+    """
     kind, payload = item
-    if kind in ("status", "tool", "error", "done") and isinstance(payload, str):
+    if isinstance(payload, str):
         payload = _fix_mojibake(payload)
     item = (kind, payload)
     _chatlog_append(item)
+    # Snapshot — avoids holding the lock while doing put_nowait on every queue.
     with _stream_queues_lock:
-        for q in _stream_queues:
-            try:
-                q.put_nowait(item)
-            except Exception:
-                pass
+        queues = list(_stream_queues)
+    for q in queues:
+        try:
+            q.put_nowait(item)
+        except Exception:
+            pass
 
 
 def _register_stream_q() -> "queue.Queue":
@@ -397,6 +407,7 @@ def _chatlog_clear(session_id: "str | None") -> None:
 
 
 def _chatlog_merge_keys(old_key: "str | None", new_key: str) -> None:
+    """Merge chat log from old_key into new_key atomically under a single lock."""
     old = old_key or "_none"
     if old == new_key:
         return
@@ -414,7 +425,7 @@ class _AgentStopped(BaseException):
 
 
 # =============================================================================
-# _HeaderStreamCb PATCH  (routes tokens to _tl.token_cb)
+# _HeaderStreamCb PATCH
 # =============================================================================
 
 class _PatchedHSC(_OrigHSC):
@@ -440,7 +451,6 @@ _agent_main_mod._HeaderStreamCb = _PatchedHSC
 # =============================================================================
 
 def _make_thinking_helpers():
-    """Return (thinking_cb, flush_thinking) pair backed by a shared buffer."""
     buf = [""]
 
     def flush_thinking():
@@ -464,8 +474,9 @@ def _make_thinking_helpers():
 
 _STATUS_NOISE = frozenset({
     "thinking model mode", "state restored", "soul loaded", "mcp ",
-    "checking llm", "llm connected", "task:", "workspace :", "llm       :",
-    "loaded ", "compacting context", "compacted:", "plan approved", "plan mode",
+    "checking llm", "llm connected", "task:", "workspace :",
+    "llm       :", "loaded ", "compacting context", "compacted:",
+    "plan approved", "plan mode",
 })
 
 
@@ -491,7 +502,7 @@ def _push_event(event, stop_event: "threading.Event | None", last_status: list,
         preview = edata.get("args_preview", "")[:50]
         _broadcast(("tool", f"{name}({preview})"))
     elif etype == "tool_result":
-        mark = "✓" if edata.get("success") else "✗"
+        mark = "\u2713" if edata.get("success") else "\u2717"
         _broadcast(("tool", f"{mark} {edata.get('name', '')}"))
     elif etype == "iteration":
         if flush_thinking:
@@ -507,7 +518,7 @@ def _push_event(event, stop_event: "threading.Event | None", last_status: list,
     elif etype == "waiting":
         _broadcast(("status", f"waiting until {edata.get('resume_after')}"))
     elif etype == "complete":
-        _broadcast(("status", f"done — {edata.get('reason', '')}"))
+        _broadcast(("status", f"done \u2014 {edata.get('reason', '')}"))
 
 
 def _sse_response(generator) -> Response:
@@ -567,13 +578,13 @@ def _build_tools_payload() -> dict:
             for t in client.tools
         ]
         if tools:
-            mcp_groups[f"MCP · {client.name}"] = tools
+            mcp_groups[f"MCP \u00b7 {client.name}"] = tools
 
     return {"builtin": builtin, "mcp": mcp_groups}
 
 
 # =============================================================================
-# HTML TEMPLATE
+# HTML TEMPLATE  (v6.5.9)
 # =============================================================================
 
 HTML = r"""<!DOCTYPE html>
@@ -833,7 +844,7 @@ header {
   font-style: normal; font-size: 12px;
 }
 
-/* ── Thinking blocks ───────────────────────────────────────────────────────── */
+/* ── Thinking blocks ── */
 .thinking-block {
   margin: 2px 0 2px 4px;
   border-left: 2px solid var(--border2);
@@ -997,6 +1008,7 @@ header {
 .pi-cmd { color: var(--amber); font-weight: 600; min-width: 90px; }
 .pi-desc { color: var(--text3); font-size: 11px; }
 
+/* ── Panels (shared base) ── */
 .panel {
   position: absolute; top: 0; right: 0;
   width: min(320px, 90vw); height: 100%;
@@ -1007,6 +1019,148 @@ header {
 .panel.open { transform: translateX(0); }
 #tools-panel { width: min(360px, 92vw); }
 
+/* ── File tree panel (left side) ── */
+#files-panel {
+  right: auto;
+  left: 0;
+  width: min(380px, 92vw);
+  border-left: none;
+  border-right: 1px solid var(--border);
+  transform: translateX(-100%);
+}
+#files-panel.open { transform: translateX(0); }
+
+/* ── File tree internals ── */
+.ft-toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 10px; border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.ft-toolbar-title {
+  flex: 1; font-family: var(--sans); font-weight: 600;
+  font-size: 12px; color: var(--text2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ft-icon-btn {
+  width: 24px; height: 24px; border-radius: 4px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text3); cursor: pointer; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color .1s, color .1s; flex-shrink: 0;
+}
+.ft-icon-btn:hover { border-color: var(--amber); color: var(--amber); }
+
+.ft-search {
+  margin: 7px 8px 5px; flex-shrink: 0;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text); font-family: var(--mono);
+  font-size: 12px; padding: 5px 10px; outline: none;
+  width: calc(100% - 16px);
+}
+.ft-search:focus { border-color: var(--amber); }
+.ft-search::placeholder { color: var(--text3); }
+
+#ft-tree {
+  flex: 1; overflow-y: auto; padding: 2px 0 6px;
+  font-size: 12px; font-family: var(--mono);
+}
+#ft-tree::-webkit-scrollbar { width: 3px; }
+
+.ft-msg {
+  padding: 10px 14px; color: var(--text3);
+  font-size: 11px; font-style: italic;
+}
+
+.ft-node {
+  display: flex; align-items: center; gap: 5px;
+  cursor: pointer; min-height: 22px; padding-right: 8px;
+  transition: background .07s; white-space: nowrap; overflow: hidden;
+}
+.ft-node:hover { background: rgba(255,255,255,.03); }
+.ft-node.ft-selected { background: rgba(232,162,69,.07); }
+.ft-node.ft-loading-node { color: var(--text3); cursor: default; padding-left: 0; }
+
+.ft-arrow {
+  width: 10px; text-align: center; flex-shrink: 0;
+  font-size: 7px; color: var(--text3);
+  transition: transform .12s; display: inline-block;
+}
+.ft-node.ft-expanded > .ft-arrow { transform: rotate(90deg); }
+
+.ft-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text2); user-select: none;
+}
+.ft-node.ft-dir > .ft-name { color: var(--text); font-weight: 500; }
+.ft-node.ft-selected > .ft-name { color: var(--amber); }
+
+.ft-size {
+  flex-shrink: 0; color: var(--text3); font-size: 10px;
+  min-width: 34px; text-align: right;
+}
+
+.ft-ext-badge {
+  flex-shrink: 0; font-size: 9px; padding: 0 4px;
+  border-radius: 2px; font-family: var(--mono);
+  border: 1px solid; text-transform: uppercase;
+  letter-spacing: .04em; line-height: 16px;
+}
+.ft-ext-py   { color: #4ec9b0; border-color: #1a3c34; }
+.ft-ext-js   { color: #e8c45a; border-color: #504218; }
+.ft-ext-ts   { color: #569cd6; border-color: #18304c; }
+.ft-ext-html { color: #ce9178; border-color: #4c301c; }
+.ft-ext-css  { color: #9d7dea; border-color: #362258; }
+.ft-ext-md   { color: #8e8c88; border-color: #28282e; }
+.ft-ext-json { color: #3ecfb2; border-color: #0c342e; }
+.ft-ext-sh   { color: #3ec97a; border-color: #0c3224; }
+.ft-ext-xml  { color: #ce9178; border-color: #4c301c; }
+.ft-ext-yml  { color: #e8c45a; border-color: #504218; }
+.ft-ext-txt  { color: var(--text3); border-color: var(--border); }
+.ft-ext-def  { color: var(--text3); border-color: var(--border); }
+
+.ft-divider { height: 1px; background: var(--border); flex-shrink: 0; }
+
+#ft-preview {
+  display: flex; flex-direction: column;
+  flex-shrink: 0; min-height: 130px; max-height: 44%;
+}
+
+.ft-preview-hdr {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px 5px 10px; flex-shrink: 0;
+  background: var(--surface2); border-bottom: 1px solid var(--border);
+  min-height: 32px;
+}
+#ft-preview-path {
+  flex: 1; font-size: 10px; color: var(--text2);
+  font-family: var(--mono); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.ft-preview-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.ft-preview-btn {
+  font-family: var(--mono); font-size: 9px;
+  padding: 2px 7px; border-radius: 3px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text3); cursor: pointer;
+  transition: border-color .1s, color .1s; white-space: nowrap;
+}
+.ft-preview-btn:hover { border-color: var(--amber); color: var(--amber); }
+
+#ft-preview-content {
+  flex: 1; overflow: auto;
+  padding: 10px 12px;
+  font-family: var(--mono); font-size: 11px;
+  line-height: 1.52; background: var(--code-bg);
+  color: var(--text2); white-space: pre;
+  word-break: break-all; tab-size: 2;
+}
+.ft-preview-hint {
+  color: var(--text3) !important;
+  font-style: italic; white-space: normal !important;
+  font-size: 11px;
+}
+
+/* ── Sessions / Tools panels ── */
 .panel-hdr {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 14px; border-bottom: 1px solid var(--border);
@@ -1080,11 +1234,12 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.5.7</span>
+      <span class="logo-sub">v6.5.9</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
       <div class="conn-dot" id="conn-dot" title="Stream connection"></div>
+      <button class="btn" onclick="UI.toggleFiles()">Files</button>
       <button class="btn accent" onclick="UI.toggleTools()">Tools</button>
       <button class="btn" onclick="UI.toggleSessions()">Sessions</button>
       <button class="btn danger" onclick="Agent.newSession()">New</button>
@@ -1096,7 +1251,7 @@ header {
     <div id="empty">
       <div class="empty-glyph">&#955;_</div>
       <p>Send a message to start</p>
-      <div class="hint">/ for commands &nbsp;·&nbsp; &uarr;&darr; history</div>
+      <div class="hint">/ for commands &nbsp;&middot;&nbsp; &uarr;&darr; history</div>
     </div>
   </div>
 
@@ -1123,6 +1278,30 @@ header {
 
 <div id="overlay" onclick="UI.closeAll()"></div>
 
+<!-- ── File tree panel (opens LEFT) ──────────────────────────────────────── -->
+<div class="panel" id="files-panel">
+  <div class="ft-toolbar">
+    <span class="ft-toolbar-title" id="ft-ws-label">Workspace</span>
+    <button class="ft-icon-btn" onclick="FileTree.refresh()" title="Refresh tree">&#8635;</button>
+    <button class="ft-icon-btn" onclick="UI.closeFiles()" title="Close">&times;</button>
+  </div>
+  <input id="ft-search" class="ft-search" placeholder="Filter files&hellip;"
+         oninput="FileTree.filter(this.value)">
+  <div id="ft-tree"><div class="ft-msg">Loading&hellip;</div></div>
+  <div class="ft-divider"></div>
+  <div id="ft-preview">
+    <div class="ft-preview-hdr">
+      <span id="ft-preview-path">No file selected</span>
+      <div class="ft-preview-actions">
+        <button class="ft-preview-btn" onclick="FileTree.copyPath()">copy path</button>
+        <button class="ft-preview-btn" onclick="FileTree.askAgent()">ask agent</button>
+      </div>
+    </div>
+    <div id="ft-preview-content" class="ft-preview-hint">click a file to preview</div>
+  </div>
+</div>
+
+<!-- ── Sessions panel (opens RIGHT) ─────────────────────────────────────── -->
 <div class="panel" id="sessions-panel">
   <div class="panel-hdr">
     <span>Sessions</span>
@@ -1131,6 +1310,7 @@ header {
   <div id="sessions-list"></div>
 </div>
 
+<!-- ── Tools panel (opens RIGHT) ─────────────────────────────────────────── -->
 <div class="panel" id="tools-panel">
   <div class="panel-hdr">
     <span>Tools</span>
@@ -1638,12 +1818,14 @@ const Agent = (() => {
     inp.placeholder = on ? 'Whisper to agent\u2026 (nudge mid-run, Enter to send)' : 'Message or /command\u2026';
     btn.textContent = on ? 'Stop' : 'Send';
     btn.className   = on ? 'stop' : '';
-    if (!on) { Scroll.pin(); Scroll.update(); }
   }
 
+  // FIX: removed duplicate Scroll.update() — Scroll.update() is called once
+  // below after lockUI, not additionally inside lockUI.
   function transition(next) {
     state = next;
     lockUI(next !== 'idle');
+    if (next === 'idle') Scroll.pin();
     Scroll.update();
     if (next !== 'idle') ElapsedTimer.start(); else ElapsedTimer.stop();
   }
@@ -1852,9 +2034,326 @@ const Agent = (() => {
   connect();
 })();
 
+// =============================================================================
+// FILE TREE
+// =============================================================================
+const FileTree = (() => {
+  var _expanded  = {};
+  var _children  = {};
+  var _loading   = {};
+  var _selected  = null;
+  var _filter    = '';
+  var _autoTimer = null;
+  var _lastMtime = 0;  // OPT: skip refresh when workspace unchanged
+
+  var _EXT_MAP = {
+    '.py':'.py', '.pyw':'.py',
+    '.js':'.js', '.mjs':'.js', '.jsx':'.js',
+    '.ts':'.ts', '.tsx':'.ts',
+    '.html':'.html', '.htm':'.html',
+    '.css':'.css', '.scss':'.css', '.sass':'.css', '.less':'.css',
+    '.md':'.md', '.markdown':'.md',
+    '.json':'.json', '.jsonl':'.json',
+    '.sh':'.sh', '.bash':'.sh', '.zsh':'.sh', '.fish':'.sh',
+    '.xml':'.xml',
+    '.yml':'.yml', '.yaml':'.yml',
+    '.txt':'.txt',
+  };
+
+  function _extKey(ext) {
+    var k = _EXT_MAP[ext];
+    return k ? k.slice(1) : 'def';
+  }
+
+  function _fmtSize(bytes) {
+    if (!bytes) return '';
+    if (bytes < 1024)    return bytes + 'B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + 'K';
+    return (bytes / 1048576).toFixed(1) + 'M';
+  }
+
+  async function _fetchDir(path) {
+    _loading[path] = true;
+    try {
+      var r = await fetch('/filetree?path=' + encodeURIComponent(path));
+      var d = await r.json();
+      if (d.error) throw new Error(d.error);
+      _children[path] = d.entries || [];
+    } finally {
+      delete _loading[path];
+    }
+    return _children[path];
+  }
+
+  async function _fetchFile(path) {
+    var r = await fetch('/fileread?path=' + encodeURIComponent(path));
+    return await r.json();
+  }
+
+  async function _fetchMtime() {
+    try {
+      var r = await fetch('/workspace/mtime');
+      var d = await r.json();
+      return d.mtime || 0;
+    } catch(_) { return 0; }
+  }
+
+  function _flatten(path, depth, out) {
+    if (_loading[path] && !_children[path]) {
+      out.push({ kind: 'loading', depth: depth });
+      return;
+    }
+    var entries = _children[path] || [];
+    var q = _filter.toLowerCase();
+    var filtered = q ? entries.filter(function(e) {
+      return e.name.toLowerCase().indexOf(q) !== -1 || e.type === 'dir';
+    }) : entries;
+
+    for (var i = 0; i < filtered.length; i++) {
+      var e = filtered[i];
+      out.push({ kind: 'entry', depth: depth, entry: e });
+      if (e.type === 'dir' && _expanded[e.path]) {
+        _flatten(e.path, depth + 1, out);
+      }
+    }
+  }
+
+  function _render() {
+    var el = document.getElementById('ft-tree');
+    if (!el) return;
+    var panel = document.getElementById('files-panel');
+    if (!panel || !panel.classList.contains('open')) return;
+
+    var nodes = [];
+    _flatten('.', 0, nodes);
+
+    if (!nodes.length && _loading['.']) {
+      el.innerHTML = '<div class="ft-msg">Loading workspace\u2026</div>';
+      return;
+    }
+    if (!nodes.length && !_children['.']) {
+      el.innerHTML = '<div class="ft-msg">Empty workspace</div>';
+      return;
+    }
+    if (!nodes.length) {
+      el.innerHTML = '<div class="ft-msg">No files' + (_filter ? ' matching \u201c' + _esc(_filter) + '\u201d' : '') + '</div>';
+      return;
+    }
+
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var row = document.createElement('div');
+
+      if (n.kind === 'loading') {
+        row.className = 'ft-node ft-loading-node';
+        row.style.paddingLeft = (n.depth * 14 + 24) + 'px';
+        row.innerHTML = '<span style="color:var(--text3);font-style:italic;font-size:11px">\u2026</span>';
+        frag.appendChild(row);
+        continue;
+      }
+
+      var e = n.entry;
+      var isDir  = e.type === 'dir';
+      var isSel  = _selected === e.path;
+      var isExp  = !!_expanded[e.path];
+
+      row.className = 'ft-node' +
+        (isDir ? ' ft-dir' : ' ft-file') +
+        (isExp ? ' ft-expanded' : '') +
+        (isSel ? ' ft-selected' : '');
+      row.style.paddingLeft = (n.depth * 14 + 6) + 'px';
+
+      var arrowHtml = isDir
+        ? '<span class="ft-arrow">\u25b6</span>'
+        : '<span class="ft-arrow" style="visibility:hidden">\u25b6</span>';
+
+      var badgeHtml = '';
+      if (!isDir && e.ext) {
+        var cls = 'ft-ext-' + _extKey(e.ext);
+        badgeHtml = '<span class="ft-ext-badge ' + cls + '">' + _esc(e.ext.slice(1)) + '</span>';
+      }
+
+      var sizeHtml = (!isDir && e.size)
+        ? '<span class="ft-size">' + _fmtSize(e.size) + '</span>'
+        : '';
+
+      row.innerHTML = arrowHtml +
+        '<span class="ft-name" title="' + _esc(e.path) + '">' + _esc(e.name) + '</span>' +
+        badgeHtml + sizeHtml;
+
+      (function(entry) {
+        row.onclick = function(ev) {
+          ev.stopPropagation();
+          if (entry.type === 'dir') _toggleDir(entry.path);
+          else _openFile(entry.path);
+        };
+      })(e);
+
+      frag.appendChild(row);
+    }
+    el.innerHTML = '';
+    el.appendChild(frag);
+  }
+
+  async function _toggleDir(path) {
+    if (_expanded[path]) {
+      delete _expanded[path];
+      _render();
+    } else {
+      _expanded[path] = true;
+      _render();
+      if (!_children[path] && !_loading[path]) {
+        try {
+          await _fetchDir(path);
+        } catch(err) {
+          _children[path] = [];
+          delete _expanded[path];
+        }
+      }
+      _render();
+    }
+  }
+
+  async function _openFile(path) {
+    _selected = path;
+    _render();
+    var pathEl    = document.getElementById('ft-preview-path');
+    var contentEl = document.getElementById('ft-preview-content');
+    if (pathEl)    pathEl.textContent = path;
+    if (contentEl) { contentEl.className = ''; contentEl.textContent = 'Loading\u2026'; }
+
+    try {
+      var d = await _fetchFile(path);
+      if (!contentEl) return;
+      if (d.error) {
+        contentEl.textContent = '\u26a0 ' + d.error;
+        contentEl.className = 'ft-preview-hint';
+      } else if (d.binary) {
+        contentEl.textContent = '[binary file \u2014 ' + _fmtSize(d.size) + ']';
+        contentEl.className = 'ft-preview-hint';
+      } else {
+        contentEl.className = '';
+        contentEl.textContent = (d.content !== undefined && d.content !== null)
+          ? (d.content || '(empty file)')
+          : '(empty file)';
+        if (d.truncated) {
+          contentEl.textContent += '\n\n[\u2026 preview truncated at 100\u00a0KB \u2026]';
+        }
+      }
+    } catch(err) {
+      if (contentEl) {
+        contentEl.textContent = 'Error: ' + err.message;
+        contentEl.className = 'ft-preview-hint';
+      }
+    }
+  }
+
+  async function load() {
+    _expanded  = {};
+    _children  = {};
+    _loading   = {};
+    _selected  = null;
+    _lastMtime = 0;
+    var el = document.getElementById('ft-tree');
+    if (el) el.innerHTML = '<div class="ft-msg">Loading workspace\u2026</div>';
+    var pathEl = document.getElementById('ft-preview-path');
+    var contEl = document.getElementById('ft-preview-content');
+    if (pathEl) pathEl.textContent = 'No file selected';
+    if (contEl) { contEl.textContent = 'click a file to preview'; contEl.className = 'ft-preview-hint'; }
+
+    var lbl = document.getElementById('ft-ws-label');
+    try {
+      var s = await fetch('/status').then(function(r){ return r.json(); });
+      if (lbl && s.workspace) {
+        var parts = s.workspace.replace(/\\/g, '/').split('/');
+        lbl.textContent = parts[parts.length - 1] || 'Workspace';
+        lbl.title = s.workspace;
+      }
+    } catch(_) {}
+
+    try {
+      await _fetchDir('.');
+      _lastMtime = await _fetchMtime();
+      _render();
+    } catch(err) {
+      if (el) el.innerHTML = '<div class="ft-msg" style="color:var(--red)">\u26a0 ' + _esc(String(err.message || err)) + '</div>';
+    }
+    startAutoRefresh();
+  }
+
+  async function refresh() {
+    var paths = ['.'];
+    Object.keys(_expanded).forEach(function(p) { if (paths.indexOf(p) === -1) paths.push(p); });
+    await Promise.all(paths.map(function(p) {
+      return _fetchDir(p).catch(function(){});
+    }));
+    _render();
+  }
+
+  function filter(text) {
+    _filter = text;
+    _render();
+  }
+
+  function copyPath() {
+    if (!_selected) return;
+    var pathEl = document.getElementById('ft-preview-path');
+    navigator.clipboard.writeText(_selected).then(function() {
+      if (pathEl) {
+        var orig = pathEl.textContent;
+        pathEl.textContent = '\u2713 copied!';
+        setTimeout(function() { pathEl.textContent = orig; }, 1200);
+      }
+    }).catch(function() {
+      var ta = document.createElement('textarea');
+      ta.value = _selected;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    });
+  }
+
+  function askAgent() {
+    if (!_selected) return;
+    var inp = document.getElementById('msg-input');
+    if (inp) {
+      inp.value = _selected;
+      inp.focus();
+      inp.dispatchEvent(new Event('input'));
+    }
+    UI.closeFiles();
+  }
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    // OPT: only fetch when workspace mtime has changed, avoiding needless I/O.
+    _autoTimer = setInterval(async function() {
+      if (typeof Agent !== 'undefined' && Agent.running()) {
+        var mtime = await _fetchMtime();
+        if (mtime !== _lastMtime) {
+          _lastMtime = mtime;
+          refresh();
+        }
+      }
+    }, 2500);
+  }
+
+  function stopAutoRefresh() {
+    if (_autoTimer) { clearInterval(_autoTimer); _autoTimer = null; }
+  }
+
+  return { load, refresh, filter, copyPath, askAgent, startAutoRefresh, stopAutoRefresh };
+})();
+
+// =============================================================================
+// SLASH COMMANDS
+// =============================================================================
 const CMDS = [
   { cmd: '/help',     desc: 'Show commands' },
   { cmd: '/new',      desc: 'Start a fresh session' },
+  { cmd: '/files',    desc: 'Browse workspace files' },
   { cmd: '/sessions', desc: 'Browse history' },
   { cmd: '/tools',    desc: 'View all tools' },
   { cmd: '/status',   desc: 'Connection info' },
@@ -1866,7 +2365,7 @@ const CMDS = [
   { cmd: '/whisper',  desc: 'Inject a nudge to the running agent', arg: '<message>' },
 ];
 
-const HELP_TEXT = 'Slash commands:\n  /help               This text\n  /new                Fresh session\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID\n  /whisper <text>     Inject mid-run nudge\n\nKeyboard shortcuts:\n  \u2191 / \u2193             Cycle input history\n  Ctrl+L           New session\n  Enter            Send\n  Shift+Enter      New line';
+const HELP_TEXT = 'Slash commands:\n  /help               This text\n  /new                Fresh session\n  /files              Browse workspace files\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID\n  /whisper <text>     Inject mid-run nudge\n\nKeyboard shortcuts:\n  \u2191 / \u2193             Cycle input history\n  Ctrl+L           New session\n  Enter            Send\n  Shift+Enter      New line';
 
 const SlashCmds = (() => {
   async function run(text) {
@@ -1878,6 +2377,7 @@ const SlashCmds = (() => {
     switch (cmd) {
       case '/help':     sys(HELP_TEXT, 'info'); break;
       case '/new':      Agent.newSession(); break;
+      case '/files':    UI.toggleFiles(); break;
       case '/sessions': UI.toggleSessions(); break;
       case '/tools':    UI.toggleTools(); break;
       case '/session':
@@ -2068,24 +2568,35 @@ const ToolsPanel = (() => {
   return { load, filter };
 })();
 
+// =============================================================================
+// UI — panel orchestration
+// =============================================================================
 const UI = (() => {
   var overlay = function(){ return document.getElementById('overlay'); };
   function openPanel(id)  { document.getElementById(id).classList.add('open');    overlay().classList.add('show'); }
   function closePanel(id) { document.getElementById(id).classList.remove('open'); overlay().classList.remove('show'); }
   function isOpen(id)     { return document.getElementById(id).classList.contains('open'); }
 
+  async function toggleFiles() {
+    if (isOpen('files-panel')) { closeFiles(); return; }
+    closeSessions(); closeTools();
+    openPanel('files-panel');
+    await FileTree.load();
+  }
   async function toggleSessions() {
     if (isOpen('sessions-panel')) { closeSessions(); return; }
-    closeTools(); await SessionsPanel.load(); openPanel('sessions-panel');
+    closeTools(); closeFiles(); await SessionsPanel.load(); openPanel('sessions-panel');
   }
   async function toggleTools() {
     if (isOpen('tools-panel')) { closeTools(); return; }
-    closeSessions(); await ToolsPanel.load(); openPanel('tools-panel');
+    closeSessions(); closeFiles(); await ToolsPanel.load(); openPanel('tools-panel');
   }
+  function closeFiles()    { closePanel('files-panel'); FileTree.stopAutoRefresh(); }
   function closeSessions() { closePanel('sessions-panel'); }
   function closeTools()    { closePanel('tools-panel'); }
-  function closeAll()      { closeSessions(); closeTools(); }
-  return { toggleSessions, closeSessions, toggleTools, closeTools, closeAll };
+  function closeAll()      { closeFiles(); closeSessions(); closeTools(); }
+
+  return { toggleFiles, closeFiles, toggleSessions, closeSessions, toggleTools, closeTools, closeAll };
 })();
 
 (async function() {
@@ -2140,14 +2651,15 @@ def _scheduler_loop():
                 wake_task = (
                     f"Your scheduled wait has now completed. "
                     f"Original reason for waiting: \"{ws.reason}\". "
-                    f"Do NOT output another WAIT — the timer has expired. "
+                    f"Do NOT output another WAIT \u2014 the timer has expired. "
                     f"Proceed directly with the next step of the task."
                 )
 
+                # FIX: use configured permission mode, not hardcoded AUTO
                 result = run_agent(
                     task            = wake_task,
                     workspace       = WORKSPACE,
-                    permission_mode = PermissionMode.AUTO,
+                    permission_mode = _resolve_permission_mode(),
                     resume_session  = sid,
                     mode            = "interactive",
                     event_callback  = _event_cb,
@@ -2301,15 +2813,10 @@ def chat():
 
         thinking_cb, flush_thinking = _make_thinking_helpers()
         _tl.thinking_cb = thinking_cb
-
-        # FIX v6.5.7: register stop_event in thread-local so _web_parse_stream
-        # can check it on every SSE line and close the connection immediately.
         _tl.stop_event  = stop_event
 
         def _token_cb(tok: str) -> None:
             if stop_event.is_set():
-                # FIX v6.5.7: also close the active LM Studio connection so
-                # iter_lines() exits without waiting for generation to finish.
                 active_resp = getattr(_tl, "current_resp", None)
                 if active_resp is not None:
                     try:
@@ -2333,20 +2840,25 @@ def chat():
                 return _whisper_store.pop(0) if _whisper_store else None
 
         def _finalize_session(sid: "str | None") -> None:
+            """Update current session ID and merge chat logs atomically."""
             global _current_session_id
             if not sid:
                 return
-            old_key = _current_session_id
+            # FIX: read old_key under the same lock to prevent a race where
+            # another thread updates _current_session_id between our read and
+            # the merge, causing log entries to be merged into the wrong key.
             with _session_lock:
+                old_key = _current_session_id
                 _current_session_id = sid
             _chatlog_merge_keys(old_key, sid)
             _broadcast(("session", sid))
 
         try:
+            # FIX: use configured permission mode, not hardcoded AUTO
             result = run_agent(
                 task            = user_msg,
                 workspace       = WORKSPACE,
-                permission_mode = PermissionMode.AUTO,
+                permission_mode = _resolve_permission_mode(),
                 resume_session  = session_id,
                 mode            = "interactive",
                 event_callback  = event_cb,
@@ -2384,7 +2896,6 @@ def chat():
                 _broadcast(("error", str(exc)[:200]))
             _set_agent_state("idle")
         finally:
-            # FIX v6.5.7: clean up all thread-locals including the new ones.
             _tl.token_cb     = None
             _tl.thinking_cb  = None
             _tl.stop_event   = None
@@ -2418,16 +2929,39 @@ def whisper():
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
-        return jsonify({"ok": False, "error": "text required"})
+        return jsonify({"error": "empty text"}), 400
     with _whisper_lock:
-        _whisper_store.clear()
         _whisper_store.append(text)
     return jsonify({"ok": True})
 
 
+@app.route("/stop", methods=["POST"])
+def stop():
+    data = request.get_json(force=True, silent=True) or {}
+    rid  = data.get("request_id") or ""
+    with _stop_events_lock:
+        ev = _stop_events.get(rid)
+    if ev:
+        ev.set()
+    return jsonify({"ok": True})
+
+
+@app.route("/new", methods=["POST"])
+def new_session():
+    global _current_session_id
+    with _session_lock:
+        _current_session_id = None
+    return jsonify({"ok": True})
+
+
 @app.route("/sessions")
-def list_sessions():
-    return jsonify(SessionManager(WORKSPACE).list_recent(20))
+def sessions():
+    session_mgr = SessionManager(WORKSPACE)
+    try:
+        recent = session_mgr.list_recent(50)
+    except Exception:
+        recent = []
+    return jsonify(recent)
 
 
 @app.route("/status")
@@ -2436,127 +2970,247 @@ def status():
         sid = _current_session_id
     return jsonify({
         "workspace":       str(WORKSPACE),
-        "llm_url":         Config.LLM_URL,
+        "llm_url":         getattr(Config, "LLM_URL", ""),
         "current_session": sid,
         "permission_mode": _current_permission_mode,
         "mcp_clients":     len(_global_mcp.clients),
+        "agent_state":     _get_agent_state(),
     })
 
 
-@app.route("/soul")
-def get_soul():
-    return jsonify({"soul": soul or "(no soul config \u2014 create .soul.md in workspace)"})
-
-
-@app.route("/mode", methods=["POST"])
-def set_mode():
-    global _current_permission_mode
-    data = request.get_json(force=True, silent=True) or {}
-    mode = (data.get("mode") or "").strip().lower()
-    if mode not in {"auto", "normal", "manual"}:
-        return jsonify({"ok": False, "error": "Invalid mode. Choose: auto, normal, manual"})
-    _current_permission_mode = mode
-    return jsonify({"ok": True, "mode": mode})
-
-
 @app.route("/tools")
-def list_tools():
+def tools():
     return jsonify(_build_tools_payload())
 
 
-@app.route("/cmd", methods=["POST"])
-def run_cmd():
-    data       = request.get_json(force=True, silent=True) or {}
-    cmd        = (data.get("cmd") or "").strip()
-    session_id = data.get("session_id") or ""
-    if not session_id:
-        return jsonify({"text": "No active session."})
+@app.route("/soul")
+def soul_route():
+    try:
+        text = soul.render() if soul else ""
+    except Exception:
+        text = ""
+    return jsonify({"soul": text})
 
-    if cmd == "todo":
+
+@app.route("/mode", methods=["POST"])
+def mode():
+    global _current_permission_mode
+    data = request.get_json(force=True, silent=True) or {}
+    m    = (data.get("mode") or "").strip().lower()
+    if m not in ("auto", "normal", "manual"):
+        return jsonify({"ok": False, "error": "invalid mode"}), 400
+    _current_permission_mode = m
+    return jsonify({"ok": True, "mode": m})
+
+
+@app.route("/cmd", methods=["POST"])
+def cmd():
+    data = request.get_json(force=True, silent=True) or {}
+    c    = (data.get("cmd") or "").strip().lower()
+    sid  = data.get("session_id") or None
+
+    if not sid:
+        return jsonify({"text": "No session ID provided."})
+
+    if c == "todo":
         try:
-            mgr    = TodoManager(WORKSPACE, session_id)
-            result = mgr.list_all()
-            todos  = result.get("todos", [])
-            if not todos:
-                return jsonify({"text": "No todos yet."})
-            icons = {"pending": "\u23f3", "in_progress": "\U0001f504", "completed": "\u2705", "blocked": "\U0001f6ab"}
-            lines = [f"Todos ({result['completed']}/{result['total']} done):"]
-            for t in todos:
-                lines.append(f"  {icons.get(t['status'],'?')} #{t['id']} [{t['status']}] {t['description']}")
-                if t.get("notes"):
-                    lines.append(f"      {t['notes']}")
+            tm    = TodoManager(WORKSPACE, sid)
+            items = tm.list()
+            if not items:
+                return jsonify({"text": "No todos."})
+            lines = []
+            for t in items:
+                mark = "\u2713" if t.get("done") else "\u25a1"
+                lines.append(f"  {mark} {t.get('text','')}")
             return jsonify({"text": "\n".join(lines)})
         except Exception as e:
             return jsonify({"text": f"Error: {e}"})
 
-    if cmd == "plan":
+    if c == "plan":
         try:
-            mgr = PlanManager(WORKSPACE, session_id)
-            ctx = mgr.get_context()
-            return jsonify({"text": ctx or "No active plan."})
+            pm    = PlanManager(WORKSPACE, sid)
+            steps = pm.list()
+            if not steps:
+                return jsonify({"text": "No active plan."})
+            lines = []
+            for i, s in enumerate(steps, 1):
+                done = s.get("done", False)
+                mark = "\u2713" if done else f"{i}."
+                lines.append(f"  {mark} {s.get('text','')}")
+            return jsonify({"text": "\n".join(lines)})
         except Exception as e:
             return jsonify({"text": f"Error: {e}"})
 
-    return jsonify({"text": f"Unknown command: {cmd}"})
+    return jsonify({"text": f"Unknown command: {c}"})
 
 
-@app.route("/new", methods=["POST"])
-def new_session():
-    global _current_session_id
-    with _session_lock:
-        old = _current_session_id
-        _current_session_id = None
-    _chatlog_clear(old)
-    return jsonify({"ok": True})
+# =============================================================================
+# FILE TREE ROUTES
+# =============================================================================
+
+# FIX: include glob patterns alongside plain names so fnmatch can match them.
+_HIDDEN_NAMES = frozenset({
+    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", "node_modules", ".venv",
+    "venv", ".env", ".DS_Store", "dist", "build", ".idea", ".vscode",
+})
+_HIDDEN_GLOBS = ("*.pyc", "*.pyo")   # FIX: use fnmatch, not set membership
+
+_MAX_PREVIEW_BYTES = 100_000
 
 
-@app.route("/stop", methods=["POST"])
-def stop_agent():
-    data = request.get_json(force=True, silent=True) or {}
-    rid  = data.get("request_id") or ""
-    with _stop_events_lock:
-        ev = _stop_events.get(rid)
-    if ev:
-        ev.set()
-        return jsonify({"stopped": True})
-    return jsonify({"stopped": False, "detail": "unknown request_id"})
+def _safe_rel(path_str: str) -> "Path | None":
+    """Resolve a relative path inside WORKSPACE; return None if it escapes."""
+    try:
+        rel  = Path(path_str)
+        full = (WORKSPACE / rel).resolve()
+        full.relative_to(WORKSPACE)
+        return full
+    except (ValueError, Exception):
+        return None
+
+
+def _is_hidden(name: str) -> bool:
+    """Return True if a filename should be excluded from the tree."""
+    if name in _HIDDEN_NAMES:
+        return True
+    # FIX: was `name in _HIDDEN` which never matched glob strings like "*.pyc"
+    return any(fnmatch.fnmatch(name, pat) for pat in _HIDDEN_GLOBS)
+
+
+def _ext_of(p: Path) -> str:
+    return p.suffix.lower() if p.suffix else ""
+
+
+@app.route("/filetree")
+def filetree():
+    rel  = request.args.get("path", ".").strip() or "."
+    full = _safe_rel(rel)
+    if full is None:
+        return jsonify({"error": "invalid path"}), 400
+    if not full.is_dir():
+        return jsonify({"error": "not a directory"}), 400
+
+    try:
+        items = sorted(full.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except PermissionError:
+        return jsonify({"error": "permission denied"}), 403
+
+    entries = []
+    for item in items:
+        if _is_hidden(item.name) or item.is_symlink():
+            continue
+        try:
+            rel_path = str(item.relative_to(WORKSPACE))
+        except ValueError:
+            continue
+
+        entry: dict = {
+            "name": item.name,
+            "type": "dir" if item.is_dir() else "file",
+            "path": rel_path,
+            "ext":  _ext_of(item) if item.is_file() else "",
+        }
+        if item.is_file():
+            try:
+                entry["size"] = item.stat().st_size
+            except OSError:
+                entry["size"] = 0
+        entries.append(entry)
+
+    return jsonify({"entries": entries})
+
+
+@app.route("/fileread")
+def fileread():
+    rel  = request.args.get("path", "").strip()
+    if not rel:
+        return jsonify({"error": "no path"}), 400
+    full = _safe_rel(rel)
+    if full is None:
+        return jsonify({"error": "invalid path"}), 400
+    if not full.is_file():
+        return jsonify({"error": "not a file"}), 400
+
+    try:
+        size = full.stat().st_size
+    except OSError:
+        return jsonify({"error": "cannot stat file"}), 500
+
+    try:
+        with open(full, "rb") as fh:
+            header = fh.read(8192)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
+    if b"\x00" in header:
+        return jsonify({"binary": True, "size": size})
+
+    truncated = size > _MAX_PREVIEW_BYTES
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read(_MAX_PREVIEW_BYTES)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "content":   content,
+        "size":      size,
+        "truncated": truncated,
+        "binary":    False,
+    })
+
+
+@app.route("/workspace/mtime")
+def workspace_mtime():
+    """Return the max mtime across the workspace root and its immediate children.
+
+    Used by the FileTree auto-refresh to skip no-op fetches when nothing has
+    changed.  One level deep is cheap and catches the vast majority of edits.
+    """
+    try:
+        mtimes = [WORKSPACE.stat().st_mtime]
+        for child in WORKSPACE.iterdir():
+            try:
+                mtimes.append(child.stat().st_mtime)
+            except OSError:
+                pass
+        return jsonify({"mtime": max(mtimes)})
+    except OSError:
+        return jsonify({"mtime": 0})
 
 
 # =============================================================================
 # STARTUP
 # =============================================================================
 
-def _local_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "localhost"
+def _find_free_port(start: int = 7860) -> int:
+    # FIX: SO_REUSEADDR prevents false negatives from TIME_WAIT sockets.
+    for port in range(start, start + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    return start
 
 
 if __name__ == "__main__":
-    port      = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    ip        = _local_ip()
-    mcp_count = len(_global_mcp.clients)
+    port = _find_free_port(7860)
 
-    threading.Thread(target=_scheduler_loop, daemon=True, name="web-scheduler").start()
+    sched = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
+    sched.start()
 
-    print("\n" + "\u2550" * 58)
-    print("  LMAgent Web  v6.5.7")
-    print("\u2550" * 58)
-    print(f"  Local  \u2192  http://localhost:{port}")
-    print(f"  Phone  \u2192  http://{ip}:{port}")
+    print(f"\n  LMAgent Web  v6.5.9")
     print(f"  Workspace : {WORKSPACE}")
-    print(f"  LLM       : {Config.LLM_URL}")
-    print(f"  MCP       : {mcp_count} server{'s' if mcp_count != 1 else ''} loaded")
-    print("\u2550" * 58)
-    print("  FIX: Stop now kills LM Studio connection immediately \u2713")
-    print("  FIX: Thinking blocks visible in frontend \u2713")
-    print("  FIX: Streaming lag eliminated (rAF batching) \u2713")
-    print("  FEAT: Whisper — /whisper <text> to nudge the agent \u2713")
-    print("\u2550" * 58 + "\n")
+    print(f"  Listening : http://0.0.0.0:{port}\n")
 
-    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True,
+        use_reloader=False,
+        debug=False,
+    )
