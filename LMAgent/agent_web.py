@@ -1,5 +1,5 @@
 """
-LMAgent Web — v6.5.9
+LMAgent Web — v6.6.1
 ------------------------------------
   agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
   agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
@@ -7,26 +7,24 @@ LMAgent Web — v6.5.9
 
 Place this file next to those three files.
 
-Changes vs v6.5.8:
-  - FIX: /mode now actually affects agent permission mode (was hardcoded AUTO).
-  - FIX: *.pyc / *.pyo hidden-file patterns now use fnmatch (were never matching).
-  - FIX: Race condition in _finalize_session / _chatlog_merge_keys resolved.
-  - FIX: _fix_mojibake now applied to all string payloads (was skipping tokens).
-  - FIX: Double Scroll.update() call removed from Agent.transition().
-  - OPT: _broadcast() snapshots queue list outside lock to reduce contention.
-  - OPT: FileTree auto-refresh uses /workspace/mtime to skip no-op fetches.
-  - OPT: _find_free_port uses SO_REUSEADDR to avoid TIME_WAIT false negatives.
-  - OPT: _resolve_permission_mode() helper centralises enum lookup.
-  - NEW: GET /workspace/mtime — lightweight max-mtime scan for change detection.
-  - CLEAN: Removed stray blank lines in /chat route.
-  - CLEAN: _AGENT_LOCK_TIMEOUT reduced to 60 s (was 300 s).
-  - Version badge updated to v6.5.9.
+Changes vs v6.6.0  (UX: friendly auth for desktop + mobile):
+  - UX:  AGENT_TOKEN is now a short 6-digit PIN by default (easy to type
+         on mobile). Set AGENT_TOKEN env var to override with any value.
+  - UX:  Unauthorized page shows a QR code (generated client-side via
+         qrcode.js from cdnjs — no new Python deps) plus a PIN entry form.
+         Mobile: scan the QR from the computer screen.
+         Desktop: type or click the PIN.
+         qrcode.js added to CSP script-src allowlist.
+  - Version badge updated to v6.6.1.
 """
 
 import fnmatch
+import functools
 import json
+import os
 import queue
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -93,6 +91,244 @@ except Exception:
     pass
 
 app = Flask(__name__)
+
+
+@app.after_request
+def _security_headers(response: "Response") -> "Response":
+    """Attach security headers to every response."""
+    h = response.headers
+    h["X-Content-Type-Options"] = "nosniff"
+    h["X-Frame-Options"]        = "DENY"
+    h["Referrer-Policy"]        = "no-referrer"
+    # unsafe-inline is required because the UI uses inline <script>/<style>.
+    # Still blocks injected scripts from loading from external origins.
+    h["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "img-src 'self' data:; "
+        "connect-src 'self'"
+    )
+    return response
+
+
+# =============================================================================
+# SECURITY CONFIG
+# =============================================================================
+
+# Token: a short 6-digit PIN by default — easy to type on mobile.
+# Set AGENT_TOKEN env var to use a custom value (string, any length).
+_AGENT_TOKEN: str = os.environ.get("AGENT_TOKEN") or str(secrets.randbelow(900000) + 100000)
+
+# Host: localhost by default. Set AGENT_HOST=0.0.0.0 to expose to LAN.
+_HOST: str = os.environ.get("AGENT_HOST", "0.0.0.0")
+
+
+# HTTPS: set both env vars to PEM file paths to enable TLS.
+_SSL_CERT: str = os.environ.get("AGENT_CERT", "")
+_SSL_KEY:  str = os.environ.get("AGENT_KEY",  "")
+
+# ── Rate limiter (pure in-memory, no deps) ────────────────────────────────────
+_rate_data: "dict[str, list]" = {}
+_rate_lock = threading.Lock()
+_RATE_LIMIT  = 120    # max requests per window per IP
+_RATE_WINDOW = 60.0   # seconds
+
+
+def _is_rate_limited(ip: str) -> bool:
+    """Sliding-window rate limiter. Returns True when the IP is over limit."""
+    now = time.time()
+    with _rate_lock:
+        ts = [t for t in _rate_data.get(ip, []) if now - t < _RATE_WINDOW]
+        if len(ts) >= _RATE_LIMIT:
+            _rate_data[ip] = ts
+            return True
+        ts.append(now)
+        _rate_data[ip] = ts
+        # Prune stale IPs to prevent unbounded memory growth.
+        if len(_rate_data) > 1000:
+            cutoff = now - _RATE_WINDOW * 2
+            stale = [k for k, v in _rate_data.items() if not v or v[-1] < cutoff]
+            for k in stale:
+                del _rate_data[k]
+        return False
+
+
+def _require_auth(f):
+    """Decorator: enforce token auth + rate limiting on a route.
+
+    Accepts the token from:
+      - X-Token request header  (fetch / XHR)
+      - ?token= query param     (EventSource, direct URL)
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if _AGENT_TOKEN:
+            token = (request.headers.get("X-Token", "")
+                     or request.args.get("token", ""))
+            # secrets.compare_digest prevents timing-based token oracle attacks.
+            if not token or not secrets.compare_digest(token, _AGENT_TOKEN):
+                return jsonify({"error": "unauthorized"}), 401
+        ip = request.remote_addr or "unknown"
+        if _is_rate_limited(ip):
+            return jsonify({"error": "rate limited — try again shortly"}), 429
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# Shown to visitors who hit / without a valid token.
+# __AUTH_URL__ is replaced server-side with the full URL including token.
+_UNAUTH_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LMAgent — Sign In</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d0d0f;color:#8e8c88;font-family:'IBM Plex Mono',monospace;
+       display:flex;align-items:center;justify-content:center;
+       min-height:100vh;padding:20px}
+  .box{text-align:center;padding:36px 32px;max-width:360px;width:100%;
+       background:#16161a;border:1px solid #252530;border-radius:12px}
+  .mark{width:40px;height:40px;background:#e8a245;border-radius:8px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:20px;color:#0d0d0f;font-weight:700;margin:0 auto 16px}
+  h2{color:#ddd8d0;margin-bottom:6px;font-size:15px;font-weight:600}
+  .sub{font-size:11px;color:#4e4c50;margin-bottom:22px}
+  /* QR code */
+  #qr{display:flex;justify-content:center;margin-bottom:20px}
+  #qr canvas,#qr img{border-radius:8px;border:6px solid #fff}
+  /* Divider */
+  .divider{display:flex;align-items:center;gap:10px;margin:18px 0;font-size:10px;color:#4e4c50}
+  .divider::before,.divider::after{content:'';flex:1;height:1px;background:#252530}
+  /* PIN entry */
+  .pin-row{display:flex;gap:8px;justify-content:center;margin-bottom:14px}
+  .pin-digit{
+    width:44px;height:54px;border-radius:8px;
+    border:1px solid #252530;background:#0d0d0f;
+    color:#ddd8d0;font-family:'IBM Plex Mono',monospace;
+    font-size:22px;font-weight:600;text-align:center;
+    outline:none;caret-color:#e8a245;
+    transition:border-color .12s;
+    -webkit-appearance:none;
+  }
+  .pin-digit:focus{border-color:#e8a245}
+  .pin-digit.filled{border-color:#32323e;color:#e8a245}
+  .go-btn{
+    width:100%;padding:11px;border-radius:8px;
+    background:#e8a245;border:none;color:#0d0d0f;
+    font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;
+    cursor:pointer;transition:background .12s;margin-bottom:10px;
+  }
+  .go-btn:hover{background:#f0b055}
+  .go-btn:disabled{background:#252530;color:#4e4c50;cursor:default}
+  .err{font-size:11px;color:#e05555;min-height:16px;margin-top:2px}
+  .hint{font-size:10px;color:#4e4c50;margin-top:16px;line-height:1.6}
+  code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;
+       border-radius:3px;color:#3ecfb2;font-size:10px}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="mark">&#955;</div>
+  <h2>LMAgent</h2>
+  <p class="sub">Scan with your phone or enter the PIN</p>
+
+  <div id="qr"></div>
+
+  <div class="divider">or enter PIN</div>
+
+  <div class="pin-row" id="pin-row">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+    <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+  </div>
+  <button class="go-btn" id="go-btn" disabled onclick="submitPin()">Unlock</button>
+  <div class="err" id="err"></div>
+
+  <div class="hint">
+    PIN printed to server console on startup.<br>
+    Set <code>AGENT_TOKEN</code> env var for a fixed PIN.
+  </div>
+</div>
+
+<script>
+(function() {
+  // QR code — URL is injected server-side
+  var authUrl = '__AUTH_URL__';
+  try {
+    new QRCode(document.getElementById('qr'), {
+      text: authUrl,
+      width: 200, height: 200,
+      colorDark: '#000000', colorLight: '#ffffff',
+      correctLevel: QRCode.CorrectLevel.M
+    });
+  } catch(e) {
+    document.getElementById('qr').style.display = 'none';
+  }
+
+  // 6-digit PIN inputs — auto-advance, auto-submit, paste support
+  var digits = Array.from(document.querySelectorAll('.pin-digit'));
+  var btn = document.getElementById('go-btn');
+  var err = document.getElementById('err');
+
+  function pinValue() { return digits.map(function(d){return d.value}).join(''); }
+  function updateBtn() {
+    var full = pinValue().length === 6;
+    btn.disabled = !full;
+    digits.forEach(function(d){ d.classList.toggle('filled', d.value !== ''); });
+  }
+
+  digits.forEach(function(d, i) {
+    d.addEventListener('input', function() {
+      // Allow only digits
+      d.value = d.value.replace(/\\D/g, '').slice(0, 1);
+      updateBtn();
+      if (d.value && i < digits.length - 1) digits[i+1].focus();
+      if (pinValue().length === 6) submitPin();
+    });
+    d.addEventListener('keydown', function(e) {
+      if (e.key === 'Backspace' && !d.value && i > 0) {
+        digits[i-1].value = '';
+        digits[i-1].focus();
+        updateBtn();
+      }
+    });
+    d.addEventListener('paste', function(e) {
+      e.preventDefault();
+      var text = (e.clipboardData || window.clipboardData).getData('text').replace(/\\D/g,'').slice(0,6);
+      text.split('').forEach(function(ch, j){ if (digits[i+j]) digits[i+j].value = ch; });
+      updateBtn();
+      var next = Math.min(i + text.length, digits.length - 1);
+      digits[next].focus();
+      if (pinValue().length === 6) submitPin();
+    });
+  });
+
+  digits[0].focus();
+
+  window.submitPin = function() {
+    var pin = pinValue();
+    if (pin.length !== 6) return;
+    btn.disabled = true;
+    err.textContent = '';
+    // Build redirect URL preserving host/path, adding token
+    var base = window.location.origin + window.location.pathname;
+    window.location.href = base + '?token=' + encodeURIComponent(pin);
+  };
+})();
+</script>
+</body>
+</html>"""
 
 # Reduced from 300 s — a stuck agent should surface quickly, not block for 5 min.
 _AGENT_LOCK         = threading.Lock()
@@ -1234,7 +1470,7 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.5.9</span>
+      <span class="logo-sub">v6.6.1</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -1323,6 +1559,20 @@ header {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
 <script>
 'use strict';
+
+// ── Auth token (injected server-side) ─────────────────────────────────────────
+const _AGENT_TOKEN = '__AGENT_TOKEN__';
+
+// Monkey-patch window.fetch to auto-inject the auth header on every call.
+// This is the single point of change — no individual fetch() needs updating.
+(function() {
+  var _origFetch = window.fetch.bind(window);
+  window.fetch = function(url, opts) {
+    opts = Object.assign({}, opts);
+    opts.headers = Object.assign({'X-Token': _AGENT_TOKEN}, opts.headers || {});
+    return _origFetch(url, opts);
+  };
+})();
 
 function _esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -2019,7 +2269,7 @@ const Agent = (() => {
   var es = null, retryMs = 1000;
   function connect() {
     ConnDot.try();
-    es = new EventSource('/stream');
+    es = new EventSource('/stream?token=' + encodeURIComponent(_AGENT_TOKEN));
     es.onopen  = function() { ConnDot.ok(); retryMs = 1000; };
     es.onmessage = function(e) {
       if (!e.data || e.data === '[DONE]') return;
@@ -2743,9 +2993,23 @@ def _scheduler_loop():
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    token = request.args.get("token", "")
+    if _AGENT_TOKEN and not secrets.compare_digest(token, _AGENT_TOKEN):
+        # Build the full auth URL so the QR code works from any device on
+        # the network — uses the Host header so it resolves correctly on LAN.
+        host = request.host  # e.g. "192.168.1.10:7860"
+        proto = "https" if (_SSL_CERT and _SSL_KEY) else "http"
+        auth_url = f"{proto}://{host}/?token={_AGENT_TOKEN}"
+        unauth = _UNAUTH_HTML.replace("__AUTH_URL__", auth_url)
+        return unauth, 401, {"Content-Type": "text/html; charset=utf-8"}
+    # Inject the validated token into the page so JS can use it for all
+    # subsequent API calls without re-reading it from the URL.
+    return HTML.replace("__AGENT_TOKEN__", _AGENT_TOKEN), 200, {
+        "Content-Type": "text/html; charset=utf-8"
+    }
 
 
+@_require_auth
 @app.route("/stream")
 def stream():
     q = _register_stream_q()
@@ -2786,6 +3050,7 @@ def stream():
     return _sse_response(generate())
 
 
+@_require_auth
 @app.route("/chat", methods=["POST"])
 def chat():
     global _current_session_id
@@ -2924,6 +3189,7 @@ def chat():
     return jsonify({"ok": True, "request_id": rid})
 
 
+@_require_auth
 @app.route("/whisper", methods=["POST"])
 def whisper():
     data = request.get_json(force=True, silent=True) or {}
@@ -2935,6 +3201,7 @@ def whisper():
     return jsonify({"ok": True})
 
 
+@_require_auth
 @app.route("/stop", methods=["POST"])
 def stop():
     data = request.get_json(force=True, silent=True) or {}
@@ -2946,6 +3213,7 @@ def stop():
     return jsonify({"ok": True})
 
 
+@_require_auth
 @app.route("/new", methods=["POST"])
 def new_session():
     global _current_session_id
@@ -2954,6 +3222,7 @@ def new_session():
     return jsonify({"ok": True})
 
 
+@_require_auth
 @app.route("/sessions")
 def sessions():
     session_mgr = SessionManager(WORKSPACE)
@@ -2964,6 +3233,7 @@ def sessions():
     return jsonify(recent)
 
 
+@_require_auth
 @app.route("/status")
 def status():
     with _session_lock:
@@ -2978,11 +3248,13 @@ def status():
     })
 
 
+@_require_auth
 @app.route("/tools")
 def tools():
     return jsonify(_build_tools_payload())
 
 
+@_require_auth
 @app.route("/soul")
 def soul_route():
     try:
@@ -2992,6 +3264,7 @@ def soul_route():
     return jsonify({"soul": text})
 
 
+@_require_auth
 @app.route("/mode", methods=["POST"])
 def mode():
     global _current_permission_mode
@@ -3003,6 +3276,7 @@ def mode():
     return jsonify({"ok": True, "mode": m})
 
 
+@_require_auth
 @app.route("/cmd", methods=["POST"])
 def cmd():
     data = request.get_json(force=True, silent=True) or {}
@@ -3082,6 +3356,7 @@ def _ext_of(p: Path) -> str:
     return p.suffix.lower() if p.suffix else ""
 
 
+@_require_auth
 @app.route("/filetree")
 def filetree():
     rel  = request.args.get("path", ".").strip() or "."
@@ -3121,6 +3396,7 @@ def filetree():
     return jsonify({"entries": entries})
 
 
+@_require_auth
 @app.route("/fileread")
 def fileread():
     rel  = request.args.get("path", "").strip()
@@ -3161,6 +3437,7 @@ def fileread():
     })
 
 
+@_require_auth
 @app.route("/workspace/mtime")
 def workspace_mtime():
     """Return the max mtime across the workspace root and its immediate children.
@@ -3203,14 +3480,20 @@ if __name__ == "__main__":
     sched = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
     sched.start()
 
-    print(f"\n  LMAgent Web  v6.5.9")
+    proto = "https" if (_SSL_CERT and _SSL_KEY) else "http"
+    print(f"\n  LMAgent Web  v6.6.1")
     print(f"  Workspace : {WORKSPACE}")
-    print(f"  Listening : http://0.0.0.0:{port}\n")
+    print(f"  Listening : {proto}://{_HOST}:{port}")
+    print(f"  Token     : {_AGENT_TOKEN}")
+    print(f"  Open      : {proto}://{'localhost' if _HOST == '127.0.0.1' else _HOST}:{port}/?token={_AGENT_TOKEN}\n")
+
+    ssl_context = (_SSL_CERT, _SSL_KEY) if (_SSL_CERT and _SSL_KEY) else None
 
     app.run(
-        host="0.0.0.0",
+        host=_HOST,
         port=port,
         threaded=True,
         use_reloader=False,
         debug=False,
+        ssl_context=ssl_context,
     )
