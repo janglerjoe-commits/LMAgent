@@ -781,10 +781,10 @@ def run_agent(
 
             # Execute any tool calls BEFORE checking completion.
             if tool_calls:
-                _, current_permission_mode = _process_tool_calls(
-                    tool_calls, workspace, available_tools, detector,
-                    iteration, mcp_manager, messages, current_permission_mode,
-                    emit=emit,
+                current_permission_mode = _process_tool_calls(
+                tool_calls, workspace, available_tools, detector,
+                iteration, mcp_manager, messages, current_permission_mode,
+                emit=emit,
                 )
 
             # ── WHISPER INJECTION ──────────────────────────────────────────────
