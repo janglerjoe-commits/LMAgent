@@ -3474,6 +3474,15 @@ def _find_free_port(start: int = 7860) -> int:
     return start
 
 
+def _get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 if __name__ == "__main__":
     port = _find_free_port(7860)
 
@@ -3481,11 +3490,12 @@ if __name__ == "__main__":
     sched.start()
 
     proto = "https" if (_SSL_CERT and _SSL_KEY) else "http"
+    local_ip = "localhost" if _HOST == "127.0.0.1" else _get_local_ip()
     print(f"\n  LMAgent Web  v6.6.1")
     print(f"  Workspace : {WORKSPACE}")
     print(f"  Listening : {proto}://{_HOST}:{port}")
     print(f"  Token     : {_AGENT_TOKEN}")
-    print(f"  Open      : {proto}://{'localhost' if _HOST == '127.0.0.1' else _HOST}:{port}/?token={_AGENT_TOKEN}\n")
+    print(f"  Open      : {proto}://{local_ip}:{port}/?token={_AGENT_TOKEN}\n")
 
     ssl_context = (_SSL_CERT, _SSL_KEY) if (_SSL_CERT and _SSL_KEY) else None
 
