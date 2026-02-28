@@ -1,6 +1,10 @@
 # LMAgent
 
-[![Watch the demo](https://img.youtube.com/vi/GNQP6M53c5A/hqdefault.jpg)](https://www.youtube.com/watch?v=GNQP6M53c5A)
+<p align="center">
+  <img src="LMAgentLogo.png" alt="LMAgent Logo" width="200">
+</p>
+
+[![Watch the demo](https://img.youtube.com/vi/-_jKwfssAvA/hqdefault.jpg)](https://www.youtube.com/shorts/-_jKwfssAvA)
 
 A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible LLM (LM Studio, Ollama, etc.) and can autonomously read and write files, run shell commands, manage git, track todos, coordinate sub-tasks, and much more — all from an interactive terminal REPL or a polished web UI.
 
@@ -21,6 +25,7 @@ A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible
 - [Scheduled Waits](#scheduled-waits)
 - [Session Storage](#session-storage)
 - [Web UI Features](#web-ui-features)
+- [Limitations](#limitations)
 - [Tips & Troubleshooting](#tips--troubleshooting)
 - [Version History](#version-history)
 
@@ -67,6 +72,8 @@ By default the container runs with `bridge` network mode, meaning it can make ou
 
 If Docker is not running, LMAgent falls back to a process-group sandbox with memory and CPU limits. A loud warning is printed to the terminal when this happens. Start Docker Desktop to restore full isolation.
 
+> **Note:** The POSIX fallback (macOS/Linux without Docker) uses `RLIMIT_AS` and process groups for resource limiting, but does **not** provide filesystem isolation. The agent can only reach outside the workspace through the shell tool if Docker is not active. Start Docker Desktop or set `FORCE_DOCKER = True` in `sandboxed_shell.py` for full isolation on POSIX systems.
+
 ### Requirements
 
 ```bash
@@ -81,13 +88,14 @@ Docker Desktop must be running on Windows. On macOS/Linux, Docker is optional �
 
 | File | Version | Role |
 |---|---|---|
-| `agent_core.py` | v9.3.4-sec | Foundation layer — config, logging, sessions, state, todos, plans, shell sessions, MCP |
-| `agent_tools.py` | v9.5.1-sandbox-git | Tool handlers, LLM client, tool registry, system prompts |
-| `agent_main.py` | v9.3.4-fix | CLI entrypoint, `run_agent()`, interactive REPL, background scheduler |
-| `agent_web.py` | v6.5.7 | Flask web UI — place next to the three core files |
+| `agent_core.py` | v9.3.5-sec | Foundation layer — config, logging, sessions, state, todos, plans, shell sessions, MCP client, message compaction |
+| `agent_tools.py` | v9.5.2-vision | Tool handlers, tool schemas, tool registry, vision support |
+| `agent_llm.py` | — | LLM HTTP client, streaming parser, agent execution loop, system prompts, sub-agent runner |
+| `agent_main.py` | — | CLI entrypoint, `run_agent()`, interactive REPL, background scheduler |
+| `agent_web.py` | v6.9.1 | Flask web UI — place next to the other files |
 | `sandboxed_shell.py` | — | Cross-platform sandboxed subprocess execution (Docker + fallback) |
 
-All five files must be in the same directory.
+All six files must be in the same directory.
 
 ---
 
@@ -167,7 +175,7 @@ python agent_main.py
 ```bash
 python agent_web.py
 ```
-Then open `http://localhost:5000` in your browser.
+Then open `http://localhost:7860` in your browser (the exact URL and PIN are printed to the console on startup).
 
 You should see the LMAgent banner and a confirmation that the LLM connected. Type a task and press Enter.
 
@@ -202,11 +210,17 @@ Runs a single task and exits with a meaningful exit code:
 
 ```bash
 python agent_web.py
-# Custom port:
-python agent_web.py 8080
 ```
 
-Opens at `http://localhost:5000`. Streams tokens live, shows tool calls inline, and lets you browse session history. Also accessible from your phone on the local network — the startup output shows your LAN address.
+Opens at `http://0.0.0.0:7860` by default. A PIN is printed to the console on startup — use it to log in. Set `AGENT_TOKEN` in the environment for a fixed token instead of a random one each run. Also accessible from your phone on the local network — the startup output shows your LAN address.
+
+```env
+AGENT_TOKEN=mysecretpin
+AGENT_PORT=7860
+AGENT_HOST=127.0.0.1
+AGENT_CERT=/path/to/cert.pem   # optional TLS
+AGENT_KEY=/path/to/key.pem
+```
 
 ### Resume a Previous Session
 
@@ -264,7 +278,7 @@ Set any of these in your `.env` file or as environment variables.
 | `LLM_TIMEOUT` | `560` | Seconds to wait for an LLM response |
 | `LLM_MAX_RETRIES` | `3` | Retry attempts on connection failure |
 | `LLM_RETRY_DELAY` | `3.0` | Seconds between retries |
-| `THINKING_MODEL` | `true` | Strip `<think>` blocks (for QwQ, DeepSeek-R1, etc.) |
+| `THINKING_MODEL` | `true` | Strip `<think>` blocks from context (for QwQ, DeepSeek-R1, etc.) |
 | `THINKING_MAX_TOKENS` | `16000` | Token budget for thinking models |
 
 ### Context & Memory
@@ -288,6 +302,13 @@ Set any of these in your `.env` file or as environment variables.
 | `ENABLE_SUB_AGENTS` | `true` | Allow the agent to spawn sub-agents for file creation |
 | `ENABLE_TODO_TRACKING` | `true` | Track todos across iterations |
 | `ENABLE_PLAN_ENFORCEMENT` | `true` | Enforce step-by-step plans |
+
+### Vision Settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `VISION_ENABLED` | `auto` | `auto` probes LM Studio on first use; `true` skips the probe and always enables; `false` always disables |
+| `LLM_BASE_URL` | `http://localhost:1234` | Base URL used for the vision capability probe (hits `/api/v1/models`) |
 
 ### Security Settings
 
@@ -329,7 +350,7 @@ LMAgent calls these tools autonomously during a task.
 
 | Tool | Description |
 |---|---|
-| `shell` | Run a command inside the Docker sandbox (bash on Linux/macOS, sh in container). Timeout 1–120s, memory 64MB–2GB. Falls back to process-group isolation if Docker is unavailable. |
+| `shell` | Run a command inside the Docker sandbox. Timeout 1–120s, memory 64MB–2GB. Falls back to process-group isolation if Docker is unavailable. |
 
 ### Git
 
@@ -361,6 +382,14 @@ All git operations run inside the Docker sandbox, not on your host machine.
 | Tool | Description |
 |---|---|
 | `task` | Delegate single-file creation to an isolated sub-agent (file tools only — no shell or git access) |
+
+### Vision
+
+| Tool | Description |
+|---|---|
+| `vision` | Analyse a workspace image file using the loaded vision model. Only appears when a vision-capable model is detected. Accepts JPEG, PNG, GIF, and WebP. |
+
+The vision tool probes LM Studio's `GET /api/v1/models` endpoint on first use to check whether the loaded model has vision capability. If you're using a non-LM Studio backend, set `VISION_ENABLED=true` to skip the probe and always enable the tool.
 
 ### Utilities
 
@@ -523,7 +552,7 @@ The agent can suspend itself until a future time by outputting a special token:
 WAIT: 2026-03-01T09:00:00: Waiting for market open.
 ```
 
-The background scheduler wakes the session automatically when the time arrives. Waiting sessions appear in the web UI session browser and can also be manually resumed with `--resume`.
+The background scheduler wakes the session automatically when the time arrives. Waiting sessions appear in the web UI session browser and can also be manually resumed with `--resume`. The scheduler uses polling — minimum wakeup granularity is `SCHEDULER_POLL_INTERVAL` seconds (default 60).
 
 ---
 
@@ -538,6 +567,18 @@ python agent_main.py --resume 20260220_143512_a1b2c3
 
 Session data includes full message history, iteration count, todo/plan state, and the agent's last checkpoint — so resuming picks up exactly where it left off, even after a crash.
 
+```
+.lmagent/
+  sessions/   # full message history per session (JSON)
+  state/      # loop detector, iteration count, wait state
+  todos/      # per-session todo lists
+  plans/      # per-session execution plans
+  inbox/      # .task files for the scheduler
+  locks/      # instance lock (prevents two agents on the same workspace)
+```
+
+Sessions are never automatically deleted.
+
 ---
 
 ## Web UI Features
@@ -547,12 +588,26 @@ Session data includes full message history, iteration count, todo/plan state, an
 - Inline tool call display (pending → success / failure), collapsible when > 3 calls
 - **Whisper** — send a mid-run nudge to the agent without stopping it (type in the input box while the agent is running, or use `/whisper <text>`)
 - Session browser with status indicators
+- File tree browser with live preview and file filtering
 - Tool explorer showing all built-in and MCP tools with their parameters
+- Image upload for vision tasks — drag and drop, paste from clipboard, or use the file picker
 - Slash commands (`/help`, `/mode`, `/todo`, `/plan`, `/soul`, `/status`, `/session`, `/whisper`)
-- Stop button — immediately kills the LM Studio connection and halts the stream
+- Stop button — cancels the current run mid-stream
 - New button to clear and start a fresh session
 - Chat history replay on page refresh
+- PIN-based authentication with QR code on the login screen
 - Mobile-friendly — accessible from any device on your local network
+
+---
+
+## Limitations
+
+- **POSIX sandbox does not isolate the filesystem.** Only Docker provides that. On macOS/Linux without Docker enabled, the agent can access files outside the workspace through the shell tool (the safety layer still blocks commands it recognises as dangerous, but it is not a complete guard).
+- **The web UI is single-user.** The agent lock returns HTTP 429 if a second chat request arrives while one is already running.
+- **Vision probe is LM Studio-specific.** The `auto` probe hits LM Studio's `GET /api/v1/models` endpoint. Other backends don't expose this — set `VISION_ENABLED=true` to skip it.
+- **The scheduler uses polling.** Minimum wakeup granularity is `SCHEDULER_POLL_INTERVAL` seconds. It is not event-driven.
+- **Sub-agents have no shell access.** Tasks that require shell commands must be handled by the parent agent.
+- **Keep the workspace in git.** The agent makes real changes. If something goes wrong, git is your rollback.
 
 ---
 
@@ -573,5 +628,7 @@ Session data includes full message history, iteration count, todo/plan state, an
 **Want full air-gap isolation?** Set `DOCKER_NETWORK = "none"` in `sandboxed_shell.py` to block all outbound network access from inside the container. Note this will also disable pip installs and web requests from within the sandbox.
 
 **High temperature warnings?** If `TEMPERATURE` is above 0.7 with a thinking model, LMAgent will log a warning. Consider setting `TEMPERATURE=0.6` or lower for more consistent tool use.
+
+**Vision not appearing?** If you're using a vision-capable model but the tool isn't showing up, set `VISION_ENABLED=true` in `.env` to bypass the LM Studio probe.
 
 ---
