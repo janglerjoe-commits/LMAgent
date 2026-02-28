@@ -498,7 +498,18 @@ _ASKING_PHRASES = ("would you like", "what would you", "should i")
 
 
 def detect_completion(content: str, has_tool_calls: bool) -> Tuple[bool, str]:
-    if "TASK_COMPLETE" in content.upper() and not has_tool_calls:
+    if "TASK_COMPLETE" in content.upper():
+        # TASK_COMPLETE is authoritative even alongside tool calls —
+        # agent completed its work and did bookkeeping in the same turn.
+        for line in content.split("\n"):
+            if "TASK_COMPLETE" not in line.upper(): continue
+            stripped = line.strip()
+            if any(stripped.startswith(p) for p in _SKIP_PREFIXES): continue
+            if any(k in stripped.lower() for k in _SKIP_KEYWORDS): continue
+            if has_tool_calls:
+                Log.info("TASK_COMPLETE with tool calls — treating as complete")
+            return True, "Explicit TASK_COMPLETE"
+    if not has_tool_calls and len(content.strip()) > 50:
         for line in content.split("\n"):
             if "TASK_COMPLETE" not in line.upper(): continue
             stripped = line.strip()
