@@ -39,6 +39,17 @@ Changes in this patch:
      health_check() to close a minor thread-safety gap.
 
 All other code is unchanged from v9.3.4-sec.
+
+Vision support (v9.5.2-vision):
+  - Added Config.VISION_ENABLED: controls probe behaviour in agent_tools.
+      "auto"  (default) — probe LM Studio's /api/v1/models on first use
+      "true"            — skip probe, always report vision available
+      "false"           — skip probe, always report no vision
+  - Added Config.LLM_BASE_URL: base URL used by the vision probe to hit
+      /api/v1/models independently of Config.LLM_URL (which points to
+      /v1/chat/completions).  Defaults to http://localhost:1234.
+  Both are read from .env / environment variables so no code changes are
+  needed by users who set them in their .env file.
 """
 
 import atexit
@@ -170,6 +181,21 @@ class Config:
                                     "git_commit", "git_branch",
                                     "todo_add", "todo_update", "todo_complete"})
 
+    # ── Vision support (v9.5.2-vision) ───────────────────────────────────────
+    # VISION_ENABLED controls how agent_tools._detect_vision_support() behaves:
+    #   "auto"  — probe LM Studio's /api/v1/models on first use (default)
+    #   "true"  — always report vision available (skip the probe)
+    #   "false" — always report no vision (skip the probe, tool hidden)
+    # Set in .env:  VISION_ENABLED=auto
+    VISION_ENABLED = os.getenv("VISION_ENABLED", "auto")
+
+    # LLM_BASE_URL is the root of the LM Studio API, used to construct the
+    # /api/v1/models probe URL independently of LLM_URL (which already includes
+    # the full /v1/chat/completions path).
+    # Set in .env:  LLM_BASE_URL=http://localhost:1234
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234")
+    # ─────────────────────────────────────────────────────────────────────────
+
     @classmethod
     def init(cls) -> None:
         workspace = Path(cls.WORKSPACE)
@@ -187,6 +213,12 @@ class Config:
             PermissionMode(cls.PERMISSION_MODE)
         except ValueError:
             raise ValueError(f"Invalid PERMISSION_MODE: {cls.PERMISSION_MODE}")
+        valid_vision = {"auto", "true", "false"}
+        if cls.VISION_ENABLED.lower() not in valid_vision:
+            raise ValueError(
+                f"Invalid VISION_ENABLED: '{cls.VISION_ENABLED}'. "
+                f"Must be one of: {sorted(valid_vision)}"
+            )
 
 
 # =============================================================================
