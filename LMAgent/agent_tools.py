@@ -2,40 +2,15 @@
 """
 agent_tools.py — Tool layer for LMAgent.
 
-Sandbox patch v9.5.1-sandbox-git:
-  - Git commands now routed through run_sandboxed() instead of get_shell_session().
-    This means git runs inside the Docker container (same sandbox as shell tool)
-    and falls back to process-group + rlimits if Docker is unavailable — exactly
-    the same backend selection as the shell tool.
-  - IMPORTANT: git must be available inside the Docker image.
-    python:3.12-slim does NOT include git. Either:
-      a) Change DOCKER_IMAGE in sandboxed_shell.py to an image that has git, or
-      b) Change the container startup command to apt-get install -y git before use.
-    The simplest option is to set DOCKER_IMAGE = "python:3.12-slim" and change the
-    container command to:
-        ["sh", "-c", "apt-get install -y -q git > /dev/null 2>&1; while true; do sleep 3600; done"]
-    Or use a pre-built image with git already present.
-  - All other behaviour is unchanged from v9.5.0-sandbox.
+Contains: tool handlers, schemas, registry, vision support, git helpers.
+LLM client, agent loops, and system prompts live in agent_llm.py.
 
-All other behaviour is unchanged from v9.4.0-nosell.
-
-Fixes applied (v9.5.1-fixed):
-  - BUG FIX: tool_write and tool_edit: replaced fp.with_suffix(fp.suffix + ".tmp")
-    with fp.parent / (fp.name + ".tmp") to avoid ValueError on files with extensions
-    (e.g. script.py, style.css). Path.with_suffix() raises ValueError if the
-    resulting suffix contains more than one dot.
-  - BUG FIX: tool_grep: hidden-file filter now uses f.relative_to(workspace).parts
-    instead of f.parts, so absolute path components (e.g. "/home") don't
-    accidentally match the startswith(".") check.
-  - BUG FIX: tool_git_diff: git command now uses the Safety-resolved path
-    (relative to workspace) rather than the raw user-supplied string, preventing
-    path-traversal inconsistencies.
-  - CLEANUP: _process_tool_calls: removed the dead had_rename_op bool from the
-    return value. Callers now receive only updated_permission_mode. Update any
-    callers that previously unpacked two values to unpack one:
-        current_permission_mode = _process_tool_calls(...)
+Backward compatibility: everything that was previously importable from
+agent_tools is still importable from agent_tools via the re-export block
+at the bottom of this file.  No external files need to change.
 """
 
+import base64
 import json
 import os
 import re
@@ -96,18 +71,196 @@ def _validate_git_ref(name: str) -> Tuple[bool, str]:
 # =============================================================================
 # SECURE GIT EXECUTION HELPER  (internal only — not a tool the LLM can call)
 #
-# CHANGED from v9.5.0: now routes through run_sandboxed() so git executes inside
-# the Docker container (or process-group fallback) rather than on the host shell.
-# This closes the bypass where git hooks / submodule URLs could touch the host.
+# Routes through run_sandboxed() so git executes inside the Docker container
+# (or process-group fallback) rather than on the host shell.
 # =============================================================================
 
 def _git_safe(workspace: Path, cmd: str) -> Tuple[str, int]:
     ok, reason = Safety.validate_command(cmd, workspace)
     if not ok:
         raise ValueError(reason)
-    # Route through run_sandboxed — same Docker container / fallback as tool_shell.
-    # Git must be available in the container image (see module docstring).
     return run_sandboxed(cmd=cmd, workspace=workspace)
+
+
+# =============================================================================
+# VISION SUPPORT
+# =============================================================================
+
+_vision_cache: Optional[bool] = None   # None = unchecked, True/False = result
+_vision_lock = threading.Lock()
+
+_VISION_MIME_MAP: Dict[str, str] = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _detect_vision_support() -> bool:
+    """
+    Probe LM Studio's /api/v1/models endpoint to determine whether the currently
+    loaded model has vision capability.  Result is cached for the process lifetime.
+
+    Controlled by the VISION_ENABLED env var (read via Config):
+      "true"  — always report vision available (skip the probe)
+      "false" — always report no vision (skip the probe)
+      "auto"  — probe LM Studio (default)
+
+    Call vision_cache_invalidate() to force a fresh probe.
+    """
+    global _vision_cache
+    with _vision_lock:
+        if _vision_cache is not None:
+            return _vision_cache
+
+        mode = getattr(Config, "VISION_ENABLED", "auto").lower()
+        if mode == "true":
+            _vision_cache = True
+            return True
+        if mode == "false":
+            _vision_cache = False
+            return False
+
+        # "auto" — probe LM Studio's native model list endpoint
+        base = getattr(Config, "LLM_BASE_URL", "http://localhost:1234")
+        try:
+            resp = requests.get(
+                f"{base}/api/v1/models",
+                timeout=5,
+                headers={"Authorization": f"Bearer {Config.LLM_API_KEY}"},
+            )
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            target = (Config.LLM_MODEL or "").lower()
+
+            # First pass: try to match the configured model name exactly.
+            for m in models:
+                key = (m.get("key") or m.get("id") or "").lower()
+                if target and target not in key:
+                    continue
+                if m.get("capabilities", {}).get("vision", False):
+                    Log.info(f"Vision capability detected on configured model: {key}")
+                    _vision_cache = True
+                    return True
+
+            # Second pass: accept any loaded vision-capable model as a fallback.
+            for m in models:
+                if m.get("capabilities", {}).get("vision", False):
+                    key = m.get("key") or m.get("id") or "unknown"
+                    Log.info(f"Vision fallback model found: {key}")
+                    _vision_cache = True
+                    return True
+
+            Log.info("No vision-capable model found in LM Studio — vision tool disabled")
+            _vision_cache = False
+
+        except Exception as e:
+            Log.warning(f"Vision probe failed ({e}) — disabling vision tool for this session")
+            _vision_cache = False
+
+        return _vision_cache
+
+
+def vision_cache_invalidate() -> None:
+    """Force a fresh vision-capability probe on the next tool assembly.
+
+    Call this whenever the user loads a different model in LM Studio so the
+    vision tool appears/disappears appropriately without restarting the server.
+    """
+    global _vision_cache
+    with _vision_lock:
+        _vision_cache = None
+    Log.info("Vision cache invalidated — will re-probe on next tool call")
+
+
+def tool_vision(
+    workspace: Path,
+    path: str,
+    prompt: str = "Describe this image in detail.",
+) -> Dict[str, Any]:
+    """Send a workspace image to the loaded vision model and return its description.
+
+    The tool validates the path, base64-encodes the image, and submits it to the
+    OpenAI-compatible /v1/chat/completions endpoint using the image_url content
+    type.  Only JPEG, PNG, GIF, and WebP files are accepted.
+
+    Returns:
+        {"success": True, "path": "...", "description": "<model output>"}
+    or
+        {"success": False, "error": "<reason>"}
+    """
+    if not _detect_vision_support():
+        return {
+            "success": False,
+            "error": (
+                "No vision-capable model is currently loaded in LM Studio. "
+                "Load a VLM (e.g. LLaVA, Qwen-VL, Pixtral) and try again, "
+                "or set VISION_ENABLED=true in .env to skip the check."
+            ),
+        }
+
+    ok, err, fp = Safety.validate_path(workspace, path, must_exist=True)
+    if not ok:
+        return {"success": False, "error": err}
+    if not fp.is_file():
+        return {"success": False, "error": f"Not a file: {path}"}
+
+    mime = _VISION_MIME_MAP.get(fp.suffix.lower())
+    if not mime:
+        supported = ", ".join(sorted(_VISION_MIME_MAP.keys()))
+        return {
+            "success": False,
+            "error": (
+                f"Unsupported image type '{fp.suffix}'. "
+                f"Supported extensions: {supported}"
+            ),
+        }
+
+    try:
+        b64 = base64.b64encode(fp.read_bytes()).decode("utf-8")
+    except Exception as e:
+        return {"success": False, "error": f"Could not read image file: {e}"}
+
+    payload: Dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        "max_tokens": 1024,
+        "temperature": Config.TEMPERATURE,
+    }
+    if Config.LLM_MODEL:
+        payload["model"] = Config.LLM_MODEL
+
+    try:
+        resp = requests.post(
+            Config.LLM_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {Config.LLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        description = resp.json()["choices"][0]["message"]["content"]
+        return {
+            "success":     True,
+            "path":        str(fp.relative_to(workspace)).replace("\\", "/"),
+            "description": description,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Vision request failed: {e}"}
 
 
 # =============================================================================
@@ -174,9 +327,6 @@ def tool_write(workspace: Path, path: str, content: str) -> Dict[str, Any]:
     try:
         existed = fp.exists()
         fp.parent.mkdir(parents=True, exist_ok=True)
-        # FIX: fp.with_suffix(fp.suffix + ".tmp") raises ValueError for any file
-        # that already has an extension (e.g. ".py" + ".tmp" → ".py.tmp" is
-        # invalid for Path.with_suffix). Use fp.parent / (fp.name + ".tmp") instead.
         tmp = fp.parent / (fp.name + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         os.replace(str(tmp), str(fp))
@@ -197,7 +347,6 @@ def tool_edit(workspace: Path, path: str, search: str, replace: str) -> Dict[str
         success, new_content, msg = FileEditor.search_replace(content, search, replace)
         if not success:
             return {"success": False, "error": truncate_output(msg, 500)}
-        # FIX: same as tool_write — avoid ValueError from with_suffix on dotted names.
         tmp = fp.parent / (fp.name + ".tmp")
         tmp.write_text(new_content, encoding="utf-8")
         os.replace(str(tmp), str(fp))
@@ -238,10 +387,6 @@ def tool_grep(workspace: Path, pattern: str,
                     if fp.exists():
                         search_files.append(fp)
         else:
-            # FIX: use f.relative_to(workspace).parts instead of f.parts so that
-            # absolute path components like "/home" or "/usr" don't accidentally
-            # satisfy startswith("."), and hidden dirs like .git are correctly
-            # excluded — consistent with tool_ls and tool_glob behaviour.
             search_files = [
                 f for f in workspace.rglob("*")
                 if f.is_file()
@@ -324,27 +469,18 @@ def tool_shell(
 
     Sandbox backends (auto-selected):
       • Windows + pywin32  : Job Object — kill_on_job_close + memory limit.
-        The process tree is hard-killed the moment the handle closes, even if
-        Python itself crashes.
       • Windows, no pywin32: psutil tree-kill on timeout.
       • macOS / Linux      : new process group (os.setsid) + RLIMIT_AS +
         RLIMIT_CPU — entire group killed on timeout or error.
 
-    The command is validated by Safety.validate_command() before execution.
     stdout and stderr are merged; output is capped at 32 KB.
-
-    Install:
-        pip install psutil          # all platforms
-        pip install pywin32         # Windows only, for stronger Job Object backend
     """
-    # ── safety gate (same check used by _git_safe) ───────────────────────────
     ok, reason = Safety.validate_command(command, workspace)
     if not ok:
         return {"success": False, "error": f"Command blocked by safety check: {reason}"}
 
-    # ── clamp user-supplied limits to sane bounds ─────────────────────────────
-    timeout       = max(1, min(timeout, 120))           # 1 – 120 s
-    max_memory_mb = max(64, min(max_memory_mb, 2048))   # 64 MB – 2 GB
+    timeout       = max(1, min(timeout, 120))
+    max_memory_mb = max(64, min(max_memory_mb, 2048))
 
     try:
         output, exit_code = run_sandboxed(
@@ -366,7 +502,7 @@ def tool_shell(
 
 
 # =============================================================================
-# TOOL HANDLERS — GIT  (now sandboxed via _git_safe → run_sandboxed)
+# TOOL HANDLERS — GIT  (sandboxed via _git_safe → run_sandboxed)
 # =============================================================================
 
 def tool_git_status(workspace: Path) -> Dict[str, Any]:
@@ -403,9 +539,6 @@ def tool_git_diff(workspace: Path, path: str = "", staged: bool = False) -> Dict
             ok, err, resolved = Safety.validate_path(workspace, path)
             if not ok:
                 return {"success": False, "error": f"Invalid diff path: {err}"}
-            # FIX: use the Safety-resolved path relative to workspace in the git
-            # command rather than the raw user-supplied string. This prevents
-            # path-traversal inconsistencies between validation and execution.
             resolved_path = str(resolved.relative_to(workspace))
         cmd = "git diff"
         if staged:
@@ -689,7 +822,7 @@ def tool_task_reconcile(workspace: Path) -> Dict[str, Any]:
 
 
 # =============================================================================
-# SUB-AGENT CONTEXT HELPER
+# SUB-AGENT CONTEXT HELPER  (used by tool_task below)
 # =============================================================================
 
 def _build_parent_context(parent_messages: List[Dict[str, Any]],
@@ -724,8 +857,19 @@ def _build_parent_context(parent_messages: List[Dict[str, Any]],
 
 def tool_task(workspace: Path, task_type: str,
               instructions: str, file_path: str) -> Dict[str, Any]:
+    """Delegate file creation to an isolated sub-agent.
+
+    Uses a lazy import of run_sub_agent / SUB_AGENT_SYSTEM_PROMPT from
+    agent_llm to break the circular dependency:
+        agent_llm imports agent_tools (schemas/handlers at module level)
+        agent_tools lazy-imports agent_llm only when tool_task() is called
+    """
     if not Config.ENABLE_SUB_AGENTS:
         return {"success": False, "error": "Sub-agents disabled"}
+
+    # Lazy import — by call-time both modules are fully initialised.
+    from agent_llm import run_sub_agent, SUB_AGENT_SYSTEM_PROMPT  # noqa: PLC0415
+
     try:
         Log.task(f"Sub-agent: Create {task_type} → {file_path}")
         ctx             = get_current_context()
@@ -777,6 +921,10 @@ def tool_task(workspace: Path, task_type: str,
 # =============================================================================
 # TOOL REGISTRY
 # =============================================================================
+
+# TOOL_SCHEMAS is the full universe of possible tools.
+# Never pass this directly to LLMClient.call() — use get_available_tools() instead,
+# which filters out "vision" when no VLM is detected.
 
 TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {"type": "function", "function": {
@@ -951,6 +1099,34 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "name": "task_reconcile",
         "description": "Reconcile after rename/move operations. Re-enumerate from disk.",
         "parameters": {"type": "object", "properties": {}}}},
+
+    # ── vision (conditionally included by get_available_tools) ───────────────
+    {"type": "function", "function": {
+        "name": "vision",
+        "description": (
+            "Read and analyse an image file from the workspace using the loaded "
+            "vision model. Use this whenever the task involves an image, screenshot, "
+            "diagram, chart, photo, or other visual file. Pass the workspace-relative "
+            "path and an optional specific question about the image. "
+            "Only available when a vision-capable model (VLM) is loaded in LM Studio."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path to the image file (jpg, png, gif, webp)",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "What to ask about the image. "
+                        "Default: 'Describe this image in detail.'"
+                    ),
+                },
+            },
+            "required": ["path"],
+        }}},
 ]
 
 TOOL_HANDLERS: Dict[str, Callable] = {
@@ -977,902 +1153,93 @@ TOOL_HANDLERS: Dict[str, Callable] = {
     "task_state_update":  tool_task_state_update,
     "task_state_get":     tool_task_state_get,
     "task_reconcile":     tool_task_reconcile,
+    # vision: conditionally available — registered so dispatch works
+    "vision":             tool_vision,
 }
 
+# Tools that always require non-empty arguments — used by _parse_stream in agent_llm.
 _REQUIRED_ARG_TOOLS = frozenset({
     "shell",
     "write", "read", "edit", "glob", "grep", "ls", "mkdir",
     "todo_add", "todo_complete", "todo_update", "plan_complete_step",
     "git_add", "git_commit", "git_branch", "git_diff",
     "task",
+    "vision",
 })
 
-_llm_local = threading.local()
-
 
 # =============================================================================
-# LLM CLIENT
+# DYNAMIC TOOL LIST  ← use this everywhere instead of TOOL_SCHEMAS directly
 # =============================================================================
 
-class LLMClient:
-    _HEADERS: Dict[str, str] = {"Content-Type": "application/json"}
-
-    @classmethod
-    def _headers(cls) -> Dict[str, str]:
-        return {**cls._HEADERS, "Authorization": f"Bearer {Config.LLM_API_KEY}"}
-
-    @classmethod
-    def _tool_choice_rejected(cls) -> bool:
-        return getattr(_llm_local, "tool_choice_rejected", False)
-
-    @classmethod
-    def _set_tool_choice_rejected(cls, val: bool) -> None:
-        _llm_local.tool_choice_rejected = val
-
-    @staticmethod
-    def validate_connection() -> Optional[str]:
-        try:
-            r = requests.post(
-                Config.LLM_URL,
-                json={"messages": [{"role": "user", "content": "test"}], "max_tokens": 1},
-                headers=LLMClient._headers(), timeout=10,
-            )
-            if r.status_code == 200: return None
-            if r.status_code == 401: return "Authentication failed"
-            return f"HTTP {r.status_code}"
-        except requests.ConnectionError:
-            return f"Cannot connect to {Config.LLM_URL}"
-        except Exception as e:
-            return f"Connection error: {e}"
-
-    @classmethod
-    def _build_payload(cls, messages: List[Dict[str, Any]],
-                        tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "messages":    messages,
-            "temperature": Config.TEMPERATURE,
-            "stream":      True,
-        }
-        if Config.LLM_MODEL:      payload["model"]      = Config.LLM_MODEL
-        if Config.MAX_TOKENS > 0: payload["max_tokens"] = Config.MAX_TOKENS
-        if Config.THINKING_MODEL:
-            payload["max_tokens"] = max(payload.get("max_tokens", 0) or 0,
-                                        Config.THINKING_MAX_TOKENS)
-            if payload.get("temperature", 0) > 0.7:
-                Log.warning("High temperature with thinking model — consider TEMPERATURE<=0.6")
-        if tools:
-            payload["tools"] = tools
-            if not cls._tool_choice_rejected():
-                payload["tool_choice"] = "auto"
-        return payload
-
-    @staticmethod
-    def _wait_for_server(max_wait: int = 60) -> bool:
-        Log.info(f"Waiting for LLM server (up to {max_wait}s)…")
-        deadline, interval = time.time() + max_wait, 3
-        while time.time() < deadline:
-            time.sleep(interval)
-            try:
-                r = requests.post(
-                    Config.LLM_URL,
-                    json={"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
-                    headers=LLMClient._headers(), timeout=5,
-                )
-                if r.status_code in (200, 400, 401):
-                    Log.success("LLM server back online.")
-                    return True
-            except Exception:
-                pass
-            interval = min(interval + 2, 10)
-        Log.error("LLM server did not recover in time.")
-        return False
-
-    @classmethod
-    def call(cls, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
-             stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
-        payload    = cls._build_payload(messages, tools)
-        last_error: Optional[str] = None
-        for attempt in range(1, Config.LLM_MAX_RETRIES + 1):
-            try:
-                resp = requests.post(
-                    Config.LLM_URL, json=payload, headers=cls._headers(),
-                    stream=True, timeout=Config.LLM_TIMEOUT,
-                )
-                if resp.status_code == 400 and "tool_choice" in (resp.text or "").lower():
-                    Log.warning("Model rejected tool_choice — disabling for this session")
-                    cls._set_tool_choice_rejected(True)
-                    payload.pop("tool_choice", None)
-                    resp = requests.post(
-                        Config.LLM_URL, json=payload, headers=cls._headers(),
-                        stream=True, timeout=Config.LLM_TIMEOUT,
-                    )
-                if resp.status_code in (500, 503):
-                    Log.warning(f"LLM returned {resp.status_code} — waiting for recovery")
-                    if cls._wait_for_server(60):
-                        Log.info(f"Retrying after recovery (attempt {attempt})")
-                        continue
-                    last_error = f"HTTP {resp.status_code} and server did not recover"
-                    break
-                resp.raise_for_status()
-                return cls._parse_stream(resp, stream_callback)
-            except requests.ConnectionError as e:
-                last_error = str(e)
-                Log.warning(f"Connection lost (attempt {attempt}): {e}")
-                if cls._wait_for_server(60) and attempt < Config.LLM_MAX_RETRIES:
-                    continue
-                break
-            except requests.Timeout as e:
-                last_error = str(e)
-                Log.warning(f"Request timed out (attempt {attempt}): {e}")
-                if attempt < Config.LLM_MAX_RETRIES:
-                    time.sleep(Config.LLM_RETRY_DELAY * attempt)
-            except requests.RequestException as e:
-                last_error = str(e)
-                if attempt < Config.LLM_MAX_RETRIES:
-                    Log.warning(f"LLM error (attempt {attempt}): {e}")
-                    time.sleep(Config.LLM_RETRY_DELAY * attempt)
-        return {"error": f"LLM failed after {Config.LLM_MAX_RETRIES} attempts: {last_error}"}
-
-    @staticmethod
-    def _parse_stream(resp, stream_callback: Optional[Callable[[str], None]]) -> Dict[str, Any]:
-        content       = ""
-        tool_calls: Dict[int, Dict[str, Any]] = {}
-        next_idx      = 0
-        finish_reason = None
-        in_think      = False
-
-        resp.encoding = "utf-8"
-
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "): continue
-            data = line[6:].strip()
-            if data == "[DONE]": break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-            choices = chunk.get("choices", [])
-            if not choices: continue
-            choice = choices[0]
-            delta  = choice.get("delta", {})
-
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-
-            raw_content = delta.get("content")
-            if raw_content:
-                content += raw_content
-                if stream_callback:
-                    for part in re.split(r'(</?think>)', raw_content, flags=re.IGNORECASE):
-                        if not part: continue
-                        if part.lower() == "<think>":
-                            in_think = True
-                        elif part.lower() == "</think>":
-                            in_think = False
-                        elif in_think:
-                            sys.stdout.write(colored(part, Colors.GRAY))
-                            sys.stdout.flush()
-                        else:
-                            stream_callback(part)
-
-            thinking_blocks = delta.get("thinking")
-            if isinstance(thinking_blocks, list) and stream_callback:
-                for tb in thinking_blocks:
-                    if tb.get("thinking"):
-                        sys.stdout.write(colored(tb["thinking"], Colors.GRAY))
-                        sys.stdout.flush()
-
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", next_idx)
-                if idx not in tool_calls:
-                    tool_calls[idx] = {
-                        "id":       tc.get("id", f"tc_{idx}"),
-                        "type":     "function",
-                        "function": {"name": None, "arguments": ""},
-                    }
-                    next_idx += 1
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    tool_calls[idx]["function"]["name"] = fn["name"]
-                if isinstance(fn.get("arguments"), str):
-                    tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-
-        if content and stream_callback:
-            stream_callback("\n")
-
-        calls, incomplete = [], False
-        for i in sorted(tool_calls):
-            tc      = tool_calls[i]
-            fn_name = tc["function"]["name"]
-
-            if not fn_name:
-                Log.warning(f"Tool call {i} missing name — skipping")
-                incomplete = True
-                continue
-
-            args_str = tc["function"]["arguments"]
-            Log.info(f"[PARSE] '{fn_name}' args length={len(args_str)} "
-                     f"first100={repr(args_str[:100])}")
-
-            is_empty = not args_str or not args_str.strip()
-
-            if is_empty or args_str.strip() == "{}":
-                if fn_name in _REQUIRED_ARG_TOOLS:
-                    Log.error(f"'{fn_name}' received empty/bare args — "
-                              f"finish_reason={finish_reason!r}")
-                    incomplete = True
-                    tc["function"]["arguments"] = "{}"
-                    tc["_truncated"] = True
-                    calls.append(tc)
-                    continue
-                tc["function"]["arguments"] = "{}"
-                calls.append(tc)
-                continue
-
-            try:
-                json.loads(args_str)
-                calls.append(tc)
-            except json.JSONDecodeError as parse_err:
-                Log.error(f"[PARSE] '{fn_name}' JSON decode failed at pos "
-                          f"{parse_err.pos}: {parse_err.msg} — "
-                          f"tail={repr(args_str[-80:])}")
-                repaired = False
-                if len(args_str) < 500:
-                    opens, closes = args_str.count("{"), args_str.count("}")
-                    if opens > closes:
-                        candidate = args_str + "}" * (opens - closes)
-                        try:
-                            json.loads(candidate)
-                            tc["function"]["arguments"] = candidate
-                            Log.info(f"[PARSE] Auto-repaired '{fn_name}': "
-                                     f"added {opens - closes} brace(s)")
-                            incomplete = True
-                            calls.append(tc)
-                            repaired = True
-                        except json.JSONDecodeError:
-                            pass
-                if not repaired:
-                    Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
-                              f"({'short' if len(args_str) < 500 else 'large'} payload, "
-                              f"{len(args_str)} chars)")
-                    incomplete = True
-                    tc["function"]["arguments"] = "{}"
-                    tc["_truncated"] = True
-                    calls.append(tc)
-
-        if finish_reason == "length":
-            Log.warning("⚠️  Generation stopped: output token limit hit (finish_reason=length)")
-            incomplete = True
-        elif finish_reason == "stop" and incomplete:
-            Log.warning("⚠️  finish_reason=stop but tool calls were incomplete")
-        elif finish_reason is None and incomplete:
-            Log.warning("⚠️  finish_reason=None — stream may have ended prematurely")
-
-        clean_content, _ = strip_thinking(content)
-        return {
-            "content":       clean_content,
-            "tool_calls":    calls or None,
-            "incomplete":    incomplete,
-            "finish_reason": finish_reason,
-        }
-
-
-# =============================================================================
-# COMPLETION DETECTION
-# =============================================================================
-
-_SKIP_PREFIXES = ("#", "//", "/*", "*", "--", "<!--", "'")
-_SKIP_KEYWORDS = ("print(", "return ", "def ", "class ")
-_ASKING_PHRASES = ("would you like", "what would you", "should i")
-
-
-def detect_completion(content: str, has_tool_calls: bool) -> Tuple[bool, str]:
-    if "TASK_COMPLETE" in content.upper() and not has_tool_calls:
-        for line in content.split("\n"):
-            if "TASK_COMPLETE" not in line.upper(): continue
-            stripped = line.strip()
-            if any(stripped.startswith(p) for p in _SKIP_PREFIXES): continue
-            if any(k in stripped.lower() for k in _SKIP_KEYWORDS): continue
-            return True, "Explicit TASK_COMPLETE"
-    if not has_tool_calls and len(content.strip()) > 50:
-        if any(q in content.lower() for q in _ASKING_PHRASES):
-            return False, "Asking for input"
-        return True, "Answer without tools"
-    return False, "Not complete"
-
-
-# =============================================================================
-# PERMISSION SYSTEM
-# =============================================================================
-
-def should_ask_permission(tool_name: str, mode: PermissionMode) -> bool:
-    if mode == PermissionMode.AUTO:   return False
-    if mode == PermissionMode.MANUAL: return True
-    return tool_name in Config.DESTRUCTIVE_TOOLS
-
-
-def ask_permission(tool_name: str, args: Dict[str, Any]) -> Tuple[bool, Optional[PermissionMode]]:
-    sep = colored("─" * 60, Colors.YELLOW)
-    print(f"\n{sep}")
-    print(colored(f"  ⚡ Permission needed: {tool_name}", Colors.YELLOW, bold=True))
-    print(sep)
-    print(json.dumps(args, indent=2))
-    print(sep)
-    response = input(colored("\n  Allow? [y/n/auto]: ", Colors.YELLOW)).lower().strip()
-    if response == "auto":
-        print(colored("  → Auto-approve mode enabled for this session", Colors.GREEN))
-        return True, PermissionMode.AUTO
-    return (True, None) if response in ("y", "yes") else (False, None)
-
-
-# =============================================================================
-# SYSTEM PROMPTS
-# =============================================================================
-
-SYSTEM_PROMPT = """You are a skilled, proactive digital coworker with real tools that make real changes.
-
-{soul_section}
-
-════════════════════════════════════════════════════
-CORE RULE
-════════════════════════════════════════════════════
-
-Every iteration: call a tool OR output TASK_COMPLETE. No other output is valid.
-
-════════════════════════════════════════════════════
-TASK_COMPLETE
-════════════════════════════════════════════════════
-
-Output TASK_COMPLETE the moment the deliverable exists and is verified.
-It is a hard stop — nothing follows it, ever.
-
-Output TASK_COMPLETE when ANY of these are true:
-  • You verified the file/output exists and is correct
-  • todo_complete returned all_complete: true
-  • The user's question has been answered
-  • The plan is finished and verified
-
-Do NOT delay TASK_COMPLETE to summarize, narrate completion, re-verify, or explain reasoning.
-
-════════════════════════════════════════════════════
-EXECUTION RULES
-════════════════════════════════════════════════════
-
-0. STOP THE MOMENT THE JOB IS DONE
-   Deliverable verified → TASK_COMPLETE. No exceptions.
-
-1. VERIFY ONCE, THEN STOP
-   After write/edit → verify with read or ls exactly once.
-   Pass → TASK_COMPLETE. Fail → one fix attempt, then TASK_COMPLETE or BLOCKED.
-
-2. ALL MEANS ALL — COUNT FIRST
-   "All files" → enumerate with glob/ls, process each, then TASK_COMPLETE.
-   Do not re-enumerate files already processed.
-
-3. EXECUTE, DON'T SCRIPT
-   Make changes directly. Exception: if the task IS to write a script, write it then TASK_COMPLETE.
-
-4. TODOS — STRICT RULES
-   • todo_complete each ID exactly once — never twice
-   • todo_complete returns all_complete: true → TASK_COMPLETE immediately
-   • Never add todos after execution has started
-   • Todos are bookkeeping only — they never gate TASK_COMPLETE
-
-5. SELF-CORRECT ONCE
-   Error → read it → adapt → one retry with a different approach.
-   Same error twice → BLOCKED.
-
-6. NO REDUNDANT WORK
-   Succeeded → don't repeat. Verified → don't re-verify. Done → TASK_COMPLETE.
-
-════════════════════════════════════════════════════
-LOOP PREVENTION
-════════════════════════════════════════════════════
-
-Before every tool call, confirm:
-  1. Did this exact operation already succeed this session? → Skip it.
-  2. Have I verified the deliverable exists? → TASK_COMPLETE.
-  3. Am I about to todo_complete an already-completed ID? → TASK_COMPLETE.
-  4. Have I done 3+ iterations without meaningful new output? → TASK_COMPLETE or BLOCKED.
-
-════════════════════════════════════════════════════
-TOOL CALL DISCIPLINE
-════════════════════════════════════════════════════
-
-Every call needs ALL required arguments:
-
-  write  → "path" AND "content" (complete file, no placeholders)
-  read   → "path"
-  edit   → "path", "search", "replace"
-  shell  → "command" (timeout and max_memory_mb optional)
-
-When unsure of a path: ls or glob first, then act.
-
-════════════════════════════════════════════════════
-WORKFLOW
-════════════════════════════════════════════════════
-
-  Phase 1 — Orient : glob/ls/read to understand scope (skip if task is obvious)
-  Phase 2 — Execute: act and verify each step once
-  Phase 3 — Confirm: deliverable exists and is correct (one check)
-  Phase 4 — Done   : TASK_COMPLETE
-
-  One file task? Skip Phase 1. Write it, verify it, TASK_COMPLETE.
-
-════════════════════════════════════════════════════
-SCHEDULED WAIT PROTOCOL
-════════════════════════════════════════════════════
-
-To pause until a future time:
-
-  WAIT: <ISO_datetime>: <reason>
-  Example: WAIT: 2026-03-01T09:00:00: Waiting for market open.
-
-  • Must be a future datetime: YYYY-MM-DDTHH:MM:SS
-  • Do NOT follow WAIT with TASK_COMPLETE
-
-════════════════════════════════════════════════════
-WHEN YOU'RE STUCK
-════════════════════════════════════════════════════
-
-Output exactly:
-
-  BLOCKED:
-  Reason: <one sentence>
-  Failed operation: <tool name>
-  Error received: <exact error>
-  What I need: <specific requirement>
-
-════════════════════════════════════════════════════
-TOOLS
-════════════════════════════════════════════════════
-
-  Files:      read, write, edit, glob, grep, ls, mkdir
-  Shell:      shell (sandboxed — timeout 30s, memory 512MB by default)
-  Git:        git_status, git_diff, git_add, git_commit, git_branch
-  Todos:      todo_add, todo_complete, todo_update, todo_list
-  Task State: task_state_update, task_state_get, task_reconcile
-  Planning:   plan_complete_step
-  Delegation: task (sub-agent for a single file — once per file maximum)
-
-Shell sandbox backends (selected automatically):
-  Windows + pywin32   → Job Object (process tree killed on handle close)
-  Windows, no pywin32 → psutil tree-kill
-  macOS / Linux       → process group + RLIMIT_AS + RLIMIT_CPU
-"""
-
-SUB_AGENT_SYSTEM_PROMPT = """You are a precise file-creation agent. One job: create the file exactly as specified.
-
-Rules:
-  • 2 sentences of reasoning max — then write immediately
-  • write requires both "path" AND complete "content" — no placeholders
-  • After writing: read it back once to verify
-  • Verified correct → TASK_COMPLETE
-  • Failed or wrong → BLOCKED: <one line reason>
-  • Never loop. Never ask questions. Never plan.
-
-TASK_COMPLETE means stop. Nothing follows it.
-
-Tools available: write, read, edit, ls, glob
-"""
-
-PLAN_MODE_PROMPT = """You are in PLAN MODE. Produce a concrete, actionable plan. Do not execute anything.
-
-Think briefly (3 sentences max), then output the JSON immediately.
-
-Consider:
-  • What is actually in scope?
-  • What is the correct order and what has dependencies?
-  • Where are the failure risks?
-  • How is each step verified as done?
-
-OUTPUT FORMAT — valid JSON only, no text before or after:
-
-{
-  "title": "Short descriptive title",
-  "goal": "One sentence: what does done look like?",
-  "risk_areas": ["Risk 1", "Risk 2"],
-  "steps": [
-    {
-      "id": "step_1",
-      "description": "Concrete action — specific enough to execute without clarification",
-      "verification": "Exact check that proves this step is complete",
-      "risk": "low|medium|high",
-      "dependencies": []
-    }
-  ]
-}
-
-After the JSON, output exactly:
-PLAN_APPROVED
-"""
-
-
-# =============================================================================
-# SUB-AGENT EXECUTION  (shell intentionally excluded — sub-agents are file-only)
-# =============================================================================
-
-_SUB_AGENT_TOOL_NAMES = frozenset({"write", "read", "edit", "ls", "glob"})
-
-
-def run_sub_agent(
-    messages: List[Dict[str, Any]],
-    workspace: Path,
-    session_id: str,
-    max_iterations: int,
-    stream_callback: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
-    available_tools = [t for t in TOOL_SCHEMAS
-                       if t["function"]["name"] in _SUB_AGENT_TOOL_NAMES]
-    detector = LoopDetector()
-
-    parent_ctx   = get_current_context()
-    sub_todo_mgr = TodoManager(workspace, session_id)
-    sub_plan_mgr = PlanManager(workspace, session_id)
-    sub_task_mgr = TaskStateManager(workspace, session_id)
-    set_tool_context(
-        workspace, session_id,
-        sub_todo_mgr, sub_plan_mgr, sub_task_mgr,
-        messages, mode=parent_ctx.get("mode", "interactive"),
-        stream_callback=stream_callback,
-    )
-
-    try:
-        for iteration in range(1, max_iterations + 1):
-            loop_msg = detector.check(iteration)
-            if loop_msg:
-                return {"status": "error", "output": f"Sub-agent stalled: {loop_msg}",
-                        "iterations": iteration}
-
-            response = LLMClient.call(messages, available_tools,
-                                      stream_callback=stream_callback)
-            if "error" in response:
-                return {"status": "error", "output": response["error"],
-                        "iterations": iteration}
-
-            content    = response.get("content", "")
-            tool_calls = response.get("tool_calls") or []
-
-            if not content and not tool_calls:
-                detector.track_empty()
-                continue
-
-            if detect_completion(content, bool(tool_calls))[0]:
-                return {"status": "completed", "output": "File created",
-                        "iterations": iteration}
-
-            assistant_msg: Dict[str, Any] = {"role": "assistant"}
-            if content:    assistant_msg["content"]    = content
-            if tool_calls: assistant_msg["tool_calls"] = tool_calls
-            messages.append(assistant_msg)
-
-            for tc in tool_calls:
-                fn_name, args_raw, tc_id = _unpack_tc(tc, f"tc_{iteration}")
-                args, err = _parse_tool_args(fn_name, args_raw)
-
-                if err:
-                    detector.track_error()
-                    messages.append({
-                        "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                        "content": json.dumps({"success": False, "error": err}),
-                    })
-                    continue
-
-                handler = TOOL_HANDLERS.get(fn_name)
-                try:
-                    result  = (handler(workspace, **args) if handler
-                               else {"success": False, "error": f"Unknown tool: {fn_name}"})
-                    success = result.get("success", False)
-                    detector.track_tool(fn_name, args, success)
-                    if success: detector.track_success(iteration)
-                    else:       detector.track_error()
-                except Exception as e:
-                    result = {"success": False, "error": str(e)}
-                    detector.track_error()
-                    detector.track_tool(fn_name, args, False)
-
-                messages.append({
-                    "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                    "content": json.dumps(result),
-                })
-
-        return {"status": "max_iterations",
-                "output": "Sub-agent reached max iterations",
-                "iterations": max_iterations}
-
-    finally:
-        set_current_context(parent_ctx)
-
-
-# =============================================================================
-# PLAN MODE EXECUTION
-# =============================================================================
-
-_PLAN_TOOL_NAMES = frozenset({"ls", "read", "glob", "grep", "git_status"})
-
-
-def run_plan_mode(task: str, workspace: Path) -> Optional[Dict[str, Any]]:
-    Log.plan("Building execution plan…")
-    messages = [
-        {"role": "system", "content": PLAN_MODE_PROMPT},
-        {"role": "user",   "content": f"Create plan for:\n\n{task}"},
-    ]
-    planning_tools = [t for t in TOOL_SCHEMAS
-                      if t["function"]["name"] in _PLAN_TOOL_NAMES]
-
-    for iteration in range(1, 11):
-        response = LLMClient.call(messages, planning_tools)
-        if "error" in response:
-            Log.error(f"Planning failed: {response['error']}")
-            return None
-
-        content    = response.get("content", "")
-        tool_calls = response.get("tool_calls") or []
-
-        assistant_msg: Dict[str, Any] = {"role": "assistant"}
-        if content:    assistant_msg["content"]    = content
-        if tool_calls: assistant_msg["tool_calls"] = tool_calls
-        messages.append(assistant_msg)
-
-        if "PLAN_APPROVED" in content:
-            for msg in reversed(messages):
-                if msg.get("role") != "assistant": continue
-                body = msg.get("content", "")
-                if "steps" not in body or "{" not in body: continue
-                try:
-                    start     = body.find("{")
-                    end       = body.rfind("}") + 1
-                    plan_data = json.loads(body[start:end])
-                    for step in plan_data.get("steps", []):
-                        step.setdefault("status", "pending")
-                    return plan_data
-                except json.JSONDecodeError:
-                    pass
-
-        for tc in tool_calls:
-            fn_name, args_raw, tc_id = _unpack_tc(tc, f"tc_p{iteration}")
-            args, err = _parse_tool_args(fn_name, args_raw)
-            if err:
-                messages.append({
-                    "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                    "content": json.dumps({"success": False, "error": err}),
-                })
-                continue
-            handler = TOOL_HANDLERS.get(fn_name)
-            try:
-                result = (handler(workspace, **args) if handler
-                          else {"success": False, "error": "Not available in plan mode"})
-            except Exception as e:
-                result = {"success": False, "error": str(e)}
-            messages.append({
-                "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                "content": json.dumps(result),
-            })
-
-    Log.warning("Plan mode: max iterations reached without PLAN_APPROVED")
-    return None
-
-
-# =============================================================================
-# TOOL EXECUTION HELPERS
-# =============================================================================
-
-def _execute_tool(
-    fn_name: str,
-    args: Dict[str, Any],
-    workspace: Path,
-    available_tools: List[Dict],
-    detector: LoopDetector,
-    iteration: int,
-    mcp_manager: Any,
-    emit: Callable,
-) -> Dict[str, Any]:
-    schema = next((t for t in available_tools if t["function"]["name"] == fn_name), None)
-    if schema:
-        missing = [p for p in schema["function"]["parameters"].get("required", [])
-                   if p not in args]
-        if missing:
-            detector.track_error()
-            return {"success": False,
-                    "error": f"Missing required parameters: {missing}. Got: {list(args.keys())}"}
-
-    if len(json.dumps(args)) < 5:
-        emit("warning", {"message": f"Very short args for '{fn_name}': {args}"})
-
-    try:
-        if fn_name.startswith("mcp_"):
-            mcp_result = mcp_manager.call_tool(fn_name, args)
-            if not mcp_result.get("success"):
-                detector.track_error()
-                detector.track_tool(fn_name, args, False)
-                return {"success": False, "error": mcp_result.get("error", "MCP call failed")}
-            blocks = mcp_result.get("result", {}).get("content", [])
-            if isinstance(blocks, list) and blocks:
-                text_parts = [b["text"] for b in blocks
-                              if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
-                if text_parts:
-                    detector.track_success(iteration)
-                    detector.track_tool(fn_name, args, True)
-                    return {"success": True, "output": "\n\n".join(text_parts)}
-                detector.track_error()
-                detector.track_tool(fn_name, args, False)
-                return {"success": False,
-                        "error": f"MCP returned {len(blocks)} block(s) with no text"}
-            elif isinstance(blocks, list):
-                detector.track_error()
-                detector.track_tool(fn_name, args, False)
-                return {"success": False, "error": "MCP returned empty content"}
-            else:
-                detector.track_success(iteration)
-                detector.track_tool(fn_name, args, True)
-                return {"success": True, "output": str(mcp_result.get("result", {})),
-                        "warning": "Non-standard MCP response format"}
-
-        handler = TOOL_HANDLERS.get(fn_name)
-        if not handler:
-            detector.track_error()
-            detector.track_tool(fn_name, args, False)
-            return {"success": False, "error": f"Unknown tool: {fn_name}"}
-
-        result  = handler(workspace, **args)
-        success = result.get("success", False)
-        detector.track_tool(fn_name, args, success)
-        if success: detector.track_success(iteration)
-        else:       detector.track_error()
-        return result
-
-    except Exception as e:
-        emit("error", {"message": f"Tool exception in '{fn_name}': {e}"})
-        detector.track_error()
-        detector.track_tool(fn_name, args, False)
-        return {"success": False, "error": str(e)}
-
-
-def _process_tool_calls(
-    tool_calls: List[Dict],
-    workspace: Path,
-    available_tools: List[Dict],
-    detector: LoopDetector,
-    iteration: int,
-    mcp_manager: Any,
-    messages: List[Dict],
-    current_permission_mode: PermissionMode,
-    emit: Callable,
-) -> PermissionMode:
-    """Execute all tool calls for one agent iteration.
-
-    Returns the (possibly updated) permission mode.
-
-    FIX: removed the dead had_rename_op bool that was always returned as False.
-    Update callers that previously unpacked two values:
-        _, current_permission_mode = _process_tool_calls(...)   # old
-        current_permission_mode    = _process_tool_calls(...)   # new
+def get_available_tools(
+    extra_schemas: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Return the tool list to pass to LLMClient.call() for the current session.
+
+    The "vision" tool is included only when _detect_vision_support() returns True.
+
+    Args:
+        extra_schemas: Additional tool schemas to merge in (e.g. from MCP servers).
+                       Extra schemas are deduplicated by name; extras win on collision.
+
+    Usage:
+        available_tools = get_available_tools(extra_schemas=mcp_manager.get_all_tools())
+
+        # Force a fresh vision probe after user switches models:
+        vision_cache_invalidate()
+        available_tools = get_available_tools(...)
     """
-    todo_op_count = 0
-    total_calls   = len(tool_calls)
+    has_vision = _detect_vision_support()
 
-    for tc in tool_calls:
-        fn_name, args_raw, tc_id = _unpack_tc(tc, f"tc_{iteration}")
-        args, err = _parse_tool_args(fn_name, args_raw)
+    tools = [
+        t for t in TOOL_SCHEMAS
+        if t["function"]["name"] != "vision" or has_vision
+    ]
 
-        if err:
-            emit("error", {"message": err})
-            detector.track_error()
-            messages.append({
-                "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                "content": json.dumps({"success": False, "error": err}),
-            })
-            continue
+    if extra_schemas:
+        existing_names = {t["function"]["name"] for t in tools}
+        for schema in extra_schemas:
+            name = (schema.get("function") or {}).get("name", "")
+            if name and name not in existing_names:
+                tools.append(schema)
+                existing_names.add(name)
 
-        if should_ask_permission(fn_name, current_permission_mode):
-            allowed, new_mode = ask_permission(fn_name, args)
-            if not allowed:
-                messages.append({
-                    "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                    "content": json.dumps({"success": False, "error": "Permission denied"}),
-                })
-                continue
-            if new_mode:
-                current_permission_mode = new_mode
-
-        emit("tool_call", {"name": fn_name, "args_preview": json.dumps(args)[:80]})
-        result = _execute_tool(fn_name, args, workspace, available_tools,
-                               detector, iteration, mcp_manager, emit)
-
-        if fn_name.startswith("todo_"):
-            todo_op_count += 1
-
-        if result.get("success"):
-            emit("tool_result", {"name": fn_name, "success": True,
-                                  "summary": str(result)[:200]})
-            if fn_name == "todo_complete" and result.get("all_complete"):
-                emit("log", {"message": "✓ All todos complete"})
-                messages.append({
-                    "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                    "content": json.dumps(result),
-                })
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "✅ ALL TODOS COMPLETE.\n\n"
-                        "Your task is finished. Output TASK_COMPLETE right now.\n"
-                        "Do NOT call any more tools."
-                    ),
-                })
-                continue
-        else:
-            emit("tool_result", {"name": fn_name, "success": False,
-                                  "error": result.get("error", "")[:200]})
-            if (fn_name == "todo_complete"
-                    and result.get("already_completed")
-                    and result.get("all_complete")):
-                emit("warning", {"message": "Loop: completing already-done todo"})
-                messages.append({
-                    "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-                    "content": json.dumps(result),
-                })
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "⚠️ LOOP DETECTED: You are re-completing finished todos.\n\n"
-                        "ALL TODOS ARE DONE. Output TASK_COMPLETE now."
-                    ),
-                })
-                continue
-
-        result_str = json.dumps(result)
-        if len(result_str) > Config.MAX_TOOL_OUTPUT:
-            result_str = truncate_output(result_str, Config.MAX_TOOL_OUTPUT, fn_name)
-            result = {"success": result.get("success", False),
-                      "truncated": True, "data": result_str}
-
-        messages.append({
-            "role": "tool", "tool_call_id": tc_id, "name": fn_name,
-            "content": json.dumps(result),
-        })
-
-    if todo_op_count > 0 and todo_op_count == total_calls:
-        todo_mgr = get_current_context().get("todo_manager")
-        if todo_mgr:
-            still_pending = [t for t in todo_mgr.list_all().get("todos", [])
-                             if t["status"] not in ("completed", "blocked")]
-            if not still_pending:
-                emit("warning", {"message": "Todo-only iteration, nothing pending → hard stop"})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "⚠️ HARD STOP: You've been doing todo bookkeeping with nothing left to do.\n\n"
-                        "If your deliverable is verified → output TASK_COMPLETE\n"
-                        "If blocked → output BLOCKED: <reason>\n"
-                        "No more todo calls."
-                    ),
-                })
-
-    return current_permission_mode
+    return tools
 
 
 # =============================================================================
-# STREAMING HEADER HELPER
+# BACKWARD-COMPAT RE-EXPORTS
+#
+# Everything that lived in agent_tools.py before the split is still importable
+# from agent_tools.  External files need zero changes.
+#
+# HOW THE CIRCULAR IMPORT IS AVOIDED:
+#   1. Python starts loading agent_tools (this file).
+#   2. All tool handlers, TOOL_SCHEMAS, TOOL_HANDLERS, get_available_tools
+#      are fully defined above this point.
+#   3. This block triggers agent_llm to load.
+#   4. agent_llm does `from agent_tools import ...` — Python finds agent_tools
+#      already in sys.modules (partially loaded) but with everything it needs
+#      already defined (steps 1-2 above).  Import succeeds.
+#   5. agent_llm finishes loading.
+#   6. The names below are bound in this module's namespace.
+#
+# tool_task uses a *call-time* lazy import of run_sub_agent/SUB_AGENT_SYSTEM_PROMPT
+# so there is no module-level cycle from that direction either.
 # =============================================================================
 
-class _HeaderStreamCb:
-    def __init__(self, inner_cb: Optional[Callable[[str], None]], mode: str):
-        self._inner   = inner_cb
-        self._mode    = mode
-        self._printed = False
-
-    def reset(self) -> None:
-        self._printed = False
-
-    @property
-    def printed(self) -> bool:
-        return self._printed
-
-    def __call__(self, token: str) -> None:
-        if not self._printed and self._mode == "interactive":
-            self._printed = True
-            sys.stdout.write(colored("\nAssistant:\n\n", Colors.CYAN, bold=True))
-            sys.stdout.flush()
-        if self._inner:
-            self._inner(token)
+from agent_llm import (  # noqa: E402, F401
+    LLMClient,
+    detect_completion,
+    should_ask_permission,
+    ask_permission,
+    SYSTEM_PROMPT,
+    SUB_AGENT_SYSTEM_PROMPT,
+    PLAN_MODE_PROMPT,
+    run_sub_agent,
+    run_plan_mode,
+    _execute_tool,
+    _process_tool_calls,
+    _HeaderStreamCb,
+)
