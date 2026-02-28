@@ -1,90 +1,7 @@
 #!/usr/bin/env python3
 """
 agent_main.py — Main entrypoint for LMAgent.
-
-Contains: run_agent(), run_scheduler(), interactive REPL,
-slash commands, and the CLI argument parser.
-
-Usage:
-  python agent_main.py                        # Interactive REPL + background scheduler
-  python agent_main.py "task description"     # One-shot mode
-  python agent_main.py --resume SESSION_ID    # Resume session
-  python agent_main.py --plan "task"          # Plan mode
-  python agent_main.py --list-sessions        # List sessions
-  python agent_main.py --scheduler            # Scheduler daemon only
-  python agent_main.py --submit "task"        # Submit task to running scheduler
-
-BUG FIX (v9.3.2):
-  Tool calls now execute BEFORE completion is detected.
-  Previously, detect_completion() ran before _process_tool_calls(), so if the
-  LLM emitted TASK_COMPLETE in the same response as a tool call (common with
-  thinking models), the agent exited before the tool was ever executed.
-  The fix: execute tool_calls first, then run detect_completion().
-
-SECURITY (v9.3.2-sec):
-  _pick_workspace() now resolves every candidate path to its absolute, canonical
-  form and refuses to proceed if the chosen path cannot be created or written to.
-  Config.WORKSPACE is pinned to the resolved absolute path via _lock_workspace()
-  before ANY other code runs, so it is impossible for shell commands or path
-  traversal to silently escape the sandbox.
-
-  agent_core.Safety.validate_command() now receives the workspace Path and
-  rejects any shell command that references an absolute path outside it.
-  See agent_core.py and the SHELL_WORKSPACE_ONLY config flag.
-
-FIXES (v9.3.4-fix):
-  [1] CRITICAL — _had_truncation key mismatch:
-      run_agent() checked tc.get("_had_truncation") but _parse_stream() sets
-      tc["_truncated"]. The wrong key meant truncated tool calls were SILENTLY
-      IGNORED on every run; the agent proceeded to detect_completion() on
-      garbage partial arguments.  Fixed: use tc.get("_truncated").
-
-  [2] CRITICAL — Double retry loop:
-      run_agent() wrapped LLMClient.call() in its own while-retry loop.
-      LLMClient.call() already retries internally (Config.LLM_MAX_RETRIES
-      times with exponential backoff), so the outer loop stacked up to
-      4×3 = 12 LLM attempts and added up to 14 extra sleep seconds per
-      iteration.  Fixed: outer retry loop removed; LLM errors are handled
-      inline with a single call.
-
-  [3] BUG — Wrong config attribute name:
-      getattr(Config, "MAX_LLM_RETRIES", 3) silently returned 3 on every
-      run because the attribute is Config.LLM_MAX_RETRIES.  Fixed along
-      with [2] (outer loop removed entirely).
-
-  [4] SECURITY — .env newline/quote injection in _pick_workspace():
-      A workspace path containing '"' broke the quoted .env value; a path
-      containing '\\n' injected arbitrary lines (e.g. PATH=/attacker/bin).
-      Fixed: _sanitize_env_value() strips control characters and rejects
-      embedded double-quotes before writing.
-
-  [5] BUG — Dead _hold_lock parameter:
-      run_agent() accepted _hold_lock: bool = True but never read it.
-      The scheduler passed _hold_lock=False believing it prevented
-      double-locking; it did nothing.  Fixed: parameter removed.
-
-  [6] FRAGILE — Module attribute patching:
-      main() did _core_mod._instance_lock = instance_lock to share the
-      lock with agent_core.  Fixed: replaced with the already-imported
-      _core_instance_lock binding.
-
-  [7] BUG — Unreachable / type-unsafe post-loop guard:
-      After the outer retry loop, a "response is None" guard was
-      unreachable (the loop always assigns response or returns early).
-      Had response actually been None, `"error" in response` would have
-      raised TypeError instead of returning a clean AgentResult.
-      Fixed: guard removed along with the outer loop.
-
-  [8] CODE SMELL — _running_lock scope mismatch:
-      _running_lock was module-level while _running set was local to
-      run_scheduler().  A second call to run_scheduler() would create a
-      new set but share the old lock, losing track of running sessions.
-      Fixed: both are now local to run_scheduler().
-
-  [9] MINOR — soul loaded twice in scheduler path:
-      run_scheduler() called SoulConfig.load() internally on every
-      worker spawn even though main() had already loaded it.  Fixed:
-      soul is passed into run_scheduler() as a parameter.
+FIXES: [1] truncation key mismatch, [2/3] double retry loop, [4] .env injection, [5] dead _hold_lock param, [6] module attr patching, [7] unreachable None guard, [8] _running_lock scope, [9] soul loaded twice, [10] scheduler stdout bleed, [11] scheduler UX headers, [12] scheduler output mode, [13] scheduler worker never updated current_session_id so follow-up messages always started a fresh session instead of continuing.
 """
 
 import argparse
@@ -122,48 +39,32 @@ from agent_tools import (
     _process_tool_calls, _unpack_tc, _parse_tool_args,
     _HeaderStreamCb,
     SYSTEM_PROMPT, SUB_AGENT_SYSTEM_PROMPT,
+    get_available_tools,
+    vision_cache_invalidate,
 )
 
 import agent_core as _core_mod
 
 
 _repl_prompt_fn: Optional[Callable[[], None]] = None
+_worker_stdout_lock: threading.Lock = threading.Lock()
 
 
 # =============================================================================
-# WORKSPACE SECURITY — resolve, validate, and permanently lock the path
+# WORKSPACE SECURITY
 # =============================================================================
 
 def _lock_workspace(raw_path: str) -> Path:
-    """Resolve *raw_path* to its canonical absolute form and pin it.
-
-    This is the single point where the workspace path is finalised.  After
-    this function returns:
-
-      • ``Config.WORKSPACE`` is the resolved absolute path string.
-      • The returned ``Path`` object is what every other part of the program
-        must use.  It must never be re-derived from user input.
-
-    Raises ``SystemExit`` if the path cannot be created or is not writable,
-    rather than continuing with an unsafe or undefined sandbox root.
-    """
     try:
-        # expanduser handles ~ on both platforms; resolve() makes it absolute
-        # and follows any symlinks so Safety.validate_path comparisons work.
         resolved = Path(raw_path).expanduser().resolve()
     except Exception as e:
         print(colored(f"\n[!] Could not resolve workspace path {raw_path!r}: {e}", Colors.RED))
         sys.exit(1)
-
-    # Create the directory tree if it does not yet exist.
     try:
         resolved.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         print(colored(f"\n[!] Cannot create workspace {resolved}: {e}", Colors.RED))
         sys.exit(1)
-
-    # Verify we can actually write to it (catches read-only mounts, permission
-    # errors, etc. before anything sensitive happens).
     probe = resolved / ".lmagent" / ".write_probe"
     try:
         probe.parent.mkdir(parents=True, exist_ok=True)
@@ -172,36 +73,12 @@ def _lock_workspace(raw_path: str) -> Path:
     except Exception as e:
         print(colored(f"\n[!] Workspace {resolved} is not writable: {e}", Colors.RED))
         sys.exit(1)
-
-    # Pin the global config so every subsystem that reads Config.WORKSPACE
-    # gets the fully-resolved string, never the raw user input.
     Config.WORKSPACE = str(resolved)
-
     return resolved
 
 
-# =============================================================================
-# .ENV SAFETY HELPER
-# =============================================================================
-
 def _sanitize_env_value(raw: str) -> str:
-    """Return a version of *raw* that is safe to embed inside a double-quoted
-    .env value.
-
-    Specifically:
-      • All control characters (including \\n, \\r, \\t) are stripped so that
-        a crafted path cannot inject new lines into the .env file and thereby
-        add arbitrary environment variables (e.g. PATH=/attacker/bin).
-      • Embedded double-quotes are removed to prevent breaking out of the
-        quoted value and corrupting the parse.
-
-    The sanitised value is used ONLY for writing to the .env file; the
-    original (unsanitised) path continues to be used as the workspace — it was
-    already validated by _lock_workspace() at this point.
-    """
-    # Strip all ASCII control characters (0x00–0x1F and 0x7F).
     cleaned = "".join(ch for ch in raw if ch >= " " and ch != "\x7f")
-    # Remove embedded double-quotes (they would end the quoted value early).
     cleaned = cleaned.replace('"', "")
     return cleaned
 
@@ -211,100 +88,38 @@ def _sanitize_env_value(raw: str) -> str:
 # =============================================================================
 
 def _pick_workspace(args_workspace: Optional[str]) -> str:
-    """Return the workspace path to use, prompting the user if needed.
-
-    Priority:
-      1. --workspace CLI flag  (explicit, always wins)
-      2. WORKSPACE environment variable  (set by .env or the shell)
-      3. Interactive prompt  (shown only when neither of the above is set)
-
-    The prompt shows the default path and lets the user press Enter to accept
-    it or type an alternative.  An empty input keeps the default.
-
-    SECURITY: the returned string is ALWAYS an absolute, resolved path — the
-    same value that _lock_workspace() will later pin into Config.WORKSPACE.
-    No raw user-supplied path ever reaches agent code without going through
-    _lock_workspace() first.
-    """
-    # 1. Explicit CLI arg — no prompt needed.
     if args_workspace:
         return args_workspace
-
-    # 2. Environment variable (may have been loaded from .env by agent_core).
     raw = os.environ.get("WORKSPACE", "").strip()
     if raw:
         return raw
-
-    # 3. Interactive prompt.
-    default = Config.WORKSPACE          # already set from os.getenv default
-
-    print(colored(
-        "\n┌─ Workspace Setup ──────────────────────────────────────────────┐",
-        Colors.CYAN,
-    ))
-    print(colored(
-        "│  No workspace configured.                                      │",
-        Colors.CYAN,
-    ))
-    print(colored(
-        f"│  Default: {default:<54}│",
-        Colors.CYAN,
-    ))
-    print(colored(
-        "│                                                                │",
-        Colors.CYAN,
-    ))
-    print(colored(
-        "│  ⚠  The agent will ONLY be able to read and write files        │",
-        Colors.YELLOW,
-    ))
-    print(colored(
-        "│     inside this directory.  Choose carefully.                  │",
-        Colors.YELLOW,
-    ))
-    print(colored(
-        "└────────────────────────────────────────────────────────────────┘",
-        Colors.CYAN,
-    ))
-
+    default = Config.WORKSPACE
+    print(colored("\n┌─ Workspace Setup ──────────────────────────────────────────────┐", Colors.CYAN))
+    print(colored("│  No workspace configured.                                      │", Colors.CYAN))
+    print(colored(f"│  Default: {default:<54}│", Colors.CYAN))
+    print(colored("│                                                                │", Colors.CYAN))
+    print(colored("│  ⚠  The agent will ONLY be able to read and write files        │", Colors.YELLOW))
+    print(colored("│     inside this directory.  Choose carefully.                  │", Colors.YELLOW))
+    print(colored("└────────────────────────────────────────────────────────────────┘", Colors.CYAN))
     try:
-        choice = input(
-            colored("  Press Enter to use the default, or type a path: ", Colors.YELLOW)
-        ).strip()
+        choice = input(colored("  Press Enter to use the default, or type a path: ", Colors.YELLOW)).strip()
     except (EOFError, KeyboardInterrupt):
-        # Non-interactive environment (pipe, CI, etc.) — fall through to default.
         print()
         choice = ""
-
     chosen = choice if choice else default
-
-    # Offer to remember the choice in a .env file next to this script.
     if chosen != default:
         script_dir = Path(__file__).parent
         env_file   = script_dir / ".env"
         try:
-            save = input(
-                colored(
-                    f"  Save this path to {env_file.name} for future runs? [y/N]: ",
-                    Colors.YELLOW,
-                )
-            ).strip().lower()
+            save = input(colored(f"  Save this path to {env_file.name} for future runs? [y/N]: ", Colors.YELLOW)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             save = ""
-
         if save in ("y", "yes"):
             try:
                 lines: List[str] = []
                 if env_file.exists():
                     lines = env_file.read_text(encoding="utf-8").splitlines()
-
-                # FIX [4]: sanitise the path before embedding it in a .env
-                # double-quoted value.  A raw path containing '"' would break
-                # the value boundary; one containing '\n' would inject extra
-                # env-var lines (e.g. PATH=/attacker/bin).
                 safe_chosen = _sanitize_env_value(chosen)
-
-                # Replace existing WORKSPACE= line or append a new one.
                 found = False
                 for i, line in enumerate(lines):
                     if line.strip().startswith("WORKSPACE="):
@@ -313,12 +128,10 @@ def _pick_workspace(args_workspace: Optional[str]) -> str:
                         break
                 if not found:
                     lines.append(f'WORKSPACE="{safe_chosen}"')
-
                 env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 print(colored(f"  ✓ Saved to {env_file}", Colors.GREEN))
             except Exception as e:
                 print(colored(f"  Could not write {env_file}: {e}", Colors.YELLOW))
-
     return chosen
 
 
@@ -459,8 +272,224 @@ SLASH_COMMANDS: Dict[str, SlashCommand] = {
 
 
 # =============================================================================
+# run_scheduler()
+# =============================================================================
+
+def run_scheduler(
+    workspace: Path,
+    poll_interval: Optional[int] = None,
+    soul: str = "",
+    # FIX [13]: called with the completed session_id after each worker finishes
+    # so the REPL's current_session_id stays in sync and follow-up messages
+    # resume the same session instead of starting a fresh one.
+    session_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    _running_lock: threading.Lock = threading.Lock()
+    _running:      set            = set()
+    _wake_event:   threading.Event = threading.Event()
+
+    interval = poll_interval if poll_interval is not None else Config.SCHEDULER_POLL_INTERVAL
+    inbox    = workspace / ".lmagent" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    session_mgr = SessionManager(workspace)
+    state_mgr   = StateManager(workspace)
+
+    Log.info(f"Scheduler started — polling every {interval}s")
+    Log.info(f"Workspace : {workspace}")
+    Log.info(f"Inbox     : {inbox}  (drop a .task file to submit work)")
+
+    def _is_running(key: str) -> bool:
+        with _running_lock:
+            return key in _running
+
+    def _mark_done(key: str) -> None:
+        with _running_lock:
+            _running.discard(key)
+
+    def _worker(task: str, resume_sid: Optional[str], run_key: str) -> None:
+        sid_label = (resume_sid or run_key)[:8]
+
+        with _worker_stdout_lock:
+            sys.stdout.write(
+                "\n" + colored(
+                    f"╔══ [scheduler] ▶  session {sid_label} waking"
+                    f" ════════════════════════════════╗",
+                    Colors.MAGENTA,
+                ) + "\n\n"
+            )
+            sys.stdout.flush()
+
+        try:
+            result = run_agent(
+                task,
+                workspace,
+                permission_mode=PermissionMode.AUTO,
+                resume_session=resume_sid,
+                plan_first=False,
+                mode="interactive",
+                soul=soul,
+            )
+
+            with _worker_stdout_lock:
+                status_color = (
+                    Colors.GREEN  if result.status == "completed" else
+                    Colors.YELLOW if result.status == "waiting"   else
+                    Colors.RED
+                )
+                sys.stdout.write(
+                    "\n" + colored(
+                        f"╚══ [scheduler] ✓  session {result.session_id[:8]}"
+                        f" → {result.status}"
+                        f" ══════════════════════════════════╝",
+                        status_color,
+                    ) + "\n"
+                )
+                if result.final_answer and result.status != "completed":
+                    preview = result.final_answer[:300].replace("\n", " ")
+                    sys.stdout.write(colored(f"  {preview}", Colors.CYAN) + "\n")
+                sys.stdout.flush()
+
+            # FIX [13]: tell the REPL which session just finished so the next
+            # user message continues it rather than starting from scratch.
+            if session_callback and result.status == "completed":
+                session_callback(result.session_id)
+
+            if _repl_prompt_fn is not None:
+                _repl_prompt_fn()
+
+            if result.status == "waiting":
+                Log.wait(
+                    f"[scheduler] session {result.session_id} sleeping "
+                    f"until {result.wait_until}"
+                )
+                _wake_event.set()
+
+        except Exception as e:
+            with _worker_stdout_lock:
+                Log.error(f"[scheduler] worker error (session={sid_label}): {e}")
+            if _repl_prompt_fn is not None:
+                _repl_prompt_fn()
+        finally:
+            _mark_done(run_key)
+
+    def _spawn(task: str, resume_sid: Optional[str], run_key: str) -> None:
+        with _running_lock:
+            if run_key in _running:
+                return
+            _running.add(run_key)
+        threading.Thread(
+            target=_worker,
+            args=(task, resume_sid, run_key),
+            daemon=True,
+            name=f"sched-{run_key[:12]}",
+        ).start()
+
+    try:
+        while True:
+            try:
+                next_wake_secs: Optional[float] = None
+
+                for task_file in sorted(inbox.glob("*.task")):
+                    try:
+                        task_text = task_file.read_text(encoding="utf-8").strip()
+                        if not task_text:
+                            task_file.unlink(missing_ok=True)
+                            continue
+                        run_key = f"inbox-{task_file.stem}"
+                        Log.info(f"[scheduler] inbox: {task_text[:80]}")
+                        task_file.unlink(missing_ok=True)
+                        _spawn(task_text, resume_sid=None, run_key=run_key)
+                    except Exception as e:
+                        Log.error(f"[scheduler] failed to read inbox task {task_file.name}: {e}")
+                        try:
+                            task_file.rename(task_file.with_suffix(".failed"))
+                        except Exception:
+                            pass
+
+                for session in session_mgr.list_recent(200):
+                    if session.get("status") != "waiting":
+                        continue
+                    sid = session["id"]
+                    if _is_running(sid):
+                        continue
+
+                    saved_state = state_mgr.load(sid)
+
+                    if not saved_state or not saved_state.wait_state:
+                        Log.warning(
+                            f"[scheduler] [{sid[:8]}] stuck in 'waiting' with "
+                            f"no wait_state — rescuing back to 'idle'"
+                        )
+                        try:
+                            data = session_mgr.load(sid)
+                            if data:
+                                msgs, meta = data
+                                meta["status"] = "idle"
+                                session_mgr.save(sid, msgs, meta)
+                        except Exception as rescue_err:
+                            Log.error(f"[scheduler] [{sid[:8]}] rescue failed: {rescue_err}")
+                        continue
+
+                    ws = WaitState.from_dict(saved_state.wait_state)
+
+                    if not ws.is_ready():
+                        try:
+                            remaining = (
+                                datetime.fromisoformat(ws.resume_after) - datetime.now()
+                            ).total_seconds()
+                            if remaining > 0:
+                                next_wake_secs = (
+                                    remaining if next_wake_secs is None
+                                    else min(next_wake_secs, remaining)
+                                )
+                            Log.info(
+                                f"[scheduler] [{sid[:8]}] sleeping — "
+                                f"{max(0, remaining):.0f}s left"
+                                f"  ({ws.reason[:50]})"
+                            )
+                        except Exception:
+                            pass
+                        continue
+
+                    Log.info(f"[scheduler] [{sid[:8]}] waking — {ws.reason}")
+                    _spawn("Continue from scheduled wake-up", resume_sid=sid, run_key=sid)
+
+            except Exception as poll_err:
+                Log.error(f"[scheduler] poll error: {poll_err}")
+
+            sleep_for = (
+                max(0.5, next_wake_secs + 0.25)
+                if next_wake_secs is not None and next_wake_secs < interval
+                else interval
+            )
+            if sleep_for < interval:
+                Log.info(
+                    f"[scheduler] sleeping {sleep_for:.1f}s "
+                    f"(next wake-up in ~{next_wake_secs:.0f}s)"
+                )
+
+            _wake_event.clear()
+            _wake_event.wait(timeout=sleep_for)
+
+    except KeyboardInterrupt:
+        Log.info("[scheduler] shutting down — waiting for active agents…")
+        deadline = time.time() + 10
+        while True:
+            with _running_lock:
+                if not _running:
+                    break
+            if time.time() > deadline:
+                Log.warning("[scheduler] timeout — some workers may still be running")
+                break
+            time.sleep(0.5)
+        Log.info("[scheduler] exited.")
+
+
+# =============================================================================
 # MAIN AGENT
 # =============================================================================
+
 def run_agent(
     task: str,
     workspace: Path,
@@ -470,15 +499,8 @@ def run_agent(
     mode: str = "interactive",
     event_callback: Optional[Callable[[AgentEvent], None]] = None,
     soul: str = "",
-    whisper_fn: Optional[Callable[[], Optional[str]]] = None,  
+    whisper_fn: Optional[Callable[[], Optional[str]]] = None,
 ) -> AgentResult:
-    # FIX [5]: _hold_lock parameter removed — it was accepted but never read.
-    # The scheduler passed _hold_lock=False believing it prevented double-
-    # locking; it did nothing.  Lock management is the caller's responsibility.
-
-    # SECURITY: Double-check that workspace is the resolved locked path.
-    # _lock_workspace() sets Config.WORKSPACE to the resolved string; if for
-    # any reason the caller passes a different path we refuse to run.
     expected_ws = Path(Config.WORKSPACE).resolve()
     if workspace.resolve() != expected_ws:
         raise ValueError(
@@ -504,7 +526,6 @@ def run_agent(
 
     _stream_cb = _HeaderStreamCb(_base_stream_cb, mode)
 
-    # ── event emitter ─────────────────────────────────────────────────────────
     def emit(event_type: str, data: Dict[str, Any]) -> None:
         ev = AgentEvent(type=event_type, data=data)
         events.append(ev)
@@ -522,17 +543,13 @@ def run_agent(
             (Log.success if data.get("success") else Log.error)(
                 f"{'✓' if data.get('success') else '✗'} {data.get('name', '')}"
             )
-        elif event_type == "complete":
-            Log.success(f"Done — {data.get('reason', '')}")
-        elif event_type == "iteration":
-            Log.info(f"\nIteration {data.get('n')}/{Config.MAX_ITERATIONS}")
-        elif event_type == "waiting":
-            Log.wait(f"Sleeping until {data.get('resume_after')}: {data.get('reason')}")
+        elif event_type == "complete":    Log.success(f"Done — {data.get('reason', '')}")
+        elif event_type == "iteration":   Log.info(f"\nIteration {data.get('n')}/{Config.MAX_ITERATIONS}")
+        elif event_type == "waiting":     Log.wait(f"Sleeping until {data.get('resume_after')}: {data.get('reason')}")
 
     session_mgr = SessionManager(workspace)
     state_mgr   = StateManager(workspace)
 
-    # ── session setup ──────────────────────────────────────────────────────────
     if resume_session:
         emit("log", {"message": f"Resuming session: {resume_session}"})
         session_data = session_mgr.load(resume_session)
@@ -556,9 +573,7 @@ def run_agent(
 
         if saved_state and saved_state.wait_state:
             ws         = WaitState.from_dict(saved_state.wait_state)
-            resume_msg = ws.context_on_resume.replace(
-                "{current_time}", datetime.now().isoformat()
-            )
+            resume_msg = ws.context_on_resume.replace("{current_time}", datetime.now().isoformat())
             messages.append({"role": "user", "content": resume_msg})
             emit("log", {"message": f"Waking from sleep. Reason: {ws.reason}"})
             saved_state.wait_state = None
@@ -566,7 +581,6 @@ def run_agent(
             session_mgr.save(session_id, messages, {
                 **metadata, "status": "active", "iterations": iteration,
             })
-
         elif (task and task.strip()
               and task not in ("Continue from previous session",
                                "Continue from scheduled wake-up")):
@@ -575,7 +589,6 @@ def run_agent(
 
         emit("log", {"message": f"Resumed at iteration {iteration}"})
 
-    # ── fresh session ──────────────────────────────────────────────────────────
     else:
         emit("log", {"message": f"Task: {task[:100]}"})
         plan_data = None
@@ -617,13 +630,11 @@ def run_agent(
 
         project_cfg = ProjectConfig.load(workspace)
         if project_cfg:
-            messages.insert(1, {"role": "system",
-                                 "content": f"PROJECT CONFIG:\n\n{project_cfg}"})
+            messages.insert(1, {"role": "system", "content": f"PROJECT CONFIG:\n\n{project_cfg}"})
 
         detector  = LoopDetector()
         iteration = 0
 
-    # ── managers ──────────────────────────────────────────────────────────────
     todo_mgr       = TodoManager(workspace, session_id)
     plan_mgr       = PlanManager(workspace, session_id)
     task_state_mgr = TaskStateManager(workspace, session_id)
@@ -641,14 +652,10 @@ def run_agent(
 
     mcp_manager     = MCPManager(workspace)
     mcp_manager.load_servers()
-    available_tools = TOOL_SCHEMAS.copy()
     mcp_tools       = mcp_manager.get_all_tools()
-    if mcp_tools:
-        available_tools.extend(mcp_tools)
+    available_tools = get_available_tools(extra_schemas=mcp_tools)
 
     current_permission_mode = permission_mode
-
-    # ── inner helpers ──────────────────────────────────────────────────────────
 
     def _save_state(wait_state: Optional[WaitState] = None) -> None:
         state_mgr.save(session_id, AgentState(
@@ -697,10 +704,8 @@ def run_agent(
             insert_pos = 1 + bool(plan_mgr.plan) + bool(todo_mgr.get_context())
             messages.insert(insert_pos, task_state_mgr.current_state.to_message())
 
-        # Keep the shared context reference in sync after any reassignment above.
         get_current_context()["messages"] = messages
 
-    # ── main loop ──────────────────────────────────────────────────────────────
     try:
         while iteration < Config.MAX_ITERATIONS:
             iteration += 1
@@ -725,11 +730,12 @@ def run_agent(
 
             _inject_context()
             messages = compact_messages(messages)
-
             _stream_cb.reset()
 
+            _effective_stream_cb = _stream_cb if mode == "interactive" else None
+
             response = LLMClient.call(messages, available_tools,
-                                      stream_callback=_stream_cb)
+                                      stream_callback=_effective_stream_cb)
 
             if "error" in response:
                 emit("error", {"message": f"LLM error: {response['error']}"})
@@ -742,7 +748,6 @@ def run_agent(
             content    = response.get("content", "")
             tool_calls = response.get("tool_calls") or []
 
-            # If no content and no tool calls, track empty and continue
             if not content and not tool_calls:
                 detector.track_empty()
                 continue
@@ -750,11 +755,9 @@ def run_agent(
             if content:
                 final_answer = content
 
-            # ── WAIT detection ─────────────────────────────────────────────────
             wait_state = detect_wait(content) if content else None
             if wait_state:
-                emit("waiting", {"reason":       wait_state.reason,
-                                 "resume_after": wait_state.resume_after})
+                emit("waiting", {"reason": wait_state.reason, "resume_after": wait_state.resume_after})
                 _save_state(wait_state=wait_state)
                 _save_session("waiting")
                 if mode == "interactive":
@@ -773,26 +776,18 @@ def run_agent(
                     wait_until=wait_state.resume_after,
                 )
 
-            # ── BUG FIX v9.3.2: execute tool calls BEFORE checking completion ─
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
             if content:    assistant_msg["content"]    = content
             if tool_calls: assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
-            # Execute any tool calls BEFORE checking completion.
             if tool_calls:
                 current_permission_mode = _process_tool_calls(
-                tool_calls, workspace, available_tools, detector,
-                iteration, mcp_manager, messages, current_permission_mode,
-                emit=emit,
+                    tool_calls, workspace, available_tools, detector,
+                    iteration, mcp_manager, messages, current_permission_mode,
+                    emit=emit,
                 )
 
-            # ── WHISPER INJECTION ──────────────────────────────────────────────
-            # FIX: track whether a whisper was injected this iteration.
-            # If it was, we must defer completion so the LLM actually sees
-            # and responds to the nudge — otherwise a TASK_COMPLETE in the
-            # current response would exit the loop before the whisper is
-            # ever processed.
             whisper_injected = False
             if whisper_fn:
                 nudge = whisper_fn()
@@ -803,42 +798,18 @@ def run_agent(
                         "content": f"[User nudge - mid-run instruction]: {nudge}",
                     })
                     whisper_injected = True
-            # ──────────────────────────────────────────────────────────────────
 
-            # FIX [1]: was tc.get("_had_truncation") — wrong key.
             had_truncation = any(tc.get("_truncated") for tc in tool_calls)
             if had_truncation:
-                emit("warning", {
-                    "message": "Truncated tool call — skipping completion check, forcing retry"
-                })
+                emit("warning", {"message": "Truncated tool call — skipping completion check, forcing retry"})
                 continue
 
-            # Now check for completion (tools have already run).
             is_complete, reason = detect_completion(content, bool(tool_calls))
 
-            # ── FIX: defer completion when a whisper is pending ────────────────
-            # The LLM's TASK_COMPLETE was emitted before it could see the
-            # whisper.  Force one more iteration so it gets the nudge in
-            # context and can act on it (or re-complete if it chooses to).
             if is_complete and whisper_injected:
                 emit("log", {"message": "whisper pending — deferring completion for one iteration"})
                 is_complete = False
-            # ──────────────────────────────────────────────────────────────────
 
-            # ── FIX: treat "Asking for input" as a clean completion ────────────
-            #
-            # Previously, when the LLM replied conversationally (e.g. "hey" →
-            # "Hello! Ready to help.") detect_completion() returned
-            # (False, "Asking for input") and the loop continued.  The LLM had
-            # nothing new to respond to, so it produced empty responses for 5
-            # iterations until the loop detector killed the run with
-            # "Agent unresponsive".
-            #
-            # The model is now instructed by the system prompt to always output
-            # TASK_COMPLETE after conversational replies, but as a safety net we
-            # also treat "Asking for input" here as a completed run so the agent
-            # exits cleanly regardless of whether the model remembered to comply.
-            # ──────────────────────────────────────────────────────────────────
             if not is_complete and reason == "Asking for input" and not tool_calls:
                 emit("log", {"message": "Conversational reply detected — closing cleanly"})
                 is_complete = True
@@ -848,9 +819,7 @@ def run_agent(
                 s = task_state_mgr.current_state
                 if (s.completion_gate == "processed == total"
                         and s.processed_count != s.total_count):
-                    emit("warning", {"message": (
-                        f"Completion gate not met: {s.processed_count}/{s.total_count}"
-                    )})
+                    emit("warning", {"message": f"Completion gate not met: {s.processed_count}/{s.total_count}"})
                     messages.append({
                         "role": "user",
                         "content": (
@@ -881,7 +850,6 @@ def run_agent(
             if Config.AUTO_SAVE_SESSION and iteration % 5 == 0:
                 _save_session("active")
 
-        # ── max iterations ─────────────────────────────────────────────────────
         emit("warning", {"message": f"Reached max iterations ({Config.MAX_ITERATIONS})"})
         return AgentResult(
             status="max_iterations",
@@ -906,9 +874,10 @@ def run_agent(
 
     finally:
         mcp_manager.close_all()
-        close_shell_session()       # clean up this thread's shell process
+        close_shell_session()
         if mode == "output":
             Log.set_silent(False)
+
 
 # =============================================================================
 # BANNER
@@ -970,36 +939,21 @@ def main() -> int:
     )
     parser.add_argument("task",                 nargs="?",  help="Task to execute")
     parser.add_argument("--workspace",                      help="Workspace directory")
-    parser.add_argument("--resume",             metavar="SESSION_ID",
-                        help="Resume a previous session")
-    parser.add_argument("--plan",               action="store_true",
-                        help="Create an execution plan before running")
-    parser.add_argument("--list-sessions",      action="store_true",
-                        help="List recent sessions")
-    parser.add_argument("--permission",         choices=["manual", "normal", "auto"],
-                        help="Permission mode")
-    parser.add_argument("--no-mcp",             action="store_true",
-                        help="Disable MCP servers")
-    parser.add_argument("--no-sub-agents",      action="store_true",
-                        help="Disable sub-agents")
-    parser.add_argument("--scheduler",          action="store_true",
-                        help="Run as a background scheduler daemon")
+    parser.add_argument("--resume",             metavar="SESSION_ID", help="Resume a previous session")
+    parser.add_argument("--plan",               action="store_true",  help="Create an execution plan before running")
+    parser.add_argument("--list-sessions",      action="store_true",  help="List recent sessions")
+    parser.add_argument("--permission",         choices=["manual", "normal", "auto"], help="Permission mode")
+    parser.add_argument("--no-mcp",             action="store_true",  help="Disable MCP servers")
+    parser.add_argument("--no-sub-agents",      action="store_true",  help="Disable sub-agents")
+    parser.add_argument("--scheduler",          action="store_true",  help="Run as a background scheduler daemon")
     parser.add_argument("--scheduler-interval", type=int, default=None, metavar="SECONDS",
-                        help=f"Scheduler poll interval "
-                             f"(default {Config.SCHEDULER_POLL_INTERVAL}s)")
-    parser.add_argument("--submit",             metavar="TASK",
-                        help="Submit a task to a running scheduler and exit")
+                        help=f"Scheduler poll interval (default {Config.SCHEDULER_POLL_INTERVAL}s)")
+    parser.add_argument("--submit",             metavar="TASK", help="Submit a task to a running scheduler and exit")
     parser.add_argument("--version",            action="version", version=f"v{VERSION}")
     args = parser.parse_args()
 
-    # ── workspace: pick → lock → verify ───────────────────────────────────────
-    # This MUST happen before Config.init() and before any agent code runs.
-    # _lock_workspace() resolves the path, creates the directory, verifies it
-    # is writable, and pins Config.WORKSPACE to the resolved absolute string.
-    # Everything downstream uses the returned Path object; nothing re-reads
-    # the raw user input.
     raw_workspace = _pick_workspace(args.workspace)
-    workspace     = _lock_workspace(raw_workspace)   # ← canonical, locked Path
+    workspace     = _lock_workspace(raw_workspace)
 
     if args.permission:    Config.PERMISSION_MODE   = args.permission
     if args.no_mcp:        Config.ENABLE_MCP        = False
@@ -1018,11 +972,8 @@ def main() -> int:
         f"Shell sandbox: {'workspace-only' if Config.SHELL_WORKSPACE_ONLY else 'read outside allowed (destructive still blocked)'}"
     )
 
-    # FIX [9]: load soul once here and pass it to run_scheduler() so that the
-    # scheduler does not re-read .soul.md from disk on every worker spawn.
     soul = SoulConfig.load(workspace)
 
-    # ── --submit ───────────────────────────────────────────────────────────────
     if args.submit:
         inbox = workspace / ".lmagent" / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
@@ -1032,12 +983,10 @@ def main() -> int:
         Log.info("Scheduler will pick it up within the next poll interval.")
         return 0
 
-    # ── --scheduler (daemon only) ──────────────────────────────────────────────
     if args.scheduler:
         run_scheduler(workspace, poll_interval=args.scheduler_interval, soul=soul)
         return 0
 
-    # ── --list-sessions ────────────────────────────────────────────────────────
     if args.list_sessions:
         sessions = SessionManager(workspace).list_recent(20)
         if not sessions:
@@ -1058,7 +1007,6 @@ def main() -> int:
             print()
         return 0
 
-    # ── validate LLM ───────────────────────────────────────────────────────────
     if not args.resume:
         Log.info("Checking LLM connection…")
         err = LLMClient.validate_connection()
@@ -1072,17 +1020,10 @@ def main() -> int:
     except ValueError:
         permission_mode = PermissionMode.NORMAL
 
-    # FIX [6]: replaced `_core_mod._instance_lock = instance_lock` with the
-    # already-imported binding _core_instance_lock.  Patching private module
-    # attributes from outside breaks if agent_core is reloaded or the
-    # attribute is renamed; using the imported reference is safer and explicit.
     instance_lock = InstanceLock(workspace)
-    _core_instance_lock.__class__   # touch to confirm the import is live
-    # Publish the live lock to agent_core using the module reference so that
-    # any agent_core code that reads _instance_lock gets our instance.
+    _core_instance_lock.__class__
     _core_mod._instance_lock = instance_lock
 
-    # ── one-shot mode ──────────────────────────────────────────────────────────
     if args.task or args.resume:
         try:
             with instance_lock:
@@ -1121,8 +1062,13 @@ def main() -> int:
 
     _repl_prompt_fn = _reprint_prompt
 
+    # FIX [13]: when a scheduler worker completes, update current_session_id
+    # so the next REPL input resumes that session instead of starting fresh.
+    def _on_scheduler_session(sid: str) -> None:
+        nonlocal current_session_id
+        current_session_id = sid
+
     def _silent_run_scheduler(*a, **kw) -> None:
-        # Thread-local — only silences this thread, not the REPL thread.
         Log.set_silent(True)
         run_scheduler(*a, **kw)
 
@@ -1130,10 +1076,9 @@ def main() -> int:
         target=_silent_run_scheduler,
         args=(workspace,),
         kwargs={
-            "poll_interval": (
-                args.scheduler_interval or Config.SCHEDULER_POLL_INTERVAL
-            ),
-            "soul": soul,   # FIX [9]: pass pre-loaded soul, avoid re-reads
+            "poll_interval":    args.scheduler_interval or Config.SCHEDULER_POLL_INTERVAL,
+            "soul":             soul,
+            "session_callback": _on_scheduler_session,  # FIX [13]
         },
         daemon=True,
         name="scheduler",
