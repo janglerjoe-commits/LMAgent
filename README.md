@@ -14,6 +14,19 @@ A cross-platform, locally-hosted AI agent that connects to any OpenAI-compatible
 
 ---
 
+## Thank You
+
+42 stars. I honestly didn't expect that thank you.
+
+If you've starred the repo, opened an issue, tried it out, or just poked around it means a lot. This started as a personal tool I built for myself, and seeing other people find it useful is exactly the kind of thing that makes you want to keep going.
+
+There's a lot more I want to build. Better tooling, smarter planning, tighter sandboxing, and features I haven't figured out yet. Your support makes it easier to justify the time.
+
+If you run into bugs, have ideas, or just want to share what you're using LMAgent for feel free to open an issue or start a discussion. I read everything.
+
+More to come. 
+
+---
 ## Table of Contents
 
 - [Security & Sandboxing](#security--sandboxing)
