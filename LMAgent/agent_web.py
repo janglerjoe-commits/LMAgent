@@ -1,34 +1,12 @@
 """
-LMAgent Web — v6.9.1
-------------------------------------
-  agent_core.py   — Config, logging, session/state/todo/plan managers, etc.
-  agent_tools.py  — Tool handlers, LLMClient, _HeaderStreamCb, TOOL_SCHEMAS
-  agent_main.py   — run_agent()
-
-Place this file next to those three files.
-
-FIXES vs v6.8.0 (original FIX-1 … FIX-10 unchanged; FIX-11…FIX-14 are new):
-─────────────────────────────────────────────────────────────────────────────
-[FIX-1]  Streaming completely broken — tokens never reached browser (mode="output" sets stream_callback=None so all token processing was gated behind "if stream_callback:" and never ran; _web_parse_stream now resolves _eff_cb = stream_callback or _tl.token_cb).
-[FIX-2]  Thinking blocks never reached browser — same root cause as FIX-1; thinking_cb now checked independently of stream_callback.
-[FIX-3]  Stop button broken — side-effect of FIX-1; token_cb is now always called so _AgentStopped propagates correctly through LLMClient → run_agent.
-[FIX-4]  Permission mode override — mode="output" unconditionally forced PermissionMode.AUTO, silently ignoring the web UI selection; pass permission mode explicitly.
-[FIX-5]  _PatchedHSC double-call risk eliminated — FIX-1 ensures each path calls token_cb exactly once.
-[FIX-6]  /upload — Pillow import guarded; clearer error message when unavailable.
-[FIX-7]  Chatlog history replay — None-session key "_none_" sentinel prevents stale merge on /new.
-[FIX-8]  SSE generator heartbeat — ping payload is valid JSON so the JS client ignores it cleanly.
-[FIX-9]  FileTree hidden-dir exclusion — unified via startswith(".") so .git and all dotdirs are hidden.
-[FIX-10] MCP double-init warning suppressed — _global_mcp used only for /tools endpoint.
-[FIX-11] Web-scheduler double-wake — no guard prevented multiple _do_wake threads for the same session across poll cycles; added _waking_sessions set protected by a lock.
-[FIX-12] Web-scheduler token streaming — _do_wake never set _tl.token_cb/_tl.thinking_cb so all output from scheduled-wake sessions was silently discarded; wired the same token/thinking infrastructure as /chat's _run().
-[FIX-13] /chat pre_run_sid race — _current_session_id was read before acquiring _session_lock; now read inside the lock.
-[FIX-14] Web-scheduler Stop plumbing — wake worker had no stop event registered in _stop_events so the Stop button could not cancel a scheduler-woken session; stop event is now created and registered for each wake.
+LMAgent Web — v6.9.2 
+Place this file next to agent_core.py, agent_tools.py, agent_main.py.
 """
 
-import fnmatch
 import functools
 import io
 import json
+import mimetypes as _mimetypes
 import os
 import queue
 import re
@@ -43,49 +21,28 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
 
-# ── PIL is optional (used only for image conversion on upload) ─────────────────
 try:
     from PIL import Image as _PIL_Image
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
 
-# ── Import the agent ──────────────────────────────────────────────────────────
 try:
     import agent_core
     import agent_tools
     import agent_main as _agent_main_mod
-
     from agent_core import (
-        Config,
-        Colors,
-        colored,
-        strip_thinking,
-        MCPManager,
-        PermissionMode,
-        PlanManager,
-        Safety,
-        SessionManager,
-        StateManager,
-        WaitState,
-        SoulConfig,
-        TodoManager,
-        Log,
+        Config, Colors, colored, strip_thinking, MCPManager, PermissionMode,
+        PlanManager, Safety, SessionManager, StateManager, WaitState,
+        SoulConfig, TodoManager, Log,
     )
     from agent_tools import (
-        TOOL_SCHEMAS,
-        LLMClient,
-        _REQUIRED_ARG_TOOLS,
+        TOOL_SCHEMAS, LLMClient, _REQUIRED_ARG_TOOLS,
         _HeaderStreamCb as _OrigHSC,
     )
     from agent_main import run_agent, _lock_workspace
-
 except ImportError as _ie:
-    sys.exit(
-        "ERROR: agent_core.py / agent_tools.py / agent_main.py not found.\n"
-        f"Detail: {_ie}\n"
-        "Place agent_web.py next to those three files and try again."
-    )
+    sys.exit(f"ERROR: agent_core/tools/main not found.\nDetail: {_ie}")
 except Exception:
     sys.exit(f"ERROR importing agent modules:\n{traceback.format_exc()}")
 
@@ -95,13 +52,18 @@ except Exception as _e:
     sys.exit(f"ERROR: Config.init() failed: {_e}")
 
 WORKSPACE = _lock_workspace(Config.WORKSPACE)
-
-soul = SoulConfig.load(WORKSPACE)
+soul      = SoulConfig.load(WORKSPACE)
 Log.set_silent(True)
 
 _UPLOAD_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 
-# ── Global MCP manager (used only for /tools endpoint) ────────────────────────
+_mimetypes.add_type("text/javascript",           ".js")
+_mimetypes.add_type("text/javascript",           ".mjs")
+_mimetypes.add_type("application/json",          ".json")
+_mimetypes.add_type("text/css",                  ".css")
+_mimetypes.add_type("image/svg+xml",             ".svg")
+_mimetypes.add_type("application/manifest+json", ".webmanifest")
+
 _global_mcp = MCPManager(WORKSPACE)
 try:
     _global_mcp.load_servers()
@@ -110,41 +72,52 @@ except Exception:
 
 app = Flask(__name__)
 
+def _make_qr_data_uri(url):
+    try:
+        import qrcode, qrcode.image.svg, base64, io
+        buf = io.BytesIO()
+        qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage,
+                    box_size=4, border=2).save(buf)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/svg+xml;base64,{b64}"
+    except ImportError:
+        return "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>"
+
 
 @app.after_request
-def _security_headers(response: "Response") -> "Response":
+def _security_headers(response):
     h = response.headers
     h["X-Content-Type-Options"] = "nosniff"
-    h["X-Frame-Options"]        = "DENY"
     h["Referrer-Policy"]        = "no-referrer"
-    h["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; "
-        "img-src 'self' data: blob:; "
-        "connect-src 'self'"
-    )
+    if not request.path.startswith("/serve/"):
+        h["X-Frame-Options"]         = "DENY"
+        h["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self'"
+        )
     return response
 
 
 # =============================================================================
-# SECURITY CONFIG
+# SECURITY
 # =============================================================================
 
-_AGENT_TOKEN: str = os.environ.get("AGENT_TOKEN") or str(secrets.randbelow(900000) + 100000)
-_HOST: str        = os.environ.get("AGENT_HOST", "0.0.0.0")
-_SSL_CERT: str    = os.environ.get("AGENT_CERT", "")
-_SSL_KEY: str     = os.environ.get("AGENT_KEY",  "")
+_AGENT_TOKEN = os.environ.get("AGENT_TOKEN") or str(secrets.randbelow(900000) + 100000)
+_HOST        = os.environ.get("AGENT_HOST", "0.0.0.0")
+_SSL_CERT    = os.environ.get("AGENT_CERT", "")
+_SSL_KEY     = os.environ.get("AGENT_KEY",  "")
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-_rate_data: "dict[str, list]" = {}
+_rate_data: dict = {}
 _rate_lock   = threading.Lock()
 _RATE_LIMIT  = 120
 _RATE_WINDOW = 60.0
 
 
-def _is_rate_limited(ip: str) -> bool:
+def _is_rate_limited(ip):
     now = time.time()
     with _rate_lock:
         ts = [t for t in _rate_data.get(ip, []) if now - t < _RATE_WINDOW]
@@ -155,8 +128,7 @@ def _is_rate_limited(ip: str) -> bool:
         _rate_data[ip] = ts
         if len(_rate_data) > 1000:
             cutoff = now - _RATE_WINDOW * 2
-            stale  = [k for k, v in _rate_data.items() if not v or v[-1] < cutoff]
-            for k in stale:
+            for k in [k for k, v in _rate_data.items() if not v or v[-1] < cutoff]:
                 del _rate_data[k]
         return False
 
@@ -165,19 +137,19 @@ def _require_auth(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         if _AGENT_TOKEN:
-            token = (request.headers.get("X-Token", "")
-                     or request.args.get("token", ""))
+            token = request.headers.get("X-Token", "") or request.args.get("token", "")
             if not token or not secrets.compare_digest(token, _AGENT_TOKEN):
                 return jsonify({"error": "unauthorized"}), 401
-        ip = request.remote_addr or "unknown"
-        if _is_rate_limited(ip):
+        if _is_rate_limited(request.remote_addr or "unknown"):
             return jsonify({"error": "rate limited — try again shortly"}), 429
         return f(*args, **kwargs)
     return wrapper
 
 
 # =============================================================================
-# UNAUTH PAGE (with QR + PIN)
+# SIGN-IN PAGE
+# QR code encodes the base URL only (no token) — user must type the PIN.
+# Uses a free QR image API so no JS QR library is needed.
 # =============================================================================
 
 _UNAUTH_HTML = """\
@@ -187,49 +159,41 @@ _UNAUTH_HTML = """\
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LMAgent \u2014 Sign In</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0d0d0f;color:#8e8c88;font-family:'IBM Plex Mono',monospace;
-       display:flex;align-items:center;justify-content:center;
-       min-height:100vh;padding:20px}
-  .box{text-align:center;padding:36px 32px;max-width:360px;width:100%;
-       background:#16161a;border:1px solid #252530;border-radius:12px}
-  .mark{width:40px;height:40px;background:#e8a245;border-radius:8px;
-        display:flex;align-items:center;justify-content:center;
-        font-size:20px;color:#0d0d0f;font-weight:700;margin:0 auto 16px}
-  h2{color:#ddd8d0;margin-bottom:6px;font-size:15px;font-weight:600}
-  .sub{font-size:11px;color:#4e4c50;margin-bottom:22px}
-  #qr{display:flex;justify-content:center;margin-bottom:20px}
-  #qr canvas,#qr img{border-radius:8px;border:6px solid #fff}
-  .divider{display:flex;align-items:center;gap:10px;margin:18px 0;font-size:10px;color:#4e4c50}
-  .divider::before,.divider::after{content:'';flex:1;height:1px;background:#252530}
-  .pin-row{display:flex;gap:8px;justify-content:center;margin-bottom:14px}
-  .pin-digit{width:44px;height:54px;border-radius:8px;border:1px solid #252530;background:#0d0d0f;
-    color:#ddd8d0;font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:600;
-    text-align:center;outline:none;caret-color:#e8a245;transition:border-color .12s;-webkit-appearance:none}
-  .pin-digit:focus{border-color:#e8a245}
-  .pin-digit.filled{border-color:#32323e;color:#e8a245}
-  .go-btn{width:100%;padding:11px;border-radius:8px;background:#e8a245;border:none;
-    color:#0d0d0f;font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;
-    cursor:pointer;transition:background .12s;margin-bottom:10px}
-  .go-btn:hover{background:#f0b055}
-  .go-btn:disabled{background:#252530;color:#4e4c50;cursor:default}
-  .err{font-size:11px;color:#e05555;min-height:16px;margin-top:2px}
-  .hint{font-size:10px;color:#4e4c50;margin-top:16px;line-height:1.6}
-  code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;border-radius:3px;color:#3ecfb2;font-size:10px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d0f;color:#8e8c88;font-family:monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.box{text-align:center;padding:36px 32px;max-width:360px;width:100%;background:#16161a;border:1px solid #252530;border-radius:12px}
+.mark{width:40px;height:40px;background:#e8a245;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#0d0d0f;font-weight:700;margin:0 auto 16px}
+h2{color:#ddd8d0;margin-bottom:6px;font-size:15px;font-weight:600}
+.sub{font-size:11px;color:#4e4c50;margin-bottom:22px}
+.qr-wrap{display:flex;justify-content:center;margin-bottom:20px}
+.qr-wrap img{border-radius:8px;border:6px solid #fff;width:180px;height:180px}
+.divider{display:flex;align-items:center;gap:10px;margin:18px 0;font-size:10px;color:#4e4c50}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:#252530}
+.pin-row{display:flex;gap:8px;justify-content:center;margin-bottom:14px}
+.pin-digit{width:44px;height:54px;border-radius:8px;border:1px solid #252530;background:#0d0d0f;
+  color:#ddd8d0;font-family:monospace;font-size:22px;font-weight:600;text-align:center;
+  outline:none;caret-color:#e8a245;transition:border-color .12s;-webkit-appearance:none}
+.pin-digit:focus{border-color:#e8a245}
+.pin-digit.filled{border-color:#32323e;color:#e8a245}
+.go-btn{width:100%;padding:11px;border-radius:8px;background:#e8a245;border:none;
+  color:#0d0d0f;font-family:monospace;font-size:13px;font-weight:600;
+  cursor:pointer;transition:background .12s;margin-bottom:10px}
+.go-btn:hover{background:#f0b055}
+.go-btn:disabled{background:#252530;color:#4e4c50;cursor:default}
+.err{font-size:11px;color:#e05555;min-height:16px;margin-top:2px}
+.hint{font-size:10px;color:#4e4c50;margin-top:16px;line-height:1.6}
+code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;border-radius:3px;color:#3ecfb2;font-size:10px}
 </style>
 </head>
 <body>
 <div class="box">
   <div class="mark">&#955;</div>
   <h2>LMAgent</h2>
-  <p class="sub">Scan with your phone or enter the PIN</p>
-  <div id="qr"></div>
-  <div class="divider">or enter PIN</div>
-  <div class="pin-row" id="pin-row">
+  <p class="sub">Scan to open, then enter your PIN</p>
+  <div class="qr-wrap"><img src="__QR_IMG__" alt="Scan to open sign-in page"></div>
+  <div class="divider">enter PIN</div>
+  <div class="pin-row">
     <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
     <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
     <input class="pin-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
@@ -242,50 +206,33 @@ _UNAUTH_HTML = """\
   <div class="hint">PIN printed to server console on startup.<br>Set <code>AGENT_TOKEN</code> env var for a fixed PIN.</div>
 </div>
 <script>
-(function() {
-  var authUrl = '__AUTH_URL__';
-  try {
-    new QRCode(document.getElementById('qr'), {
-      text: authUrl, width: 200, height: 200,
-      colorDark: '#000000', colorLight: '#ffffff',
-      correctLevel: QRCode.CorrectLevel.M
+(function(){
+  var digits=Array.from(document.querySelectorAll('.pin-digit'));
+  var btn=document.getElementById('go-btn'), err=document.getElementById('err');
+  function val(){ return digits.map(function(d){return d.value;}).join(''); }
+  function upd(){ btn.disabled=val().length!==6; digits.forEach(function(d){d.classList.toggle('filled',d.value!=='');}); }
+  digits.forEach(function(d,i){
+    d.addEventListener('input',function(){
+      d.value=d.value.replace(/\D/g,'').slice(0,1); upd();
+      if(d.value&&i<digits.length-1) digits[i+1].focus();
+      if(val().length===6) submitPin();
     });
-  } catch(e) { document.getElementById('qr').style.display = 'none'; }
-  var digits = Array.from(document.querySelectorAll('.pin-digit'));
-  var btn = document.getElementById('go-btn');
-  var err = document.getElementById('err');
-  function pinValue() { return digits.map(function(d){return d.value}).join(''); }
-  function updateBtn() {
-    btn.disabled = pinValue().length !== 6;
-    digits.forEach(function(d){ d.classList.toggle('filled', d.value !== ''); });
-  }
-  digits.forEach(function(d, i) {
-    d.addEventListener('input', function() {
-      d.value = d.value.replace(/\\D/g, '').slice(0, 1);
-      updateBtn();
-      if (d.value && i < digits.length - 1) digits[i+1].focus();
-      if (pinValue().length === 6) submitPin();
+    d.addEventListener('keydown',function(e){
+      if(e.key==='Backspace'&&!d.value&&i>0){digits[i-1].value='';digits[i-1].focus();upd();}
     });
-    d.addEventListener('keydown', function(e) {
-      if (e.key === 'Backspace' && !d.value && i > 0) {
-        digits[i-1].value = ''; digits[i-1].focus(); updateBtn();
-      }
-    });
-    d.addEventListener('paste', function(e) {
+    d.addEventListener('paste',function(e){
       e.preventDefault();
-      var text = (e.clipboardData || window.clipboardData).getData('text').replace(/\\D/g,'').slice(0,6);
-      text.split('').forEach(function(ch, j){ if (digits[i+j]) digits[i+j].value = ch; });
-      updateBtn();
-      digits[Math.min(i + text.length, digits.length - 1)].focus();
-      if (pinValue().length === 6) submitPin();
+      var t=(e.clipboardData||window.clipboardData).getData('text').replace(/\D/g,'').slice(0,6);
+      t.split('').forEach(function(ch,j){if(digits[i+j])digits[i+j].value=ch;});
+      upd(); digits[Math.min(i+t.length,digits.length-1)].focus();
+      if(val().length===6) submitPin();
     });
   });
   digits[0].focus();
-  window.submitPin = function() {
-    var pin = pinValue();
-    if (pin.length !== 6) return;
-    btn.disabled = true; err.textContent = '';
-    window.location.href = window.location.origin + window.location.pathname + '?token=' + encodeURIComponent(pin);
+  window.submitPin=function(){
+    var p=val(); if(p.length!==6)return;
+    btn.disabled=true; err.textContent='';
+    window.location.href=window.location.origin+window.location.pathname+'?token='+encodeURIComponent(p);
   };
 })();
 </script>
@@ -293,38 +240,38 @@ _UNAUTH_HTML = """\
 </html>"""
 
 
+# =============================================================================
+# GLOBALS
+# =============================================================================
+
 _AGENT_LOCK         = threading.Lock()
 _AGENT_LOCK_TIMEOUT = 60
+_tl                 = threading.local()
 
-_tl = threading.local()
-
-# Cross-thread store for active streaming HTTP responses keyed by request_id.
-# _tl is thread-local so _tl.current_resp is invisible from the /stop handler
-# thread — this plain dict solves that.
-_active_responses:      "dict[str, object]" = {}
-_active_responses_lock: threading.Lock      = threading.Lock()
+_active_responses:      dict          = {}
+_active_responses_lock: threading.Lock = threading.Lock()
 
 _session_lock            = threading.Lock()
-_current_session_id: "str | None" = None
+_current_session_id      = None
 _current_permission_mode = Config.PERMISSION_MODE
 
-_stop_events:      "dict[str, threading.Event]" = {}
-_stop_events_lock = threading.Lock()
+_stop_events:      dict          = {}
+_stop_events_lock: threading.Lock = threading.Lock()
 
-_whisper_store: "list[str]" = []
-_whisper_lock  = threading.Lock()
+_whisper_store: list = []
+_whisper_lock        = threading.Lock()
 
 _agent_state      = "idle"
 _agent_state_lock = threading.Lock()
 
 
-def _set_agent_state(s: str) -> None:
+def _set_agent_state(s):
     global _agent_state
     with _agent_state_lock:
         _agent_state = s
 
 
-def _get_agent_state() -> str:
+def _get_agent_state():
     with _agent_state_lock:
         return _agent_state
 
@@ -332,11 +279,8 @@ def _get_agent_state() -> str:
 _PERM_MODE_MAP = {m.value: m for m in PermissionMode}
 
 
-def _resolve_permission_mode() -> PermissionMode:
-    return _PERM_MODE_MAP.get(
-        (_current_permission_mode or "").lower(),
-        PermissionMode.AUTO,
-    )
+def _resolve_permission_mode():
+    return _PERM_MODE_MAP.get((_current_permission_mode or "").lower(), PermissionMode.AUTO)
 
 
 # =============================================================================
@@ -345,13 +289,12 @@ def _resolve_permission_mode() -> PermissionMode:
 
 def _web_parse_stream(resp, stream_callback):
     content       = ""
-    tool_calls: "dict[int, dict]" = {}
+    tool_calls    = {}
     next_idx      = 0
     finish_reason = None
     in_think      = False
 
     resp.encoding = "utf-8"
-
     _req_id = getattr(_tl, "request_id", None)
     if _req_id:
         with _active_responses_lock:
@@ -362,12 +305,9 @@ def _web_parse_stream(resp, stream_callback):
 
     for line in resp.iter_lines(decode_unicode=True):
         if stop_event and stop_event.is_set():
-            try:
-                resp.close()
-            except Exception:
-                pass
+            try: resp.close()
+            except Exception: pass
             break
-
         if not line or not line.startswith("data: "):
             continue
         data_str = line[6:].strip()
@@ -390,12 +330,8 @@ def _web_parse_stream(resp, stream_callback):
         raw_content = delta.get("content")
         if raw_content:
             content += raw_content
-
-            # FIX-1: resolve effective callback — web mode uses _tl.token_cb
-            # directly since stream_callback is None; CLI mode uses stream_callback.
             _eff_cb     = stream_callback or getattr(_tl, "token_cb", None)
             thinking_cb = getattr(_tl, "thinking_cb", None)
-
             if _eff_cb or thinking_cb:
                 for part in re.split(r"(</?think>)", raw_content, flags=re.IGNORECASE):
                     if not part:
@@ -411,9 +347,8 @@ def _web_parse_stream(resp, stream_callback):
                         sys.stdout.flush()
                         if thinking_cb:
                             thinking_cb(part)
-                    else:
-                        if _eff_cb:
-                            _eff_cb(part)
+                    elif _eff_cb:
+                        _eff_cb(part)
 
         thinking_blocks = delta.get("thinking")
         if isinstance(thinking_blocks, list):
@@ -430,11 +365,8 @@ def _web_parse_stream(resp, stream_callback):
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", next_idx)
             if idx not in tool_calls:
-                tool_calls[idx] = {
-                    "id":       tc.get("id", f"tc_{idx}"),
-                    "type":     "function",
-                    "function": {"name": None, "arguments": ""},
-                }
+                tool_calls[idx] = {"id": tc.get("id", f"tc_{idx}"), "type": "function",
+                                   "function": {"name": None, "arguments": ""}}
                 next_idx += 1
             fn = tc.get("function") or {}
             if fn.get("name"):
@@ -449,38 +381,28 @@ def _web_parse_stream(resp, stream_callback):
     for i in sorted(tool_calls):
         tc      = tool_calls[i]
         fn_name = tc["function"]["name"]
-
         if not fn_name:
             Log.warning(f"Tool call {i} missing name — skipping")
             incomplete = True
             continue
-
         args_str = tc["function"]["arguments"]
-        Log.info(f"[PARSE] '{fn_name}' args length={len(args_str)} "
-                 f"first100={repr(args_str[:100])}")
-
+        Log.info(f"[PARSE] '{fn_name}' args length={len(args_str)} first100={repr(args_str[:100])}")
         is_empty = not args_str or not args_str.strip()
-
         if is_empty or args_str.strip() == "{}":
             if fn_name in _REQUIRED_ARG_TOOLS:
-                Log.error(f"'{fn_name}' received empty/bare args — "
-                          f"finish_reason={finish_reason!r}")
+                Log.error(f"'{fn_name}' received empty/bare args — finish_reason={finish_reason!r}")
                 incomplete = True
                 tc["function"]["arguments"] = "{}"
                 tc["_truncated"] = True
-                calls.append(tc)
-                continue
-            tc["function"]["arguments"] = "{}"
+            else:
+                tc["function"]["arguments"] = "{}"
             calls.append(tc)
             continue
-
         try:
             json.loads(args_str)
             calls.append(tc)
         except json.JSONDecodeError as parse_err:
-            Log.error(f"[PARSE] '{fn_name}' JSON decode failed at pos "
-                      f"{parse_err.pos}: {parse_err.msg} — "
-                      f"tail={repr(args_str[-80:])}")
+            Log.error(f"[PARSE] '{fn_name}' JSON decode failed: {parse_err.msg}")
             repaired = False
             if len(args_str) < 500:
                 opens, closes = args_str.count("{"), args_str.count("}")
@@ -489,143 +411,110 @@ def _web_parse_stream(resp, stream_callback):
                     try:
                         json.loads(candidate)
                         tc["function"]["arguments"] = candidate
-                        Log.info(f"[PARSE] Auto-repaired '{fn_name}': "
-                                 f"added {opens - closes} brace(s)")
                         incomplete = True
                         calls.append(tc)
                         repaired = True
                     except json.JSONDecodeError:
                         pass
             if not repaired:
-                Log.error(f"[PARSE] '{fn_name}' unrecoverable JSON — marking truncated "
-                          f"({'short' if len(args_str) < 500 else 'large'} payload, "
-                          f"{len(args_str)} chars)")
                 incomplete = True
                 tc["function"]["arguments"] = "{}"
                 tc["_truncated"] = True
                 calls.append(tc)
 
     if finish_reason == "length":
-        Log.warning("\u26a0\ufe0f  Generation stopped: output token limit hit (finish_reason=length)")
+        Log.warning("\u26a0\ufe0f  Generation stopped: output token limit hit")
         incomplete = True
     elif finish_reason == "stop" and incomplete:
         Log.warning("\u26a0\ufe0f  finish_reason=stop but tool calls were incomplete")
     elif finish_reason is None and incomplete:
-        Log.warning("\u26a0\ufe0f  finish_reason=None \u2014 stream may have ended prematurely")
+        Log.warning("\u26a0\ufe0f  finish_reason=None — stream may have ended prematurely")
 
     clean_content, _ = strip_thinking(content)
-    return {
-        "content":       clean_content,
-        "tool_calls":    calls or None,
-        "incomplete":    incomplete,
-        "finish_reason": finish_reason,
-    }
+    return {"content": clean_content, "tool_calls": calls or None,
+            "incomplete": incomplete, "finish_reason": finish_reason}
 
 
 LLMClient._parse_stream = staticmethod(_web_parse_stream)
 
 
 # =============================================================================
-# MOJIBAKE FIX
-# =============================================================================
-
-def _fix_mojibake(s: str) -> str:
-    if not s:
-        return s
-    try:
-        return s.encode("latin-1").decode("utf-8")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return s
-
-
-# =============================================================================
 # BROADCAST / STREAM QUEUES
 # =============================================================================
 
-_stream_queues: "list[queue.Queue]" = []
+_stream_queues      = []
 _stream_queues_lock = threading.Lock()
 
 
-def _broadcast(item: tuple) -> None:
+def _broadcast(item):
     kind, payload = item
     if isinstance(payload, str):
-        payload = _fix_mojibake(payload)
-        item    = (kind, payload)
+        try:
+            payload = payload.encode("latin-1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+        item = (kind, payload)
     _chatlog_append(item)
     with _stream_queues_lock:
         queues = list(_stream_queues)
     for q in queues:
-        try:
-            q.put_nowait(item)
-        except Exception:
-            pass
+        try: q.put_nowait(item)
+        except Exception: pass
 
 
-def _register_stream_q() -> "queue.Queue":
-    q: queue.Queue = queue.Queue()
+def _register_stream_q():
+    q = queue.Queue()
     with _stream_queues_lock:
         _stream_queues.append(q)
     return q
 
 
-def _unregister_stream_q(q: "queue.Queue") -> None:
+def _unregister_stream_q(q):
     with _stream_queues_lock:
-        try:
-            _stream_queues.remove(q)
-        except ValueError:
-            pass
+        try: _stream_queues.remove(q)
+        except ValueError: pass
 
 
 # =============================================================================
 # PERSISTENT CHAT LOG
 # =============================================================================
 
-_chat_logs: "dict[str, list]" = defaultdict(list)
+_chat_logs     = defaultdict(list)
 _chat_log_lock = threading.Lock()
-
-_REPLAY_KINDS = frozenset({"token", "thinking", "tool", "status",
-                            "iteration", "done", "error", "session"})
-
-# FIX-7: explicit sentinel avoids None-keyed stale merges on /new
 _NO_SESSION_KEY = "_none_"
+_REPLAY_KINDS   = frozenset({"token", "thinking", "tool", "status",
+                              "iteration", "done", "error", "session"})
 
 
-def _chatlog_session_key() -> str:
-    with _session_lock:
-        sid = _current_session_id
+def _clog_key(sid):
     return sid if sid else _NO_SESSION_KEY
 
 
-def _chatlog_append(item: tuple) -> None:
-    kind, _ = item
-    if kind not in _REPLAY_KINDS:
+def _chatlog_append(item):
+    if item[0] not in _REPLAY_KINDS:
         return
-    key = _chatlog_session_key()
+    key = _clog_key(_current_session_id)
     with _chat_log_lock:
         _chat_logs[key].append(item)
 
 
-def _chatlog_get(session_id: "str | None") -> "list[tuple]":
-    key = session_id if session_id else _NO_SESSION_KEY
+def _chatlog_get(sid):
     with _chat_log_lock:
-        return list(_chat_logs.get(key, []))
+        return list(_chat_logs.get(_clog_key(sid), []))
 
 
-def _chatlog_clear(session_id: "str | None") -> None:
-    key = session_id if session_id else _NO_SESSION_KEY
+def _chatlog_clear(sid):
     with _chat_log_lock:
-        _chat_logs.pop(key, None)
+        _chat_logs.pop(_clog_key(sid), None)
 
 
-def _chatlog_merge_keys(old_sid: "str | None", new_sid: "str | None") -> None:
-    old_key = old_sid if old_sid else _NO_SESSION_KEY
-    new_key = new_sid if new_sid else _NO_SESSION_KEY
-    if old_key == new_key:
+def _chatlog_merge_keys(old_sid, new_sid):
+    ok, nk = _clog_key(old_sid), _clog_key(new_sid)
+    if ok == nk:
         return
     with _chat_log_lock:
-        if old_key in _chat_logs:
-            merged = _chat_logs.pop(old_key, []) + _chat_logs.get(new_key, [])
-            _chat_logs[new_key] = merged
+        if ok in _chat_logs:
+            _chat_logs[nk] = _chat_logs.pop(ok, []) + _chat_logs.get(nk, [])
 
 
 # =============================================================================
@@ -633,7 +522,7 @@ def _chatlog_merge_keys(old_sid: "str | None", new_sid: "str | None") -> None:
 # =============================================================================
 
 class _AgentStopped(BaseException):
-    """Raised inside the agent thread when the user clicks Stop."""
+    pass
 
 
 # =============================================================================
@@ -641,17 +530,14 @@ class _AgentStopped(BaseException):
 # =============================================================================
 
 class _PatchedHSC(_OrigHSC):
-    def __call__(self, token: str):
+    def __call__(self, token):
         super().__call__(token)
         if token:
             cb = getattr(_tl, "token_cb", None)
             if cb:
-                try:
-                    cb(token)
-                except _AgentStopped:
-                    raise
-                except Exception:
-                    pass
+                try: cb(token)
+                except _AgentStopped: raise
+                except Exception: pass
 
 
 agent_tools._HeaderStreamCb     = _PatchedHSC
@@ -659,7 +545,7 @@ _agent_main_mod._HeaderStreamCb = _PatchedHSC
 
 
 # =============================================================================
-# THINKING CALLBACK HELPERS
+# THINKING HELPERS
 # =============================================================================
 
 def _make_thinking_helpers():
@@ -681,7 +567,7 @@ def _make_thinking_helpers():
 
 
 # =============================================================================
-# EVENT NOISE FILTER
+# EVENT NOISE FILTER + PUSH
 # =============================================================================
 
 _STATUS_NOISE = frozenset({
@@ -692,58 +578,41 @@ _STATUS_NOISE = frozenset({
 })
 
 
-def _is_noisy(msg: str) -> bool:
+def _is_noisy(msg):
     ml = msg.lower()
     return any(ml.startswith(kw) or kw in ml[:40] for kw in _STATUS_NOISE)
 
 
-# =============================================================================
-# SHARED EVENT HANDLER
-# =============================================================================
-
-def _push_event(event, stop_event: "threading.Event | None", last_status: list,
-                flush_thinking=None) -> None:
+def _push_event(event, stop_event, last_status, flush_thinking=None):
     if stop_event and stop_event.is_set():
         return
-    etype = event.type
-    edata = event.data
+    etype, edata = event.type, event.data
     if etype == "tool_call":
-        if flush_thinking:
-            flush_thinking()
-        name    = edata.get("name", "?")
-        preview = edata.get("args_preview", "")[:50]
-        _broadcast(("tool", f"{name}({preview})"))
+        if flush_thinking: flush_thinking()
+        _broadcast(("tool", f"{edata.get('name','?')}({edata.get('args_preview','')[:50]})"))
     elif etype == "tool_result":
-        mark = "\u2713" if edata.get("success") else "\u2717"
-        _broadcast(("tool", f"{mark} {edata.get('name', '')}"))
+        _broadcast(("tool", f"{'✓' if edata.get('success') else '✗'} {edata.get('name','')}"))
     elif etype == "iteration":
-        if flush_thinking:
-            flush_thinking()
+        if flush_thinking: flush_thinking()
         _broadcast(("iteration", f"{edata.get('n')}/{edata.get('max')}"))
     elif etype in ("log", "warning", "error"):
         msg = edata.get("message") or edata.get("error") or ""
-        if not msg:
-            return
-        if etype == "error" or (not _is_noisy(msg) and msg != last_status[0]):
+        if msg and (etype == "error" or (not _is_noisy(msg) and msg != last_status[0])):
             last_status[0] = msg
             _broadcast(("status", msg[:100]))
     elif etype == "waiting":
         _broadcast(("status", f"waiting until {edata.get('resume_after')}"))
     elif etype == "complete":
-        _broadcast(("status", f"done \u2014 {edata.get('reason', '')}"))
+        _broadcast(("status", f"done — {edata.get('reason', '')}"))
 
 
-def _sse_response(generator) -> Response:
-    return Response(
-        generator,
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control":     "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection":        "keep-alive",
-            "Content-Type":      "text/event-stream; charset=utf-8",
-        },
-    )
+def _sse_response(generator):
+    return Response(generator, mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream; charset=utf-8",
+    })
 
 
 # =============================================================================
@@ -760,43 +629,113 @@ _TOOL_CATEGORIES = {
 }
 
 
-def _build_tools_payload() -> dict:
-    builtin: dict = {}
+def _build_tools_payload():
+    schema_map = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS}
+    builtin = {}
     for cat, names in _TOOL_CATEGORIES.items():
         tools = []
-        for schema in TOOL_SCHEMAS:
-            fn = schema.get("function", {})
-            if fn.get("name") in names:
+        for name in names:
+            fn = schema_map.get(name)
+            if fn:
                 tools.append({
-                    "name":        fn["name"],
+                    "name": name,
                     "description": fn.get("description", ""),
-                    "params":      list(fn.get("parameters", {}).get("properties", {}).keys()),
-                    "required":    fn.get("parameters", {}).get("required", []),
+                    "params": list(fn.get("parameters", {}).get("properties", {}).keys()),
+                    "required": fn.get("parameters", {}).get("required", []),
                 })
         if tools:
             builtin[cat] = tools
 
-    mcp_groups: dict = {}
+    mcp_groups = {}
     for client in _global_mcp.clients:
         if not client.health_check():
             continue
-        tools = [
-            {
-                "name":        t.get("name", ""),
-                "description": t.get("description", ""),
-                "params":      list(t.get("inputSchema", {}).get("properties", {}).keys()),
-                "required":    t.get("inputSchema", {}).get("required", []),
-            }
-            for t in client.tools
-        ]
+        tools = [{"name": t.get("name", ""), "description": t.get("description", ""),
+                  "params": list(t.get("inputSchema", {}).get("properties", {}).keys()),
+                  "required": t.get("inputSchema", {}).get("required", [])}
+                 for t in client.tools]
         if tools:
-            mcp_groups[f"MCP \u00b7 {client.name}"] = tools
+            mcp_groups[f"MCP · {client.name}"] = tools
 
     return {"builtin": builtin, "mcp": mcp_groups}
 
 
 # =============================================================================
-# HTML TEMPLATE  (v6.9.1)
+# SHARED AGENT EXECUTION
+# Handles the inner loop for both /chat and the web scheduler.
+# Caller must hold _AGENT_LOCK before calling and release it after.
+# =============================================================================
+
+def _execute_agent(message, session_id, request_id, stop_ev, permission_mode, whisper_fn=None):
+    global _current_session_id
+
+    _tl.stop_event  = stop_ev
+    _tl.request_id  = request_id
+    thinking_cb, flush_thinking = _make_thinking_helpers()
+    _tl.thinking_cb = thinking_cb
+
+    def token_cb(tok):
+        if stop_ev.is_set():
+            raise _AgentStopped()
+        _broadcast(("token", tok))
+    _tl.token_cb = token_cb
+
+    _broadcast(("session", session_id or ""))
+    _set_agent_state("running")
+    last_status = [""]
+
+    def ev_cb(event):
+        if not stop_ev.is_set():
+            _push_event(event, stop_ev, last_status, flush_thinking)
+
+    try:
+        result = run_agent(
+            message, WORKSPACE,
+            permission_mode=permission_mode,
+            resume_session=session_id,
+            plan_first=False,
+            mode="output",
+            event_callback=ev_cb,
+            soul=soul,
+            whisper_fn=whisper_fn,
+        )
+        flush_thinking()
+
+        with _session_lock:
+            _current_session_id = result.session_id
+        _chatlog_merge_keys(session_id, result.session_id)
+        _broadcast(("session", result.session_id))
+
+        if result.status == "waiting":
+            _broadcast(("done", f"waiting until {result.wait_until}"))
+            _set_agent_state("waiting")
+        elif result.status in ("error", "interrupted"):
+            _broadcast(("error", result.final_answer or result.status))
+            _set_agent_state("idle")
+        else:
+            words = (result.final_answer or "").split()
+            reason = " ".join(words[:8]) + ("\u2026" if len(words) > 8 else "")
+            _broadcast(("done", reason or result.status))
+            _set_agent_state("idle")
+
+    except _AgentStopped:
+        flush_thinking()
+        _broadcast(("done", "stopped"))
+        _set_agent_state("idle")
+    except Exception as e:
+        flush_thinking()
+        _broadcast(("error", str(e)))
+        _set_agent_state("idle")
+        Log.error(f"[agent] unhandled exception: {e}")
+        traceback.print_exc()
+    finally:
+        _tl.stop_event = _tl.request_id = _tl.thinking_cb = _tl.token_cb = None
+        with _active_responses_lock:
+            _active_responses.pop(request_id, None)
+
+
+# =============================================================================
+# HTML TEMPLATE
 # =============================================================================
 
 HTML = r"""<!DOCTYPE html>
@@ -887,13 +826,13 @@ header {
   font-family: var(--mono); font-size: 11px; padding: 5px 12px; border-radius: 5px;
   border: 1px solid var(--border); background: transparent; color: var(--text2);
   cursor: pointer; transition: border-color .12s, color .12s; white-space: nowrap; user-select: none;
+  text-decoration: none; display: inline-flex; align-items: center;
 }
 .btn:hover { border-color: var(--amber); color: var(--amber); }
 .btn.danger:hover { border-color: var(--red); color: var(--red); }
 .btn.accent { border-color: var(--teal-dim); color: var(--teal); }
 .btn.accent:hover { border-color: var(--teal); }
 
-/* ── Messages ── */
 #messages {
   flex: 1; overflow-y: auto; padding: 16px 16px 8px;
   display: flex; flex-direction: column; gap: 0;
@@ -1108,7 +1047,6 @@ header {
 }
 #elapsed-timer.show { display: inline; }
 
-/* ── Input area ── */
 #input-area {
   display: flex; flex-direction: column;
   padding: 9px 16px 11px;
@@ -1188,7 +1126,6 @@ header {
 .pi-cmd { color: var(--amber); font-weight: 600; min-width: 90px; }
 .pi-desc { color: var(--text3); font-size: 11px; }
 
-/* Panels */
 .panel {
   position: absolute; top: 0; right: 0;
   width: min(320px, 90vw); height: 100%;
@@ -1286,6 +1223,7 @@ header {
   cursor: pointer; transition: border-color .1s, color .1s; white-space: nowrap;
 }
 .ft-preview-btn:hover { border-color: var(--amber); color: var(--amber); }
+.ft-preview-btn.html-preview-btn:hover { border-color: var(--teal); color: var(--teal); }
 
 #ft-preview-content {
   flex: 1; overflow: auto; padding: 10px 12px; font-family: var(--mono);
@@ -1350,6 +1288,30 @@ header {
 }
 #replay-banner.show { display: block; }
 
+#html-preview-modal {
+  display: none; position: fixed; inset: 0; z-index: 60;
+  flex-direction: column; background: var(--bg);
+}
+#html-preview-modal.open { display: flex; }
+
+#hp-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; background: var(--surface);
+  border-bottom: 1px solid var(--border); flex-shrink: 0; min-height: 42px;
+}
+#hp-logo-mark {
+  width: 22px; height: 22px; background: var(--amber); border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: #0d0d0f; font-weight: 700; flex-shrink: 0;
+  font-family: var(--mono); user-select: none;
+}
+#hp-path {
+  flex: 1; font-size: 11px; font-family: var(--mono); color: var(--text2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#hp-toolbar-actions { display: flex; gap: 5px; flex-shrink: 0; }
+#hp-iframe { flex: 1; border: none; background: #fff; width: 100%; display: block; }
+
 @media (max-width: 520px) {
   header, #input-area, #messages { padding-left: 11px; padding-right: 11px; }
 }
@@ -1361,7 +1323,7 @@ header {
     <div class="logo">
       <div class="logo-mark">&#955;</div>
       LMAgent
-      <span class="logo-sub">v6.9.1</span>
+      <span class="logo-sub">v6.9.2</span>
     </div>
     <div class="header-right">
       <span class="session-pill" id="session-pill"></span>
@@ -1394,7 +1356,6 @@ header {
 
   <div id="input-area">
     <div id="palette"></div>
-
     <div id="img-chip">
       <img class="ic-thumb" id="ic-thumb" src="" alt="">
       <div class="ic-info">
@@ -1403,7 +1364,6 @@ header {
       </div>
       <div class="ic-remove" onclick="ImageUpload.clear()" title="Remove image">&#x2715;</div>
     </div>
-
     <div id="input-row">
       <label for="img-upload-input" class="upload-btn" id="upload-btn-lbl" title="Attach image (vision)">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1413,7 +1373,6 @@ header {
         </svg>
       </label>
       <input type="file" id="img-upload-input" accept="image/*" style="display:none">
-
       <textarea id="msg-input" rows="1" placeholder="Message or /command&hellip;"
         onkeydown="Palette.onKey(event)"
         oninput="Palette.onInput(this)"></textarea>
@@ -1440,6 +1399,7 @@ header {
       <div class="ft-preview-actions">
         <button class="ft-preview-btn" onclick="FileTree.copyPath()">copy path</button>
         <button class="ft-preview-btn" onclick="FileTree.askAgent()">ask agent</button>
+        <button class="ft-preview-btn html-preview-btn" id="hp-ft-btn" onclick="FileTree.previewHtml()" style="display:none">&#9654; preview</button>
       </div>
     </div>
     <div id="ft-preview-content" class="ft-preview-hint">click a file to preview</div>
@@ -1457,6 +1417,20 @@ header {
   <div class="panel-hdr"><span>Tools</span><button class="btn" onclick="UI.closeTools()">&#x2715;</button></div>
   <input id="tools-search" placeholder="Filter&hellip;" oninput="ToolsPanel.filter(this.value)">
   <div id="tools-list"></div>
+</div>
+
+<!-- HTML Preview Modal -->
+<div id="html-preview-modal">
+  <div id="hp-toolbar">
+    <div id="hp-logo-mark">&#955;</div>
+    <span id="hp-path">preview</span>
+    <div id="hp-toolbar-actions">
+      <button class="btn" onclick="HTMLPreview.refresh()" title="Reload page">&#8635;</button>
+      <a id="hp-popout" class="btn" href="#" target="_blank" rel="noopener" title="Open in new tab">&#8599; tab</a>
+      <button class="btn danger" onclick="HTMLPreview.close()" title="Close (Esc)">&#x2715;</button>
+    </div>
+  </div>
+  <iframe id="hp-iframe" allowfullscreen></iframe>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
@@ -1581,965 +1555,548 @@ const InputHistory = (() => {
   return { push, up, down, reset };
 })();
 
-// =============================================================================
-// IMAGE UPLOAD
-// =============================================================================
 const ImageUpload = (() => {
-  var _path    = null;
-  var _name    = null;
-  var _localURL = null;
-
-  var _chip    = function(){ return document.getElementById('img-chip'); };
-  var _thumb   = function(){ return document.getElementById('ic-thumb'); };
-  var _nameEl  = function(){ return document.getElementById('ic-name'); };
-  var _statEl  = function(){ return document.getElementById('ic-status'); };
-  var _lbl     = function(){ return document.getElementById('upload-btn-lbl'); };
+  var _path=null, _name=null, _localURL=null;
+  var _chip=function(){ return document.getElementById('img-chip'); };
+  var _thumb=function(){ return document.getElementById('ic-thumb'); };
+  var _nameEl=function(){ return document.getElementById('ic-name'); };
+  var _statEl=function(){ return document.getElementById('ic-status'); };
+  var _lbl=function(){ return document.getElementById('upload-btn-lbl'); };
 
   function _setStatus(text, cls) {
-    var el = _statEl();
-    el.textContent = text;
-    el.className   = 'ic-status' + (cls ? ' ' + cls : '');
+    var el=_statEl(); el.textContent=text; el.className='ic-status'+(cls?' '+cls:'');
   }
-
   function _showChip(file) {
     if (_localURL) URL.revokeObjectURL(_localURL);
-    _localURL = URL.createObjectURL(file);
-    _thumb().src = _localURL;
-    _nameEl().textContent = file.name;
-    _setStatus('uploading\u2026', 'busy');
-    _chip().classList.add('show');
-    _lbl().classList.add('has-image');
+    _localURL=URL.createObjectURL(file); _thumb().src=_localURL;
+    _nameEl().textContent=file.name; _setStatus('uploading\u2026','busy');
+    _chip().classList.add('show'); _lbl().classList.add('has-image');
   }
-
   async function _doUpload(file) {
-    var fd = new FormData();
-    fd.append('file', file);
+    var fd=new FormData(); fd.append('file',file);
     try {
-      var resp = await fetch('/upload', { method: 'POST', body: fd });
-      var d    = await resp.json();
-      if (!resp.ok || d.error) throw new Error(d.error || 'Upload failed');
-      _path = d.path;
-      _name = d.filename;
-      _setStatus('\u2713 ready \u2014 send a message', 'ok');
-    } catch(e) {
-      _setStatus('\u2717 ' + e.message, 'err');
-      _path = null;
-    }
+      var resp=await fetch('/upload',{method:'POST',body:fd}), d=await resp.json();
+      if(!resp.ok||d.error) throw new Error(d.error||'Upload failed');
+      _path=d.path; _name=d.filename; _setStatus('\u2713 ready \u2014 send a message','ok');
+    } catch(e) { _setStatus('\u2717 '+e.message,'err'); _path=null; }
   }
-
-  function onFileChange(inp) {
-    if (!inp.files || !inp.files[0]) return;
-    var f = inp.files[0];
-    inp.value = '';
-    _showChip(f);
-    _doUpload(f);
-  }
-
   function clear() {
-    _path = _name = null;
-    if (_localURL) { URL.revokeObjectURL(_localURL); _localURL = null; }
-    _chip().classList.remove('show');
-    _lbl().classList.remove('has-image');
-    _thumb().src = '';
+    _path=_name=null;
+    if(_localURL){URL.revokeObjectURL(_localURL);_localURL=null;}
+    _chip().classList.remove('show'); _lbl().classList.remove('has-image'); _thumb().src='';
   }
-
   function getPendingPath() { return _path; }
-
   function consumeForMessage() {
-    if (!_path) return { suffix: '', previewURL: null };
-    var p = _path;
-    var url = _localURL;
-    _path = _name = null;
-    _localURL = null;
-    _chip().classList.remove('show');
-    _lbl().classList.remove('has-image');
-    _thumb().src = '';
-    return {
-        suffix: '\n[Attached image: ' + p + ' — please use the vision tool to analyze it]',
-        previewURL: url
-    };
+    if(!_path) return {suffix:'',previewURL:null};
+    var p=_path, url=_localURL;
+    _path=_name=_localURL=null;
+    _chip().classList.remove('show'); _lbl().classList.remove('has-image'); _thumb().src='';
+    return {suffix:'\n[Attached image: '+p+' \u2014 please use the vision tool to analyze it]',previewURL:url};
   }
-
   function initDragDrop() {
-    var pane = document.getElementById('messages');
-
-    pane.addEventListener('dragenter', function(e) {
-      if (!_hasDragImage(e)) return;
-      e.preventDefault(); pane.classList.add('drag-over');
+    var pane=document.getElementById('messages');
+    function _hasImg(e){ return e.dataTransfer&&Array.from(e.dataTransfer.types).includes('Files'); }
+    pane.addEventListener('dragenter',function(e){ if(!_hasImg(e))return; e.preventDefault(); pane.classList.add('drag-over'); });
+    pane.addEventListener('dragover',function(e){ if(!_hasImg(e))return; e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+    pane.addEventListener('dragleave',function(e){ if(!pane.contains(e.relatedTarget)) pane.classList.remove('drag-over'); });
+    pane.addEventListener('drop',function(e){
+      pane.classList.remove('drag-over'); if(!_hasImg(e))return; e.preventDefault();
+      var files=Array.from(e.dataTransfer.files).filter(function(f){return f.type.startsWith('image/');});
+      if(!files.length)return; _showChip(files[0]); _doUpload(files[0]);
     });
-    pane.addEventListener('dragover', function(e) {
-      if (!_hasDragImage(e)) return;
-      e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
-    });
-    pane.addEventListener('dragleave', function(e) {
-      if (!pane.contains(e.relatedTarget)) pane.classList.remove('drag-over');
-    });
-    pane.addEventListener('drop', function(e) {
-      pane.classList.remove('drag-over');
-      if (!_hasDragImage(e)) return;
-      e.preventDefault();
-      var files = Array.from(e.dataTransfer.files).filter(function(f){ return f.type.startsWith('image/'); });
-      if (!files.length) return;
-      _showChip(files[0]);
-      _doUpload(files[0]);
-    });
-
-    document.addEventListener('paste', function(e) {
-      var items = Array.from(e.clipboardData && e.clipboardData.items || []);
-      var imgItem = items.find(function(i){ return i.type.startsWith('image/'); });
-      if (!imgItem) return;
-      var f = imgItem.getAsFile();
-      if (!f) return;
-      var ext = f.type.split('/')[1] || 'png';
-      var named = new File([f], 'paste-' + Date.now() + '.' + ext, { type: f.type });
-      _showChip(named);
-      _doUpload(named);
+    document.addEventListener('paste',function(e){
+      var items=Array.from(e.clipboardData&&e.clipboardData.items||[]);
+      var imgItem=items.find(function(i){return i.type.startsWith('image/');});
+      if(!imgItem)return; var f=imgItem.getAsFile(); if(!f)return;
+      var ext=f.type.split('/')[1]||'png';
+      var named=new File([f],'paste-'+Date.now()+'.'+ext,{type:f.type});
+      _showChip(named); _doUpload(named);
     });
   }
-
-  function _hasDragImage(e) {
-    return e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
-  }
-
-  document.getElementById('img-upload-input').addEventListener('change', function() {
-    onFileChange(this);
-  });
-
+  document.getElementById('img-upload-input').addEventListener('change',function(){ if(this.files&&this.files[0]){_showChip(this.files[0]);_doUpload(this.files[0]);this.value='';} });
   return { clear, getPendingPath, consumeForMessage, initDragDrop };
 })();
 
 const Replay = (() => {
   function _addCopyBtn(wrap, rawText) {
-    var btn = document.createElement('button');
-    btn.className = 'msg-copy'; btn.textContent = 'copy'; btn.title = 'Copy response';
-    btn.onclick = function(e) {
-      e.stopPropagation();
-      navigator.clipboard.writeText(rawText || wrap.querySelector('.msg-body').innerText || '').then(function() {
-        btn.textContent = 'copied!'; btn.classList.add('copied');
-        setTimeout(function(){ btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
-      }).catch(function(){});
-    };
+    var btn=document.createElement('button'); btn.className='msg-copy'; btn.textContent='copy'; btn.title='Copy response';
+    btn.onclick=function(e){ e.stopPropagation(); navigator.clipboard.writeText(rawText||wrap.querySelector('.msg-body').innerText||'').then(function(){ btn.textContent='copied!'; btn.classList.add('copied'); setTimeout(function(){btn.textContent='copy';btn.classList.remove('copied');},1500); }).catch(function(){}); };
     wrap.appendChild(btn);
   }
-
   function _applyEvents(events) {
-    var tokenBuf = '', toolGroupItems = [];
-    var pane     = document.getElementById('messages');
-
+    var tokenBuf='', toolGroupItems=[];
+    var pane=document.getElementById('messages');
     function flushTokens() {
-      if (!tokenBuf.trim()) { tokenBuf = ''; return; }
-      document.getElementById('empty') && document.getElementById('empty').remove();
-      var wrap = document.createElement('div');
-      wrap.className = 'msg agent';
-      wrap.innerHTML = '<div class="msg-label">Agent</div><div class="msg-body"></div>';
-      var body = wrap.querySelector('.msg-body');
-      body.innerHTML = MD.render(tokenBuf) || _esc(tokenBuf);
-      _addCopyBtn(wrap, tokenBuf); pane.appendChild(wrap); tokenBuf = '';
+      if(!tokenBuf.trim()){tokenBuf='';return;}
+      document.getElementById('empty')&&document.getElementById('empty').remove();
+      var wrap=document.createElement('div'); wrap.className='msg agent';
+      wrap.innerHTML='<div class="msg-label">Agent</div><div class="msg-body"></div>';
+      var body=wrap.querySelector('.msg-body'); body.innerHTML=MD.render(tokenBuf)||_esc(tokenBuf);
+      _addCopyBtn(wrap,tokenBuf); pane.appendChild(wrap); tokenBuf='';
     }
     function flushTools() {
-      if (!toolGroupItems.length) return;
-      document.getElementById('empty') && document.getElementById('empty').remove();
-      var group = document.createElement('div'); group.className = 'tool-group';
-      for (var ti = 0; ti < toolGroupItems.length; ti++) {
-        var t = toolGroupItems[ti], row = document.createElement('div');
-        row.className = 'tool-row'; row.dataset.s = t.ok===null ? 'pending' : (t.ok ? 'ok' : 'fail');
-        var pv = t.args ? (t.args.slice(0,50)+(t.args.length>50?'\u2026':'')) : '';
-        row.innerHTML = '<span class="tr-icon">'+(t.ok===null?'\u25cc':(t.ok?'\u2713':'\u2717'))+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(pv?'<span class="tr-args">('+_esc(pv)+')</span>':'');
+      if(!toolGroupItems.length)return;
+      document.getElementById('empty')&&document.getElementById('empty').remove();
+      var group=document.createElement('div'); group.className='tool-group';
+      for(var ti=0;ti<toolGroupItems.length;ti++){
+        var t=toolGroupItems[ti],row=document.createElement('div');
+        row.className='tool-row'; row.dataset.s=t.ok===null?'pending':(t.ok?'ok':'fail');
+        var pv=t.args?(t.args.slice(0,50)+(t.args.length>50?'\u2026':'')):'';
+        row.innerHTML='<span class="tr-icon">'+(t.ok===null?'\u25cc':(t.ok?'\u2713':'\u2717'))+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(pv?'<span class="tr-args">('+_esc(pv)+')</span>':'');
         group.appendChild(row);
       }
-      _finaliseToolGroup(group, toolGroupItems.length); pane.appendChild(group); toolGroupItems = [];
+      _finaliseToolGroup(group,toolGroupItems.length); pane.appendChild(group); toolGroupItems=[];
     }
-    function _sysMsg(text, variant) {
-      var d = document.createElement('div');
-      d.className = 'msg sys ' + (variant||'');
-      d.innerHTML = '<div class="msg-label"></div><div class="msg-body"></div>';
-      d.querySelector('.msg-body').textContent = text; pane.appendChild(d);
-    }
-
-    var lastWasToken = false;
-    for (var ei = 0; ei < events.length; ei++) {
-      var kind = events[ei][0], payload = events[ei][1];
-      if (kind === 'token') {
-        if (!lastWasToken) flushTools(); tokenBuf += payload; lastWasToken = true;
-      } else if (kind === 'thinking') {
-        flushTokens(); flushTools(); lastWasToken = false;
-        document.getElementById('empty') && document.getElementById('empty').remove();
-        pane.appendChild(_makeThinkingBlock(payload));
-      } else if (kind === 'tool') {
-        if (lastWasToken) flushTokens(); lastWasToken = false;
-        if (payload.startsWith('\u2713') || payload.startsWith('\u2717')) {
-          var name2 = payload.slice(1).trim();
-          for (var ri = toolGroupItems.length-1; ri>=0; ri--) {
-            if (toolGroupItems[ri].name===name2 && toolGroupItems[ri].ok===null) {
-              toolGroupItems[ri].ok = payload.startsWith('\u2713'); break;
-            }
-          }
-        } else {
-          flushTokens();
-          var m2 = payload.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
-          toolGroupItems.push({ name: m2?m2[1].trim():payload, args: m2?m2[2].trim():'', ok: null });
-        }
-      } else if (kind === 'iteration') {
-        flushTokens(); flushTools(); lastWasToken = false;
-        var mm = String(payload).match(/(\d+)\/(\d+)/);
-        if (mm) _sysMsg('\u2014 iteration '+mm[1]+'/'+mm[2]+' \u2014', 'info');
-      } else if (kind === 'done') {
-        flushTokens(); flushTools(); lastWasToken = false;
-      } else if (kind === 'error') {
-        flushTokens(); flushTools(); lastWasToken = false;
-        _sysMsg('\u26a0 ' + payload, 'err');
+    function _sysMsg(text,variant){ var d=document.createElement('div'); d.className='msg sys '+(variant||''); d.innerHTML='<div class="msg-label"></div><div class="msg-body"></div>'; d.querySelector('.msg-body').textContent=text; pane.appendChild(d); }
+    var lastWasToken=false;
+    for(var ei=0;ei<events.length;ei++){
+      var kind=events[ei][0],payload=events[ei][1];
+      if(kind==='token'){if(!lastWasToken)flushTools();tokenBuf+=payload;lastWasToken=true;}
+      else if(kind==='thinking'){flushTokens();flushTools();lastWasToken=false;document.getElementById('empty')&&document.getElementById('empty').remove();pane.appendChild(_makeThinkingBlock(payload));}
+      else if(kind==='tool'){
+        if(lastWasToken)flushTokens();lastWasToken=false;
+        if(payload.startsWith('\u2713')||payload.startsWith('\u2717')){var name2=payload.slice(1).trim();for(var ri=toolGroupItems.length-1;ri>=0;ri--){if(toolGroupItems[ri].name===name2&&toolGroupItems[ri].ok===null){toolGroupItems[ri].ok=payload.startsWith('\u2713');break;}}}
+        else{flushTokens();var m2=payload.match(/^([^(]+)\(?([\s\S]*?)\)?$/);toolGroupItems.push({name:m2?m2[1].trim():payload,args:m2?m2[2].trim():'',ok:null});}
       }
+      else if(kind==='iteration'){flushTokens();flushTools();lastWasToken=false;var mm=String(payload).match(/(\d+)\/(\d+)/);if(mm)_sysMsg('\u2014 iteration '+mm[1]+'/'+mm[2]+' \u2014','info');}
+      else if(kind==='done'){flushTokens();flushTools();lastWasToken=false;}
+      else if(kind==='error'){flushTokens();flushTools();lastWasToken=false;_sysMsg('\u26a0 '+payload,'err');}
     }
-    flushTokens(); flushTools();
+    flushTokens();flushTools();
   }
-
   function run(events) {
-    if (!events || !events.length) return;
-    var banner = document.getElementById('replay-banner');
-    banner.textContent = '\u21a9 restored ' + events.length + ' events from this session';
-    banner.classList.add('show');
-    setTimeout(function(){ banner.classList.remove('show'); }, 3000);
-    var CHUNK = 200, offset = 0;
-    function nextChunk() {
-      var slice = events.slice(offset, offset + CHUNK);
-      if (!slice.length) { Scroll.jump(); return; }
-      _applyEvents(slice); offset += CHUNK; requestAnimationFrame(nextChunk);
-    }
+    if(!events||!events.length)return;
+    var banner=document.getElementById('replay-banner');
+    banner.textContent='\u21a9 restored '+events.length+' events from this session';
+    banner.classList.add('show'); setTimeout(function(){banner.classList.remove('show');},3000);
+    var CHUNK=200,offset=0;
+    function nextChunk(){ var slice=events.slice(offset,offset+CHUNK); if(!slice.length){Scroll.jump();return;} _applyEvents(slice);offset+=CHUNK;requestAnimationFrame(nextChunk); }
     requestAnimationFrame(nextChunk);
   }
   return { run };
 })();
 
 function _finaliseToolGroup(group, totalCount) {
-  if (totalCount < 3) return;
-  var okCount   = group.querySelectorAll('.tool-row[data-s="ok"]').length;
-  var failCount = group.querySelectorAll('.tool-row[data-s="fail"]').length;
-  function _label(c) {
-    if (c) return '\u25b6 ' + totalCount + ' tool call' + (totalCount!==1?'s':'') + ' \u2014 click to expand';
-    var parts = [totalCount + ' tool call' + (totalCount!==1?'s':'')];
-    if (okCount)   parts.push(okCount + ' ok');
-    if (failCount) parts.push(failCount + ' failed');
-    return '\u25bc ' + parts.join(', ') + ' \u2014 click to collapse';
-  }
-  var summary = document.createElement('div');
-  summary.className = 'tool-group-summary'; summary.textContent = _label(false);
-  group.insertBefore(summary, group.firstChild); group.classList.add('collapsible');
-  summary.onclick = function() { var c = group.classList.toggle('collapsed'); summary.textContent = _label(c); };
+  if(totalCount<3)return;
+  var okCount=group.querySelectorAll('.tool-row[data-s="ok"]').length;
+  var failCount=group.querySelectorAll('.tool-row[data-s="fail"]').length;
+  function _label(c){ if(c)return'\u25b6 '+totalCount+' tool call'+(totalCount!==1?'s':'')+' \u2014 click to expand'; var parts=[totalCount+' tool call'+(totalCount!==1?'s':'')]; if(okCount)parts.push(okCount+' ok'); if(failCount)parts.push(failCount+' failed'); return'\u25bc '+parts.join(', ')+' \u2014 click to collapse'; }
+  var summary=document.createElement('div'); summary.className='tool-group-summary'; summary.textContent=_label(false);
+  group.insertBefore(summary,group.firstChild); group.classList.add('collapsible');
+  summary.onclick=function(){var c=group.classList.toggle('collapsed');summary.textContent=_label(c);};
 }
 
 const Messages = (() => {
-  var pane = function(){ return document.getElementById('messages'); };
-  function hideEmpty() { var e = document.getElementById('empty'); if (e) e.remove(); }
-  function add(role, html, extra, asHtml) {
-    hideEmpty(); Tools.endGroup();
-    var d = document.createElement('div');
-    d.className = 'msg ' + role + (extra ? ' ' + extra : '');
-    var labels = { user: 'You', agent: 'Agent' };
-    d.innerHTML = '<div class="msg-label">'+(labels[role]||'')+'</div><div class="msg-body"></div>';
+  var pane=function(){return document.getElementById('messages');};
+  function hideEmpty(){var e=document.getElementById('empty');if(e)e.remove();}
+  function add(role,html,extra,asHtml){
+    hideEmpty();Tools.endGroup();
+    var d=document.createElement('div'); d.className='msg '+role+(extra?' '+extra:'');
+    var labels={user:'You',agent:'Agent'};
+    d.innerHTML='<div class="msg-label">'+(labels[role]||'')+'</div><div class="msg-body"></div>';
     pane().appendChild(d);
-    var body = d.querySelector('.msg-body');
-    if (html) { if (asHtml) body.innerHTML = html; else body.textContent = html; }
-    Scroll.maybe(); return body;
+    var body=d.querySelector('.msg-body');
+    if(html){if(asHtml)body.innerHTML=html;else body.textContent=html;}
+    Scroll.maybe();return body;
   }
-  function sys(text, variant) { add('sys', text, variant || ''); }
-  return { add, sys, pane, hideEmpty };
+  function sys(text,variant){add('sys',text,variant||'');}
+  return{add,sys,pane,hideEmpty};
 })();
 
 const Stream = (() => {
-  var el=null, buf='', _rafPending=false, _cursor=null;
-
-  function _attachCopyBtn(wrap, rawText) {
-    var btn = document.createElement('button');
-    btn.className='msg-copy'; btn.textContent='copy'; btn.title='Copy response';
-    btn.onclick = function(e) {
-      e.stopPropagation();
-      var copy = function(){ btn.textContent='copied!'; btn.classList.add('copied'); setTimeout(function(){ btn.textContent='copy'; btn.classList.remove('copied'); },1500); };
-      navigator.clipboard.writeText(rawText).then(copy).catch(function(){
-        var ta=document.createElement('textarea'); ta.value=rawText; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); copy();
-      });
-    };
+  var el=null,buf='',_rafPending=false,_cursor=null;
+  function _attachCopyBtn(wrap,rawText){
+    var btn=document.createElement('button'); btn.className='msg-copy'; btn.textContent='copy'; btn.title='Copy response';
+    btn.onclick=function(e){e.stopPropagation();var copy=function(){btn.textContent='copied!';btn.classList.add('copied');setTimeout(function(){btn.textContent='copy';btn.classList.remove('copied');},1500);};navigator.clipboard.writeText(rawText).then(copy).catch(function(){var ta=document.createElement('textarea');ta.value=rawText;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();copy();});};
     wrap.appendChild(btn);
   }
-
-  function _renderFinal(body, rawBuf) {
-    requestAnimationFrame(function() {
-      var wrap = body.closest('.msg');
-      if (!rawBuf.trim()) { if (wrap) wrap.remove(); }
-      else { body.innerHTML = MD.render(rawBuf)||_esc(rawBuf); if (wrap) _attachCopyBtn(wrap, rawBuf); }
+  function _renderFinal(body,rawBuf){
+    requestAnimationFrame(function(){
+      var wrap=body.closest('.msg');
+      if(!rawBuf.trim()){if(wrap)wrap.remove();}
+      else{body.innerHTML=MD.render(rawBuf)||_esc(rawBuf);if(wrap)_attachCopyBtn(wrap,rawBuf);}
       Scroll.maybe();
     });
   }
-
-  function start() {
-    buf=''; el=Messages.add('agent','');
-    _cursor=document.createElement('span'); _cursor.className='cursor'; el.appendChild(_cursor);
-  }
-  function flush() {
-    _rafPending=false; if (!el) return;
-    el.innerHTML=MD.render(buf)||_esc(buf); el.appendChild(_cursor); Scroll.maybe();
-  }
-  function token(tok) { buf+=tok; if (!_rafPending){ _rafPending=true; requestAnimationFrame(flush); } }
-  function finalize() {
-    _rafPending=false; if (!el) return;
-    var body=el, rawBuf=buf; el=null; buf=''; _cursor=null; _renderFinal(body,rawBuf);
-  }
-  function reset() {
-    _rafPending=false; if (!el) return;
-    var body=el, rawBuf=buf; el=null; buf=''; _cursor=null;
-    if (rawBuf.trim()) _renderFinal(body,rawBuf);
-    else { var wrap=body.closest('.msg'); if(wrap) wrap.remove(); }
-  }
-  function active() { return el !== null; }
-  return { start, token, finalize, reset, active };
+  function start(){buf='';el=Messages.add('agent','');_cursor=document.createElement('span');_cursor.className='cursor';el.appendChild(_cursor);}
+  function flush(){_rafPending=false;if(!el)return;el.innerHTML=MD.render(buf)||_esc(buf);el.appendChild(_cursor);Scroll.maybe();}
+  function token(tok){buf+=tok;if(!_rafPending){_rafPending=true;requestAnimationFrame(flush);}}
+  function finalize(){_rafPending=false;if(!el)return;var body=el,rawBuf=buf;el=null;buf='';_cursor=null;_renderFinal(body,rawBuf);}
+  function reset(){_rafPending=false;if(!el)return;var body=el,rawBuf=buf;el=null;buf='';_cursor=null;if(rawBuf.trim())_renderFinal(body,rawBuf);else{var wrap=body.closest('.msg');if(wrap)wrap.remove();}}
+  function active(){return el!==null;}
+  return{start,token,finalize,reset,active};
 })();
 
 const Tools = (() => {
-  var MAX=12, group=null, count=0, pending=new Map();
-
-  function ensureGroup() {
-    if (group) return group;
-    var e=document.getElementById('empty'); if(e) e.remove();
-    group=document.createElement('div'); group.className='tool-group';
-    Messages.pane().appendChild(group); count=0; return group;
-  }
-  function endGroup() { if(group&&count>0) _finaliseToolGroup(group,count); group=null; count=0; }
-
-  function makeRow(name, args) {
-    var row=document.createElement('div'); row.className='tool-row'; row.dataset.s='pending';
+  var MAX=12,group=null,count=0,pending=new Map();
+  function ensureGroup(){if(group)return group;var e=document.getElementById('empty');if(e)e.remove();group=document.createElement('div');group.className='tool-group';Messages.pane().appendChild(group);count=0;return group;}
+  function endGroup(){if(group&&count>0)_finaliseToolGroup(group,count);group=null;count=0;}
+  function makeRow(name,args){
+    var row=document.createElement('div');row.className='tool-row';row.dataset.s='pending';
     var pv=args?(args.slice(0,50)+(args.length>50?'\u2026':'')):'';
     row.innerHTML='<span class="tr-icon">\u25cc</span><span class="tr-name">'+_esc(name)+'</span>'+(pv?'<span class="tr-args">('+_esc(pv)+')</span>':'');
-    if(!pending.has(name)) pending.set(name,[]);
-    pending.get(name).push(row); return row;
+    if(!pending.has(name))pending.set(name,[]);pending.get(name).push(row);return row;
   }
-
-  function call(name, args) {
-    var g=ensureGroup(); count++;
-    if (count>MAX) {
-      var more=g.querySelector('.tool-more');
-      if (!more) {
-        more=Object.assign(document.createElement('div'),{className:'tool-more'});
-        more.onclick=function(){ more.remove(); g.querySelectorAll('[data-hidden]').forEach(function(el){delete el.dataset.hidden;el.style.display='';}); };
-        g.appendChild(more);
-      }
-      var n=count-MAX; more.textContent='+'+n+' more call'+(n!==1?'s':'')+' \u2014 click to expand';
-      var row=makeRow(name,args); row.dataset.hidden='1'; row.style.display='none'; g.insertBefore(row,more);
-    } else { g.appendChild(makeRow(name,args)); }
-    Scroll.maybe();
+  function call(name,args){
+    var g=ensureGroup();count++;
+    if(count>MAX){var more=g.querySelector('.tool-more');if(!more){more=Object.assign(document.createElement('div'),{className:'tool-more'});more.onclick=function(){more.remove();g.querySelectorAll('[data-hidden]').forEach(function(el){delete el.dataset.hidden;el.style.display='';});};g.appendChild(more);}
+    var n=count-MAX;more.textContent='+'+n+' more call'+(n!==1?'s':'')+' \u2014 click to expand';var row=makeRow(name,args);row.dataset.hidden='1';row.style.display='none';g.insertBefore(row,more);}
+    else{g.appendChild(makeRow(name,args));}Scroll.maybe();
   }
-
-  function resolve(name, ok) {
-    var q=pending.get(name); if(!q||!q.length) return;
-    var row=q.shift(); if(!q.length) pending.delete(name); if(!row) return;
-    row.dataset.s=ok?'ok':'fail'; row.querySelector('.tr-icon').textContent=ok?'\u2713':'\u2717';
-  }
-
-  function reset() { pending.clear(); endGroup(); }
-  return { call, resolve, endGroup, reset };
+  function resolve(name,ok){var q=pending.get(name);if(!q||!q.length)return;var row=q.shift();if(!q.length)pending.delete(name);if(!row)return;row.dataset.s=ok?'ok':'fail';row.querySelector('.tr-icon').textContent=ok?'\u2713':'\u2717';}
+  function reset(){pending.clear();endGroup();}
+  return{call,resolve,endGroup,reset};
 })();
 
-const Whisper = (() => {
-  function queue(text) {
-    if (!Agent.running()) { Messages.sys('Agent is not running \u2014 whisper ignored.','warn'); return; }
-    fetch('/whisper', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text}) }).catch(function(){});
+const Whisper = (() => ({
+  queue: function(text){
+    if(!Agent.running()){Messages.sys('Agent is not running \u2014 whisper ignored.','warn');return;}
+    fetch('/whisper',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text})}).catch(function(){});
   }
-  return { queue };
-})();
+}))();
 
 const Agent = (() => {
-  var state='idle', sessionId=null, requestId=null, _hadContent=false;
-
-  function setSession(id) {
-    sessionId=id;
-    var pill=document.getElementById('session-pill');
-    if(id){ pill.textContent=id.slice(-8); pill.style.display=''; } else { pill.style.display='none'; }
-  }
-  function getSession() { return sessionId; }
-  function running()    { return state !== 'idle'; }
-
-  function lockUI(on) {
-    var inp=document.getElementById('msg-input'), btn=document.getElementById('send-btn');
+  var state='idle',sessionId=null,requestId=null,_hadContent=false;
+  function setSession(id){sessionId=id;var pill=document.getElementById('session-pill');if(id){pill.textContent=id.slice(-8);pill.style.display='';}else{pill.style.display='none';}}
+  function getSession(){return sessionId;}
+  function running(){return state!=='idle';}
+  function lockUI(on){
+    var inp=document.getElementById('msg-input'),btn=document.getElementById('send-btn');
     inp.disabled=false;
-    inp.placeholder = (state==='running') ? 'Whisper to agent\u2026 (nudge mid-run, Enter to send)' : 'Message or /command\u2026';
-    if (state === 'waiting') {
-      btn.textContent = 'Resume'; btn.className = '';
-    } else {
-      btn.textContent = on ? 'Stop' : 'Send';
-      btn.className   = on ? 'stop' : '';
-    }
+    inp.placeholder=(state==='running')?'Whisper to agent\u2026 (nudge mid-run, Enter to send)':'Message or /command\u2026';
+    if(state==='waiting'){btn.textContent='Resume';btn.className='';}
+    else{btn.textContent=on?'Stop':'Send';btn.className=on?'stop':'';}
   }
-
-  function transition(next) {
-    state=next; lockUI(next!=='idle');
-    if(next==='idle') Scroll.pin();
-    Scroll.update();
-    if(next!=='idle') ElapsedTimer.start(); else ElapsedTimer.stop();
-  }
-
-  function handleEvent(evt) {
-    if (evt.type==='connect') {
+  function transition(next){state=next;lockUI(next!=='idle');if(next==='idle')Scroll.pin();Scroll.update();if(next!=='idle')ElapsedTimer.start();else ElapsedTimer.stop();}
+  function handleEvent(evt){
+    if(evt.type==='connect'){
       var d=evt.data||{};
-      if(d.session) setSession(d.session);
-      if(d.mode)    Status.mode(d.mode);
-      if(d.history && d.history.length && !document.getElementById('messages').querySelectorAll('.msg').length)
-        Replay.run(d.history);
-      if(d.state==='running' && state==='idle') { transition('running'); Status.set('running\u2026','run'); }
-      else if(d.state==='waiting' && state==='idle') {
-        transition('waiting'); Status.set('waiting \u2014 scheduled resume\u2026','wait');
-        Messages.sys('\u23f0 Session waiting \u2014 will resume automatically','warn');
-      } else if(d.state==='idle' && state!=='idle') {
-        Stream.finalize(); Tools.endGroup(); transition('idle');
-        Status.set('done','done'); Status.iter('');
-        Messages.sys('\u2713 task finished','ok');
-        document.getElementById('msg-input').focus();
-      }
+      if(d.session)setSession(d.session);
+      if(d.mode)Status.mode(d.mode);
+      if(d.history&&d.history.length&&!document.getElementById('messages').querySelectorAll('.msg').length)Replay.run(d.history);
+      if(d.state==='running'&&state==='idle'){transition('running');Status.set('running\u2026','run');}
+      else if(d.state==='waiting'&&state==='idle'){transition('waiting');Status.set('waiting \u2014 scheduled resume\u2026','wait');Messages.sys('\u23f0 Session waiting \u2014 will resume automatically','warn');}
+      else if(d.state==='idle'&&state!=='idle'){Stream.finalize();Tools.endGroup();transition('idle');Status.set('done','done');Status.iter('');Messages.sys('\u2713 task finished','ok');document.getElementById('msg-input').focus();}
       return;
     }
-
-    if(state==='waiting' && evt.type!=='connect') { transition('running'); Tools.reset(); Stream.reset(); }
-
-    switch(evt.type) {
-      case 'token':
-        Tools.endGroup();
-        if(!Stream.active()) Stream.start();
-        Stream.token(evt.data); _hadContent=true; break;
-
-      case 'thinking':
-        Stream.finalize(); Tools.endGroup(); Messages.hideEmpty();
-        Messages.pane().appendChild(_makeThinkingBlock(evt.data));
-        Scroll.maybe(); _hadContent=true; break;
-
-      case 'session': setSession(evt.data); break;
-
-      case 'tool': {
-        var t=evt.data;
-        if(t.startsWith('\u2713')||t.startsWith('\u2717')) {
-          Tools.resolve(t.slice(1).trim(), t.startsWith('\u2713'));
-        } else {
-          Stream.finalize();
-          var m=t.match(/^([^(]+)\(?([\s\S]*?)\)?$/);
-          Tools.call(m?m[1].trim():t, m?m[2].trim():''); _hadContent=true;
-        }
-        break;
-      }
-
-      case 'status': Status.set(evt.data,'run'); break;
-
-      case 'iteration': {
-        var mi=String(evt.data).match(/(\d+)\/(\d+)/);
-        if(mi){
-          Stream.finalize(); Tools.endGroup();
-          if(_hadContent) Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014','info');
-          _hadContent=false; Status.iter(mi[1]+'/'+mi[2]);
-        }
-        break;
-      }
-
-      case 'done':   onDone(evt.data); break;
-
-      case 'error':
-        Stream.finalize(); Tools.endGroup();
-        Messages.sys('\u26a0 ' + evt.data,'err');
-        transition('idle'); Status.set('error','err'); Status.iter(''); break;
+    if(state==='waiting'&&evt.type!=='connect'){transition('running');Tools.reset();Stream.reset();}
+    switch(evt.type){
+      case 'token': Tools.endGroup();if(!Stream.active())Stream.start();Stream.token(evt.data);_hadContent=true;break;
+      case 'thinking': Stream.finalize();Tools.endGroup();Messages.hideEmpty();Messages.pane().appendChild(_makeThinkingBlock(evt.data));Scroll.maybe();_hadContent=true;break;
+      case 'session': setSession(evt.data);break;
+      case 'tool':{var t=evt.data;if(t.startsWith('\u2713')||t.startsWith('\u2717')){Tools.resolve(t.slice(1).trim(),t.startsWith('\u2713'));}else{Stream.finalize();var m=t.match(/^([^(]+)\(?([\s\S]*?)\)?$/);Tools.call(m?m[1].trim():t,m?m[2].trim():'');_hadContent=true;}break;}
+      case 'status': Status.set(evt.data,'run');break;
+      case 'iteration':{var mi=String(evt.data).match(/(\d+)\/(\d+)/);if(mi){Stream.finalize();Tools.endGroup();if(_hadContent)Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014','info');_hadContent=false;Status.iter(mi[1]+'/'+mi[2]);}break;}
+      case 'done': onDone(evt.data);break;
+      case 'error': Stream.finalize();Tools.endGroup();Messages.sys('\u26a0 '+evt.data,'err');transition('idle');Status.set('error','err');Status.iter('');break;
     }
   }
-
-  function onDone(reason) {
-    Stream.finalize(); Tools.endGroup(); Status.iter('');
-    var isWait=String(reason||'').startsWith('waiting');
-    var isErr=reason==='error'||reason==='stopped';
-    if(isWait) {
-      transition('waiting'); Status.set('waiting \u2014 will resume automatically','wait');
-      Messages.sys('\u23f8 '+reason,'warn');
-    } else {
-      transition('idle'); Status.set(reason||'done', isErr?'err':'done');
-      if(reason==='stopped') Messages.sys('\u2014 stopped \u2014','warn');
-      else if(!isErr) Messages.sys('\u2713 '+((reason||'').replace(/\s*\u2713\s*$/,'').trim()||'task finished'),'ok');
-      document.getElementById('msg-input').focus();
-    }
+  function onDone(reason){
+    Stream.finalize();Tools.endGroup();Status.iter('');
+    var isWait=String(reason||'').startsWith('waiting'),isErr=reason==='error'||reason==='stopped';
+    if(isWait){transition('waiting');Status.set('waiting \u2014 will resume automatically','wait');Messages.sys('\u23f8 '+reason,'warn');}
+    else{transition('idle');Status.set(reason||'done',isErr?'err':'done');if(reason==='stopped')Messages.sys('\u2014 stopped \u2014','warn');else if(!isErr)Messages.sys('\u2713 '+((reason||'').replace(/\s*\u2713\s*$/,'').trim()||'task finished'),'ok');document.getElementById('msg-input').focus();}
   }
-
-  async function send(text) {
-    if(state!=='idle') return;
-
-    var consumed   = ImageUpload.consumeForMessage();
-    var imgSuffix  = consumed.suffix;
-    var previewURL = consumed.previewURL;
-    var fullText   = text + imgSuffix;
-
-    var body = Messages.add('user', text);
-    if (previewURL) {
-        var img = document.createElement('img');
-        img.className = 'msg-img'; img.src = previewURL; img.alt = 'attached image';
-        body.appendChild(img);
-        img.onload = function() { URL.revokeObjectURL(previewURL); };
-    }
-
-    Scroll.pin(); transition('running'); Status.set('thinking\u2026','run');
-    Tools.reset(); _hadContent=false;
+  async function send(text){
+    if(state!=='idle')return;
+    var consumed=ImageUpload.consumeForMessage(),imgSuffix=consumed.suffix,previewURL=consumed.previewURL,fullText=text+imgSuffix;
+    var body=Messages.add('user',text);
+    if(previewURL){var img=document.createElement('img');img.className='msg-img';img.src=previewURL;img.alt='attached image';body.appendChild(img);img.onload=function(){URL.revokeObjectURL(previewURL);};}
+    Scroll.pin();transition('running');Status.set('thinking\u2026','run');Tools.reset();_hadContent=false;
     requestId='r'+Date.now()+Math.random().toString(36).slice(2,6);
-
-    try {
-      var resp = await fetch('/chat', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({ message: fullText, session_id: sessionId, request_id: requestId }),
-      });
-      if(!resp.ok) {
-        var err=await resp.json().catch(function(){ return {error:'HTTP '+resp.status}; });
-        throw new Error(err.error||'HTTP '+resp.status);
-      }
-    } catch(err) {
-      Stream.finalize(); Tools.endGroup();
-      Messages.sys('Failed to send: '+err.message,'err');
-      transition('idle'); Status.set('error','err'); Status.iter('');
-    }
+    try{
+      var resp=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:fullText,session_id:sessionId,request_id:requestId})});
+      if(!resp.ok){var err=await resp.json().catch(function(){return{error:'HTTP '+resp.status};});throw new Error(err.error||'HTTP '+resp.status);}
+    }catch(err){Stream.finalize();Tools.endGroup();Messages.sys('Failed to send: '+err.message,'err');transition('idle');Status.set('error','err');Status.iter('');}
   }
-
-  function stop() {
-    if(state==='waiting') { transition('idle'); Status.set('wait dismissed',''); Messages.sys('\u2014 wait dismissed (session saved) \u2014','warn'); return; }
-    if(state!=='running') return;
-    if(requestId) {
-      fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id:requestId})}).catch(function(){});
-      requestId=null;
-    }
-    Stream.reset(); Tools.endGroup();
-    Messages.sys('\u2014 stopped \u2014','warn');
-    transition('idle'); Status.set('stopped',''); Status.iter('');
+  function stop(){
+    if(state==='waiting'){transition('idle');Status.set('wait dismissed','');Messages.sys('\u2014 wait dismissed (session saved) \u2014','warn');return;}
+    if(state!=='running')return;
+    if(requestId){fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id:requestId})}).catch(function(){});requestId=null;}
+    Stream.reset();Tools.endGroup();Messages.sys('\u2014 stopped \u2014','warn');transition('idle');Status.set('stopped','');Status.iter('');
   }
-
-  async function newSession() {
-    if(state!=='idle') { stop(); return; }
-    try { await fetch('/new',{method:'POST'}); } catch(_) {}
-    sessionId=null; requestId=null; _hadContent=false;
-    setSession(null); Tools.reset(); Stream.reset(); ImageUpload.clear();
+  async function newSession(){
+    if(state!=='idle'){stop();return;}
+    try{await fetch('/new',{method:'POST'});}catch(_){}
+    sessionId=null;requestId=null;_hadContent=false;setSession(null);Tools.reset();Stream.reset();ImageUpload.clear();
     document.getElementById('messages').innerHTML='<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">&#955;_</div><p>Send a message to start</p><div class="hint">/ for commands &nbsp;&middot;&nbsp; &uarr;&darr; history &nbsp;&middot;&nbsp; drag image to upload</div></div>';
-    Status.set('ready',''); Status.iter('');
-    document.getElementById('msg-input').focus();
+    Status.set('ready','');Status.iter('');document.getElementById('msg-input').focus();
   }
-
-  function sendOrStop() {
-    if (state === 'waiting') {
-      var inp=document.getElementById('msg-input'), text=inp.value.trim();
-      if (text) {
-        inp.value=''; inp.style.height='auto';
-        transition('idle');
-        InputHistory.push(text);
-        Messages.add('user', text);
-        send(text);
-      } else {
-        stop();
-      }
-      return;
-    }
-    if(state!=='idle') {
-      var inp=document.getElementById('msg-input'), text=inp.value.trim();
-      if(text) {
-        inp.value=''; inp.style.height='auto';
-        Whisper.queue(text);
-        Messages.sys('\ud83d\udcac whisper sent \u2014 agent will receive it on next iteration','ok');
-      } else { stop(); }
-    } else { _triggerSend(); }
+  function sendOrStop(){
+    if(state==='waiting'){var inp=document.getElementById('msg-input'),text=inp.value.trim();if(text){inp.value='';inp.style.height='auto';transition('idle');InputHistory.push(text);Messages.add('user',text);send(text);}else{stop();}return;}
+    if(state!=='idle'){var inp=document.getElementById('msg-input'),text=inp.value.trim();if(text){inp.value='';inp.style.height='auto';Whisper.queue(text);Messages.sys('\ud83d\udcac whisper sent \u2014 agent will receive it on next iteration','ok');}else{stop();}}
+    else{_triggerSend();}
   }
-
-  function _triggerSend() {
-    var inp=document.getElementById('msg-input'), text=inp.value.trim();
-    if(!text && !ImageUpload.getPendingPath()) return;
-    if(!text) text='Please analyze the attached image.';
-    inp.value=''; inp.style.height='auto';
-    Palette.close(); InputHistory.reset();
-    if(text.startsWith('/') && !ImageUpload.getPendingPath()) { Messages.add('user',text); SlashCmds.run(text); }
-    else { InputHistory.push(text); send(text); }
+  function _triggerSend(){
+    var inp=document.getElementById('msg-input'),text=inp.value.trim();
+    if(!text&&!ImageUpload.getPendingPath())return;
+    if(!text)text='Please analyze the attached image.';
+    inp.value='';inp.style.height='auto';Palette.close();InputHistory.reset();
+    if(text.startsWith('/')&&!ImageUpload.getPendingPath()){Messages.add('user',text);SlashCmds.run(text);}
+    else{InputHistory.push(text);send(text);}
   }
-
-  return { sendOrStop, newSession, running, getSession, setSession, _handle: handleEvent };
+  return{sendOrStop,newSession,running,getSession,setSession,_handle:handleEvent};
 })();
 
-(function initStream() {
-  var es=null, retryMs=1000;
-  function connect() {
+(function initStream(){
+  var es=null,retryMs=1000;
+  function connect(){
     ConnDot.try();
     es=new EventSource('/stream?token='+encodeURIComponent(_AGENT_TOKEN));
-    es.onopen=function(){ ConnDot.ok(); retryMs=1000; };
-    es.onmessage=function(e){
-      if(!e.data||e.data==='[DONE]') return;
-      try { Agent._handle(JSON.parse(e.data)); } catch(_) {}
-    };
-    es.onerror=function(){ es.close(); ConnDot.err(); setTimeout(connect,retryMs); retryMs=Math.min(retryMs*2,30000); };
+    es.onopen=function(){ConnDot.ok();retryMs=1000;};
+    es.onmessage=function(e){if(!e.data||e.data==='[DONE]')return;try{Agent._handle(JSON.parse(e.data));}catch(_){}};
+    es.onerror=function(){es.close();ConnDot.err();setTimeout(connect,retryMs);retryMs=Math.min(retryMs*2,30000);};
   }
   connect();
 })();
 
 ImageUpload.initDragDrop();
 
-// =============================================================================
-// FILE TREE
-// =============================================================================
+const HTMLPreview = (() => {
+  var _isOpen=false;
+  function _isHtml(path){var lp=(path||'').toLowerCase();return lp.endsWith('.html')||lp.endsWith('.htm');}
+  function open(path){
+    if(!path)return;
+    var rel=path.replace(/^\/+/,''),url='/serve/'+rel;
+    document.getElementById('hp-path').textContent=rel;
+    document.getElementById('hp-popout').href=url;
+    document.getElementById('hp-iframe').src=url;
+    document.getElementById('html-preview-modal').classList.add('open');
+    UI.closeAll();_isOpen=true;
+  }
+  function close(){document.getElementById('html-preview-modal').classList.remove('open');document.getElementById('hp-iframe').src='';_isOpen=false;}
+  function refresh(){var iframe=document.getElementById('hp-iframe');try{iframe.contentWindow.location.reload();}catch(_){var s=iframe.src;iframe.src='';iframe.src=s;}}
+  function isOpen(){return _isOpen;}
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&_isOpen){e.preventDefault();close();}});
+  return{open,close,refresh,isOpen,_isHtml};
+})();
+
 const FileTree = (() => {
-  var _expanded={}, _children={}, _loading={}, _selected=null, _filter='', _autoTimer=null, _lastMtime=0;
-
+  var _expanded={},_children={},_loading={},_selected=null,_filter='',_autoTimer=null,_lastMtime=0;
   var _EXT_MAP={'.py':'.py','.pyw':'.py','.js':'.js','.mjs':'.js','.jsx':'.js','.ts':'.ts','.tsx':'.ts','.html':'.html','.htm':'.html','.css':'.css','.scss':'.css','.sass':'.css','.less':'.css','.md':'.md','.markdown':'.md','.json':'.json','.jsonl':'.json','.sh':'.sh','.bash':'.sh','.zsh':'.sh','.fish':'.sh','.xml':'.xml','.yml':'.yml','.yaml':'.yml','.txt':'.txt'};
-  function _extKey(ext){ var k=_EXT_MAP[ext]; return k?k.slice(1):'def'; }
-  function _fmtSize(b){ if(!b)return''; if(b<1024)return b+'B'; if(b<1048576)return(b/1024).toFixed(1)+'K'; return(b/1048576).toFixed(1)+'M'; }
-
-  async function _fetchDir(path) {
-    _loading[path]=true;
-    try { var r=await fetch('/filetree?path='+encodeURIComponent(path)), d=await r.json(); if(d.error)throw new Error(d.error); _children[path]=d.entries||[]; }
-    finally { delete _loading[path]; }
-    return _children[path];
-  }
-  async function _fetchFile(path){ var r=await fetch('/fileread?path='+encodeURIComponent(path)); return await r.json(); }
-  async function _fetchMtime(){ try{ var r=await fetch('/workspace/mtime'),d=await r.json(); return d.mtime||0; }catch(_){return 0;} }
-
+  function _extKey(ext){var k=_EXT_MAP[ext];return k?k.slice(1):'def';}
+  function _fmtSize(b){if(!b)return'';if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'K';return(b/1048576).toFixed(1)+'M';}
+  async function _fetchDir(path){_loading[path]=true;try{var r=await fetch('/filetree?path='+encodeURIComponent(path)),d=await r.json();if(d.error)throw new Error(d.error);_children[path]=d.entries||[];}finally{delete _loading[path];}return _children[path];}
+  async function _fetchFile(path){var r=await fetch('/fileread?path='+encodeURIComponent(path));return await r.json();}
+  async function _fetchMtime(){try{var r=await fetch('/workspace/mtime'),d=await r.json();return d.mtime||0;}catch(_){return 0;}}
   function _flatten(path,depth,out){
-    if(_loading[path]&&!_children[path]){ out.push({kind:'loading',depth:depth}); return; }
-    var entries=_children[path]||[], q=_filter.toLowerCase();
+    if(_loading[path]&&!_children[path]){out.push({kind:'loading',depth:depth});return;}
+    var entries=_children[path]||[],q=_filter.toLowerCase();
     var filtered=q?entries.filter(function(e){return e.name.toLowerCase().indexOf(q)!==-1||e.type==='dir';}):entries;
-    for(var i=0;i<filtered.length;i++){
-      var e=filtered[i]; out.push({kind:'entry',depth:depth,entry:e});
-      if(e.type==='dir'&&_expanded[e.path]) _flatten(e.path,depth+1,out);
-    }
+    for(var i=0;i<filtered.length;i++){var e=filtered[i];out.push({kind:'entry',depth:depth,entry:e});if(e.type==='dir'&&_expanded[e.path])_flatten(e.path,depth+1,out);}
   }
-
   function _render(){
-    var el=document.getElementById('ft-tree'); if(!el)return;
-    var panel=document.getElementById('files-panel'); if(!panel||!panel.classList.contains('open'))return;
-    var nodes=[]; _flatten('.',0,nodes);
-    if(!nodes.length&&_loading['.']){ el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>'; return; }
-    if(!nodes.length&&!_children['.']){ el.innerHTML='<div class="ft-msg">Empty workspace</div>'; return; }
-    if(!nodes.length){ el.innerHTML='<div class="ft-msg">No files'+(_filter?' matching \u201c'+_esc(_filter)+'\u201d':'')+' </div>'; return; }
+    var el=document.getElementById('ft-tree');if(!el)return;
+    var panel=document.getElementById('files-panel');if(!panel||!panel.classList.contains('open'))return;
+    var nodes=[];_flatten('.',0,nodes);
+    if(!nodes.length&&_loading['.']){el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>';return;}
+    if(!nodes.length&&!_children['.']){el.innerHTML='<div class="ft-msg">Empty workspace</div>';return;}
+    if(!nodes.length){el.innerHTML='<div class="ft-msg">No files'+(_filter?' matching \u201c'+_esc(_filter)+'\u201d':'')+' </div>';return;}
     var frag=document.createDocumentFragment();
     for(var i=0;i<nodes.length;i++){
-      var n=nodes[i], row=document.createElement('div');
-      if(n.kind==='loading'){
-        row.className='ft-node ft-loading-node'; row.style.paddingLeft=(n.depth*14+24)+'px';
-        row.innerHTML='<span style="color:var(--text3);font-style:italic;font-size:11px">\u2026</span>';
-        frag.appendChild(row); continue;
-      }
-      var e=n.entry, isDir=e.type==='dir', isSel=_selected===e.path, isExp=!!_expanded[e.path];
+      var n=nodes[i],row=document.createElement('div');
+      if(n.kind==='loading'){row.className='ft-node ft-loading-node';row.style.paddingLeft=(n.depth*14+24)+'px';row.innerHTML='<span style="color:var(--text3);font-style:italic;font-size:11px">\u2026</span>';frag.appendChild(row);continue;}
+      var e=n.entry,isDir=e.type==='dir',isSel=_selected===e.path,isExp=!!_expanded[e.path];
       row.className='ft-node'+(isDir?' ft-dir':' ft-file')+(isExp?' ft-expanded':'')+(isSel?' ft-selected':'');
       row.style.paddingLeft=(n.depth*14+6)+'px';
       var arrowHtml=isDir?'<span class="ft-arrow">\u25b6</span>':'<span class="ft-arrow" style="visibility:hidden">\u25b6</span>';
-      var badgeHtml='';
-      if(!isDir&&e.ext){ var cls='ft-ext-'+_extKey(e.ext); badgeHtml='<span class="ft-ext-badge '+cls+'">'+_esc(e.ext.slice(1))+'</span>'; }
+      var badgeHtml=(!isDir&&e.ext)?'<span class="ft-ext-badge ft-ext-'+_extKey(e.ext)+'">'+_esc(e.ext.slice(1))+'</span>':'';
       var sizeHtml=(!isDir&&e.size)?'<span class="ft-size">'+_fmtSize(e.size)+'</span>':'';
       row.innerHTML=arrowHtml+'<span class="ft-name" title="'+_esc(e.path)+'">'+_esc(e.name)+'</span>'+badgeHtml+sizeHtml;
-      (function(entry){
-        row.onclick=function(ev){ ev.stopPropagation(); if(entry.type==='dir') _toggleDir(entry.path); else _openFile(entry.path); };
-      })(e);
+      (function(entry){row.onclick=function(ev){ev.stopPropagation();if(entry.type==='dir')_toggleDir(entry.path);else _openFile(entry.path);};})(e);
       frag.appendChild(row);
     }
-    el.innerHTML=''; el.appendChild(frag);
+    el.innerHTML='';el.appendChild(frag);
   }
-
   async function _toggleDir(path){
-    if(_expanded[path]){ delete _expanded[path]; _render(); }
-    else {
-      _expanded[path]=true; _render();
-      if(!_children[path]&&!_loading[path]){
-        try{ await _fetchDir(path); }catch(e){ _children[path]=[]; delete _expanded[path]; }
-      }
-      _render();
-    }
+    if(_expanded[path]){delete _expanded[path];_render();}
+    else{_expanded[path]=true;_render();if(!_children[path]&&!_loading[path]){try{await _fetchDir(path);}catch(e){_children[path]=[];delete _expanded[path];}}_render();}
   }
-
   async function _openFile(path){
-    _selected=path; _render();
-    var pathEl=document.getElementById('ft-preview-path'), contentEl=document.getElementById('ft-preview-content');
-    if(pathEl) pathEl.textContent=path;
-    if(contentEl){ contentEl.className=''; contentEl.textContent='Loading\u2026'; }
-    try {
-      var d=await _fetchFile(path); if(!contentEl) return;
-      if(d.error){ contentEl.textContent='\u26a0 '+d.error; contentEl.className='ft-preview-hint'; }
-      else if(d.binary){ contentEl.textContent='[binary file \u2014 '+_fmtSize(d.size)+']'; contentEl.className='ft-preview-hint'; }
-      else {
-        contentEl.className='';
-        contentEl.textContent=(d.content!==undefined&&d.content!==null)?(d.content||'(empty file)'):'(empty file)';
-        if(d.truncated) contentEl.textContent+='\n\n[\u2026 preview truncated at 100\u00a0KB \u2026]';
-      }
-    } catch(err){ if(contentEl){ contentEl.textContent='Error: '+err.message; contentEl.className='ft-preview-hint'; } }
+    _selected=path;_render();
+    var pathEl=document.getElementById('ft-preview-path'),contentEl=document.getElementById('ft-preview-content'),hpBtn=document.getElementById('hp-ft-btn');
+    if(pathEl)pathEl.textContent=path;
+    if(hpBtn)hpBtn.style.display=HTMLPreview._isHtml(path)?'':'none';
+    if(contentEl){contentEl.className='';contentEl.textContent='Loading\u2026';}
+    try{
+      var d=await _fetchFile(path);if(!contentEl)return;
+      if(d.error){contentEl.textContent='\u26a0 '+d.error;contentEl.className='ft-preview-hint';}
+      else if(d.binary){contentEl.textContent='[binary file \u2014 '+_fmtSize(d.size)+']';contentEl.className='ft-preview-hint';}
+      else{contentEl.className='';contentEl.textContent=(d.content!==undefined&&d.content!==null)?(d.content||'(empty file)'):'(empty file)';if(d.truncated)contentEl.textContent+='\n\n[\u2026 preview truncated at 100\u00a0KB \u2026]';}
+    }catch(err){if(contentEl){contentEl.textContent='Error: '+err.message;contentEl.className='ft-preview-hint';}}
   }
-
   async function load(){
-    _expanded={}; _children={}; _loading={}; _selected=null; _lastMtime=0;
-    var el=document.getElementById('ft-tree'); if(el) el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>';
-    var pathEl=document.getElementById('ft-preview-path'), contEl=document.getElementById('ft-preview-content');
-    if(pathEl) pathEl.textContent='No file selected';
-    if(contEl){ contEl.textContent='click a file to preview'; contEl.className='ft-preview-hint'; }
+    _expanded={};_children={};_loading={};_selected=null;_lastMtime=0;
+    var el=document.getElementById('ft-tree');if(el)el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>';
+    var pathEl=document.getElementById('ft-preview-path'),contEl=document.getElementById('ft-preview-content'),hpBtn=document.getElementById('hp-ft-btn');
+    if(pathEl)pathEl.textContent='No file selected';
+    if(contEl){contEl.textContent='click a file to preview';contEl.className='ft-preview-hint';}
+    if(hpBtn)hpBtn.style.display='none';
     var lbl=document.getElementById('ft-ws-label');
-    try { var s=await fetch('/status').then(function(r){return r.json();}); if(lbl&&s.workspace){ var parts=s.workspace.replace(/\\/g,'/').split('/'); lbl.textContent=parts[parts.length-1]||'Workspace'; lbl.title=s.workspace; } } catch(_){}
-    try { await _fetchDir('.'); _lastMtime=await _fetchMtime(); _render(); }
-    catch(err){ if(el) el.innerHTML='<div class="ft-msg" style="color:var(--red)">\u26a0 '+_esc(String(err.message||err))+'</div>'; }
+    try{var s=await fetch('/status').then(function(r){return r.json();});if(lbl&&s.workspace){var parts=s.workspace.replace(/\\/g,'/').split('/');lbl.textContent=parts[parts.length-1]||'Workspace';lbl.title=s.workspace;}}catch(_){}
+    try{await _fetchDir('.');_lastMtime=await _fetchMtime();_render();}
+    catch(err){if(el)el.innerHTML='<div class="ft-msg" style="color:var(--red)">\u26a0 '+_esc(String(err.message||err))+'</div>';}
     startAutoRefresh();
   }
-
   async function refresh(){
-    var paths=['.']; Object.keys(_expanded).forEach(function(p){ if(paths.indexOf(p)===-1) paths.push(p); });
-    await Promise.all(paths.map(function(p){ return _fetchDir(p).catch(function(){}); })); _render();
+    var paths=['.']; Object.keys(_expanded).forEach(function(p){if(paths.indexOf(p)===-1)paths.push(p);});
+    await Promise.all(paths.map(function(p){return _fetchDir(p).catch(function(){});}));_render();
   }
-
-  function filter(text){ _filter=text; _render(); }
-
+  function filter(text){_filter=text;_render();}
   function copyPath(){
-    if(!_selected) return;
+    if(!_selected)return;
     var pathEl=document.getElementById('ft-preview-path');
-    navigator.clipboard.writeText(_selected).then(function(){
-      if(pathEl){ var orig=pathEl.textContent; pathEl.textContent='\u2713 copied!'; setTimeout(function(){pathEl.textContent=orig;},1200); }
-    }).catch(function(){ var ta=document.createElement('textarea'); ta.value=_selected; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); });
+    navigator.clipboard.writeText(_selected).then(function(){if(pathEl){var orig=pathEl.textContent;pathEl.textContent='\u2713 copied!';setTimeout(function(){pathEl.textContent=orig;},1200);}}).catch(function(){var ta=document.createElement('textarea');ta.value=_selected;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();});
   }
-
-  function askAgent(){
-    if(!_selected) return;
-    var inp=document.getElementById('msg-input');
-    if(inp){ inp.value=_selected; inp.focus(); inp.dispatchEvent(new Event('input')); }
-    UI.closeFiles();
-  }
-
-  function startAutoRefresh(){
-    stopAutoRefresh();
-    _autoTimer=setInterval(async function(){
-      if(typeof Agent!=='undefined'&&Agent.running()){
-        var mtime=await _fetchMtime();
-        if(mtime!==_lastMtime){ _lastMtime=mtime; refresh(); }
-      }
-    }, 2500);
-  }
-  function stopAutoRefresh(){ if(_autoTimer){ clearInterval(_autoTimer); _autoTimer=null; } }
-
-  return { load, refresh, filter, copyPath, askAgent, startAutoRefresh, stopAutoRefresh };
+  function askAgent(){if(!_selected)return;var inp=document.getElementById('msg-input');if(inp){inp.value=_selected;inp.focus();inp.dispatchEvent(new Event('input'));}UI.closeFiles();}
+  function previewHtml(){if(_selected&&HTMLPreview._isHtml(_selected))HTMLPreview.open(_selected);}
+  function startAutoRefresh(){stopAutoRefresh();_autoTimer=setInterval(async function(){if(typeof Agent!=='undefined'&&Agent.running()){var mtime=await _fetchMtime();if(mtime!==_lastMtime){_lastMtime=mtime;refresh();}}},2500);}
+  function stopAutoRefresh(){if(_autoTimer){clearInterval(_autoTimer);_autoTimer=null;}}
+  return{load,refresh,filter,copyPath,askAgent,previewHtml,startAutoRefresh,stopAutoRefresh};
 })();
 
-// =============================================================================
-// SLASH COMMANDS
-// =============================================================================
-const CMDS = [
-  { cmd:'/help',     desc:'Show commands' },
-  { cmd:'/new',      desc:'Start a fresh session' },
-  { cmd:'/files',    desc:'Browse workspace files' },
-  { cmd:'/sessions', desc:'Browse history' },
-  { cmd:'/tools',    desc:'View all tools' },
-  { cmd:'/status',   desc:'Connection info' },
-  { cmd:'/mode',     desc:'Set permission mode', arg:'<auto|normal|manual>' },
-  { cmd:'/soul',     desc:'Agent personality' },
-  { cmd:'/todo',     desc:'Session todos' },
-  { cmd:'/plan',     desc:'Active plan' },
-  { cmd:'/session',  desc:'Current session ID' },
-  { cmd:'/whisper',  desc:'Inject a nudge to the running agent', arg:'<message>' },
+const CMDS=[
+  {cmd:'/help',desc:'Show commands'},{cmd:'/new',desc:'Start a fresh session'},
+  {cmd:'/files',desc:'Browse workspace files'},{cmd:'/sessions',desc:'Browse history'},
+  {cmd:'/tools',desc:'View all tools'},{cmd:'/status',desc:'Connection info'},
+  {cmd:'/mode',desc:'Set permission mode',arg:'<auto|normal|manual>'},
+  {cmd:'/soul',desc:'Agent personality'},{cmd:'/todo',desc:'Session todos'},
+  {cmd:'/plan',desc:'Active plan'},{cmd:'/session',desc:'Current session ID'},
+  {cmd:'/whisper',desc:'Inject a nudge to the running agent',arg:'<message>'},
+  {cmd:'/preview',desc:'Preview an HTML file in the viewer',arg:'<path>'},
 ];
+const HELP_TEXT='Slash commands:\n  /help               This text\n  /new                Fresh session\n  /files              Browse workspace files\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID\n  /whisper <text>     Inject mid-run nudge\n  /preview <path>     Preview HTML file\n\nKeyboard shortcuts:\n  \u2191 / \u2193             Cycle input history\n  Ctrl+L           New session\n  Enter            Send\n  Shift+Enter      New line\n  Ctrl+V           Paste image from clipboard\n  Esc              Close HTML preview';
 
-const HELP_TEXT='Slash commands:\n  /help               This text\n  /new                Fresh session\n  /files              Browse workspace files\n  /sessions           Browse sessions\n  /tools              Tool list + MCP\n  /status             Config info\n  /mode auto|normal|manual\n  /soul               Agent personality\n  /todo               Current todos\n  /plan               Current plan\n  /session            Session ID\n  /whisper <text>     Inject mid-run nudge\n\nKeyboard shortcuts:\n  \u2191 / \u2193             Cycle input history\n  Ctrl+L           New session\n  Enter            Send\n  Shift+Enter      New line\n  Ctrl+V           Paste image from clipboard';
-
-const SlashCmds = (() => {
-  async function run(text) {
-    var parts=text.trim().split(/\s+/), cmd=parts[0].toLowerCase(), arg=parts.slice(1).join(' ');
+const SlashCmds=(() => {
+  async function run(text){
+    var parts=text.trim().split(/\s+/),cmd=parts[0].toLowerCase(),arg=parts.slice(1).join(' ');
     var sys=Messages.sys.bind(Messages);
-    switch(cmd) {
-      case '/help':     sys(HELP_TEXT,'info'); break;
-      case '/new':      Agent.newSession(); break;
-      case '/files':    UI.toggleFiles(); break;
-      case '/sessions': UI.toggleSessions(); break;
-      case '/tools':    UI.toggleTools(); break;
-      case '/session':  sys(Agent.getSession()?'Session: '+Agent.getSession():'No active session.','info'); break;
-      case '/status':
-        try { var s=await fetch('/status').then(function(r){return r.json();}); sys('Workspace : '+s.workspace+'\nLLM       : '+s.llm_url+'\nSession   : '+(s.current_session?s.current_session.slice(-8):'none')+'\nMode      : '+s.permission_mode+'\nMCP       : '+s.mcp_clients+' server'+(s.mcp_clients!==1?'s':''),'info'); }
-        catch(e){ sys('Failed: '+e.message,'err'); } break;
-      case '/soul':
-        try { var r=await fetch('/soul').then(function(r){return r.json();}); sys(r.soul||'(no soul config)','info'); }
-        catch(e){ sys('Failed: '+e.message,'err'); } break;
-      case '/mode': {
-        if(!arg){ sys('Usage: /mode auto|normal|manual','warn'); break; }
-        try {
-          var r2=await fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:arg})}).then(function(r){return r.json();});
-          if(r2.ok){ Status.mode(arg); sys('Mode \u2192 '+arg,'ok'); } else { sys("Invalid mode '"+arg+"'. Use: auto, normal, manual",'err'); }
-        } catch(e){ sys('Failed: '+e.message,'err'); } break;
-      }
-      case '/whisper': { if(!arg){ sys('Usage: /whisper <message>','warn'); break; } Whisper.queue(arg); sys('Whisper queued \u2192 agent will receive it on next iteration.','ok'); break; }
-      case '/todo': case '/plan': {
-        var sid=Agent.getSession(); if(!sid){ sys('No active session.','warn'); break; }
-        try {
-          var r3=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd.slice(1),session_id:sid})}).then(function(r){return r.json();});
-          sys(r3.text||'(empty)','info');
-        } catch(e){ sys('Failed: '+e.message,'err'); } break;
-      }
-      default: sys('Unknown command: '+cmd+'. Type /help for list.','err');
+    switch(cmd){
+      case '/help':sys(HELP_TEXT,'info');break;
+      case '/new':Agent.newSession();break;
+      case '/files':UI.toggleFiles();break;
+      case '/sessions':UI.toggleSessions();break;
+      case '/tools':UI.toggleTools();break;
+      case '/session':sys(Agent.getSession()?'Session: '+Agent.getSession():'No active session.','info');break;
+      case '/status':try{var s=await fetch('/status').then(function(r){return r.json();});sys('Workspace : '+s.workspace+'\nLLM       : '+s.llm_url+'\nSession   : '+(s.current_session?s.current_session.slice(-8):'none')+'\nMode      : '+s.permission_mode+'\nMCP       : '+s.mcp_clients+' server'+(s.mcp_clients!==1?'s':''),'info');}catch(e){sys('Failed: '+e.message,'err');}break;
+      case '/soul':try{var r=await fetch('/soul').then(function(r){return r.json();});sys(r.soul||'(no soul config)','info');}catch(e){sys('Failed: '+e.message,'err');}break;
+      case '/mode':{if(!arg){sys('Usage: /mode auto|normal|manual','warn');break;}try{var r2=await fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:arg})}).then(function(r){return r.json();});if(r2.ok){Status.mode(arg);sys('Mode \u2192 '+arg,'ok');}else{sys("Invalid mode '"+arg+"'. Use: auto, normal, manual",'err');}}catch(e){sys('Failed: '+e.message,'err');}break;}
+      case '/whisper':{if(!arg){sys('Usage: /whisper <message>','warn');break;}Whisper.queue(arg);sys('Whisper queued \u2192 agent will receive it on next iteration.','ok');break;}
+      case '/preview':{if(!arg){sys('Usage: /preview <path-to-html>','warn');break;}if(!HTMLPreview._isHtml(arg)){sys('Preview only supports .html / .htm files.','warn');break;}HTMLPreview.open(arg);sys('\u25b6 opening preview: '+arg,'ok');break;}
+      case '/todo':case '/plan':{var sid=Agent.getSession();if(!sid){sys('No active session.','warn');break;}try{var r3=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd.slice(1),session_id:sid})}).then(function(r){return r.json();});sys(r3.text||'(empty)','info');}catch(e){sys('Failed: '+e.message,'err');}break;}
+      default:sys('Unknown command: '+cmd+'. Type /help for list.','err');
     }
   }
-  return { run };
+  return{run};
 })();
 
-const Palette = (() => {
+const Palette=(() => {
   var idx=-1;
-  var pal=function(){ return document.getElementById('palette'); };
-
-  function build(val) {
+  var pal=function(){return document.getElementById('palette');};
+  function build(val){
     var q=val.slice(1).toLowerCase();
-    var matches=q===''?CMDS:CMDS.filter(function(c){ return c.cmd.includes(q)||c.desc.toLowerCase().includes(q); });
-    if(!matches.length){ close(); return; }
+    var matches=q===''?CMDS:CMDS.filter(function(c){return c.cmd.includes(q)||c.desc.toLowerCase().includes(q);});
+    if(!matches.length){close();return;}
     pal().innerHTML='';
     matches.forEach(function(c,i){
-      var d=document.createElement('div'); d.className='pi'+(i===idx?' sel':'');
+      var d=document.createElement('div');d.className='pi'+(i===idx?' sel':'');
       d.innerHTML='<span class="pi-cmd">'+_esc(c.cmd)+(c.arg?' <span style="color:var(--text3)">'+_esc(c.arg)+'</span>':'')+'</span><span class="pi-desc">'+_esc(c.desc)+'</span>';
-      d.onclick=function(){ select(c.cmd); }; pal().appendChild(d);
+      d.onclick=function(){select(c.cmd);};pal().appendChild(d);
     });
     pal().classList.add('open');
   }
-
-  function close() { pal().classList.remove('open'); idx=-1; }
-
-  function select(cmd) {
-    var inp=document.getElementById('msg-input');
-    inp.value=(cmd==='/mode'||cmd==='/whisper')?cmd+' ':cmd; close(); inp.focus();
-  }
-
-  function onInput(el) {
-    autoResize(el); InputHistory.reset();
-    if(el.value.startsWith('/')) build(el.value); else close();
-  }
-
-  function onKey(e) {
-    var inp=document.getElementById('msg-input'), p=pal();
-    if(p.classList.contains('open')) {
+  function close(){pal().classList.remove('open');idx=-1;}
+  function select(cmd){var inp=document.getElementById('msg-input');inp.value=(cmd==='/mode'||cmd==='/whisper'||cmd==='/preview')?cmd+' ':cmd;close();inp.focus();}
+  function onInput(el){autoResize(el);InputHistory.reset();if(el.value.startsWith('/'))build(el.value);else close();}
+  function onKey(e){
+    var inp=document.getElementById('msg-input'),p=pal();
+    if(p.classList.contains('open')){
       var items=p.querySelectorAll('.pi');
-      if(e.key==='ArrowDown'){ e.preventDefault(); idx=Math.min(idx+1,items.length-1); items.forEach(function(el,i){el.classList.toggle('sel',i===idx);}); return; }
-      if(e.key==='ArrowUp')  { e.preventDefault(); idx=Math.max(idx-1,0);              items.forEach(function(el,i){el.classList.toggle('sel',i===idx);}); return; }
-      if(e.key==='Tab'||(e.key==='Enter'&&idx>=0)){ e.preventDefault(); (idx>=0?items[idx]:items[0])&&(idx>=0?items[idx]:items[0]).click(); return; }
-      if(e.key==='Escape'){ close(); return; }
+      if(e.key==='ArrowDown'){e.preventDefault();idx=Math.min(idx+1,items.length-1);items.forEach(function(el,i){el.classList.toggle('sel',i===idx);});return;}
+      if(e.key==='ArrowUp'){e.preventDefault();idx=Math.max(idx-1,0);items.forEach(function(el,i){el.classList.toggle('sel',i===idx);});return;}
+      if(e.key==='Tab'||(e.key==='Enter'&&idx>=0)){e.preventDefault();(idx>=0?items[idx]:items[0])&&(idx>=0?items[idx]:items[0]).click();return;}
+      if(e.key==='Escape'){close();return;}
     }
-    if(e.key==='ArrowUp'&&!p.classList.contains('open')){ if(inp.value.slice(0,inp.selectionStart).split('\n').length<=1){ e.preventDefault(); InputHistory.up(inp); return; } }
-    if(e.key==='ArrowDown'&&!p.classList.contains('open')){ if(inp.value.slice(inp.selectionEnd).split('\n').length<=1){ e.preventDefault(); InputHistory.down(inp); return; } }
-    if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); Agent.sendOrStop(); }
+    if(e.key==='ArrowUp'&&!p.classList.contains('open')){if(inp.value.slice(0,inp.selectionStart).split('\n').length<=1){e.preventDefault();InputHistory.up(inp);return;}}
+    if(e.key==='ArrowDown'&&!p.classList.contains('open')){if(inp.value.slice(inp.selectionEnd).split('\n').length<=1){e.preventDefault();InputHistory.down(inp);return;}}
+    if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();Agent.sendOrStop();}
   }
-
-  return { onInput, onKey, close };
+  return{onInput,onKey,close};
 })();
 
-function autoResize(el) {
-  requestAnimationFrame(function(){ el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,140)+'px'; });
-}
+function autoResize(el){requestAnimationFrame(function(){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,140)+'px';});}
 
-document.addEventListener('keydown', function(e) {
-  if((e.ctrlKey||e.metaKey)&&e.key==='l'){ e.preventDefault(); Agent.newSession(); }
-});
+document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='l'){e.preventDefault();Agent.newSession();}});
 
-const SessionsPanel = (() => {
-  async function load() {
+const SessionsPanel=(() => {
+  async function load(){
     var list=document.getElementById('sessions-list');
     list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
-    try {
-      var sessions=await fetch('/sessions').then(function(r){return r.json();}); list.innerHTML='';
-      if(!sessions.length){ list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">No sessions yet</div>'; return; }
+    try{
+      var sessions=await fetch('/sessions').then(function(r){return r.json();});list.innerHTML='';
+      if(!sessions.length){list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">No sessions yet</div>';return;}
       sessions.forEach(function(s){
-        var d=document.createElement('div'); d.className='session-item'+(s.id===Agent.getSession()?' active':'');
+        var d=document.createElement('div');d.className='session-item'+(s.id===Agent.getSession()?' active':'');
         d.innerHTML='<div class="si-id">'+_esc(s.id)+'</div><div class="si-task">'+_esc(s.task||'\u2014')+'</div><div class="si-stat '+_esc(s.status)+'">'+_esc(s.status)+' \u00b7 '+s.iterations+' iter</div>';
-        d.onclick=function(){ if(Agent.running())return; Agent.setSession(s.id); UI.closeSessions(); Messages.sys('resumed '+s.id.slice(-8)); };
+        d.onclick=function(){if(Agent.running())return;Agent.setSession(s.id);UI.closeSessions();Messages.sys('resumed '+s.id.slice(-8));};
         list.appendChild(d);
       });
-    } catch(err){ list.innerHTML='<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>'; }
+    }catch(err){list.innerHTML='<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>';}
   }
-  return { load };
+  return{load};
 })();
 
-const ToolsPanel = (() => {
+const ToolsPanel=(() => {
   var data=null;
   async function load(){
     var list=document.getElementById('tools-list');
     list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">Loading\u2026</div>';
-    try {
-      data = await fetch('/tools').then(function(r){return r.json();});
-      _render(data, '');
-    } catch(err){
-      list.innerHTML='<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>';
-    }
+    try{data=await fetch('/tools').then(function(r){return r.json();});_render(data,'');}
+    catch(err){list.innerHTML='<div style="padding:10px;color:var(--red);font-size:11px">Error: '+_esc(err.message)+'</div>';}
   }
-
-  function _render(d, q) {
-    var list=document.getElementById('tools-list');
-    if (!d) return;
-    list.innerHTML='';
+  function _render(d,q){
+    var list=document.getElementById('tools-list');if(!d)return;list.innerHTML='';
     var ql=q.toLowerCase();
-    function _matches(t){ return !ql || t.name.toLowerCase().includes(ql) || (t.description||'').toLowerCase().includes(ql); }
-    function _cat(name, tools, isMcp) {
-      var filtered=tools.filter(_matches);
-      if(!filtered.length) return;
-      var cat=document.createElement('div'); cat.className='tool-cat'+(isMcp?' mcp-cat':'');
-      var hdr=document.createElement('div'); hdr.className='tool-cat-hdr'; hdr.textContent=name;
-      cat.appendChild(hdr);
-      filtered.forEach(function(t){
-        var entry=document.createElement('div'); entry.className='tool-entry';
-        var params=t.params&&t.params.length?'('+t.params.join(', ')+')':'()';
-        entry.innerHTML='<div class="te-name">'+_esc(t.name)+'<span class="te-params">'+_esc(params)+'</span></div>'
-          +(t.description?'<div class="te-desc">'+_esc(t.description.slice(0,120))+'</div>':'');
-        cat.appendChild(entry);
-      });
+    function _matches(t){return!ql||t.name.toLowerCase().includes(ql)||(t.description||'').toLowerCase().includes(ql);}
+    function _cat(name,tools,isMcp){
+      var filtered=tools.filter(_matches);if(!filtered.length)return;
+      var cat=document.createElement('div');cat.className='tool-cat'+(isMcp?' mcp-cat':'');
+      var hdr=document.createElement('div');hdr.className='tool-cat-hdr';hdr.textContent=name;cat.appendChild(hdr);
+      filtered.forEach(function(t){var entry=document.createElement('div');entry.className='tool-entry';var params=t.params&&t.params.length?'('+t.params.join(', ')+')':'()';entry.innerHTML='<div class="te-name">'+_esc(t.name)+'<span class="te-params">'+_esc(params)+'</span></div>'+(t.description?'<div class="te-desc">'+_esc(t.description.slice(0,120))+'</div>':'');cat.appendChild(entry);});
       list.appendChild(cat);
     }
-    var builtin=d.builtin||{};
-    Object.keys(builtin).forEach(function(cat){ _cat(cat, builtin[cat], false); });
-    var mcp=d.mcp||{};
-    Object.keys(mcp).forEach(function(cat){ _cat(cat, mcp[cat], true); });
-    if(!list.children.length){
-      list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">'+(ql?'No tools match.':'No tools available.')+'</div>';
-    }
+    var builtin=d.builtin||{};Object.keys(builtin).forEach(function(cat){_cat(cat,builtin[cat],false);});
+    var mcp=d.mcp||{};Object.keys(mcp).forEach(function(cat){_cat(cat,mcp[cat],true);});
+    if(!list.children.length)list.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px">'+(ql?'No tools match.':'No tools available.')+'</div>';
   }
-
-  function filter(q) { if(data) _render(data, q); }
-  return { load, filter };
+  function filter(q){if(data)_render(data,q);}
+  return{load,filter};
 })();
 
-// =============================================================================
-// UI PANEL MANAGEMENT
-// =============================================================================
-const UI = (() => {
-  function _overlay(show) { document.getElementById('overlay').classList.toggle('show', show); }
-
-  function toggleFiles() {
-    var p=document.getElementById('files-panel'), open=!p.classList.contains('open');
-    closeAll(); p.classList.toggle('open', open); _overlay(open);
-    if(open) FileTree.load();
-  }
-  function closeFiles() { document.getElementById('files-panel').classList.remove('open'); _overlay(false); FileTree.stopAutoRefresh(); }
-
-  function toggleSessions() {
-    var p=document.getElementById('sessions-panel'), open=!p.classList.contains('open');
-    closeAll(); p.classList.toggle('open', open); _overlay(open);
-    if(open) SessionsPanel.load();
-  }
-  function closeSessions() { document.getElementById('sessions-panel').classList.remove('open'); _overlay(false); }
-
-  function toggleTools() {
-    var p=document.getElementById('tools-panel'), open=!p.classList.contains('open');
-    closeAll(); p.classList.toggle('open', open); _overlay(open);
-    if(open) ToolsPanel.load();
-  }
-  function closeTools() { document.getElementById('tools-panel').classList.remove('open'); _overlay(false); }
-
-  function closeAll() {
-    ['files-panel','sessions-panel','tools-panel'].forEach(function(id){
-      document.getElementById(id).classList.remove('open');
-    });
-    _overlay(false);
-    FileTree.stopAutoRefresh();
-  }
-
-  return { toggleFiles, closeFiles, toggleSessions, closeSessions, toggleTools, closeTools, closeAll };
+const UI=(() => {
+  function _overlay(show){document.getElementById('overlay').classList.toggle('show',show);}
+  function toggleFiles(){var p=document.getElementById('files-panel'),open=!p.classList.contains('open');closeAll();p.classList.toggle('open',open);_overlay(open);if(open)FileTree.load();}
+  function closeFiles(){document.getElementById('files-panel').classList.remove('open');_overlay(false);FileTree.stopAutoRefresh();}
+  function toggleSessions(){var p=document.getElementById('sessions-panel'),open=!p.classList.contains('open');closeAll();p.classList.toggle('open',open);_overlay(open);if(open)SessionsPanel.load();}
+  function closeSessions(){document.getElementById('sessions-panel').classList.remove('open');_overlay(false);}
+  function toggleTools(){var p=document.getElementById('tools-panel'),open=!p.classList.contains('open');closeAll();p.classList.toggle('open',open);_overlay(open);if(open)ToolsPanel.load();}
+  function closeTools(){document.getElementById('tools-panel').classList.remove('open');_overlay(false);}
+  function closeAll(){['files-panel','sessions-panel','tools-panel'].forEach(function(id){document.getElementById(id).classList.remove('open');});_overlay(false);FileTree.stopAutoRefresh();}
+  return{toggleFiles,closeFiles,toggleSessions,closeSessions,toggleTools,closeTools,closeAll};
 })();
 
-// =============================================================================
-// INIT
-// =============================================================================
-(async function init() {
-  try {
-    var s = await fetch('/status').then(function(r){ return r.json(); });
-    if (s.permission_mode) Status.mode(s.permission_mode);
-  } catch(_) {}
+(async function init(){
+  document.cookie='agent_token='+encodeURIComponent(_AGENT_TOKEN)+'; path=/; SameSite=Strict';
+  try{var s=await fetch('/status').then(function(r){return r.json();});if(s.permission_mode)Status.mode(s.permission_mode);}catch(_){}
   document.getElementById('msg-input').focus();
 })();
-
 </script>
 </body>
 </html>"""
 
 
 # =============================================================================
-# IMAGE UPLOAD ENDPOINT
+# IMAGE UPLOAD
 # =============================================================================
 
 @app.route("/upload", methods=["POST"])
@@ -2548,26 +2105,18 @@ def upload_image():
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"error": "no file"}), 400
-
     ext = Path(f.filename).suffix.lower()
     if ext not in _UPLOAD_EXTS:
-        return jsonify({
-            "error": f"unsupported extension {ext!r}. Allowed: {sorted(_UPLOAD_EXTS)}"
-        }), 400
+        return jsonify({"error": f"unsupported extension {ext!r}. Allowed: {sorted(_UPLOAD_EXTS)}"}), 400
 
     uploads_dir = WORKSPACE / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
-
     file_bytes = f.read()
 
-    # FIX-6: guard Pillow usage with a clear error when not installed
     needs_convert = ext == ".webp" or ext not in {".jpg", ".jpeg", ".png"}
     if needs_convert:
         if not _PIL_AVAILABLE:
-            return jsonify({
-                "error": f"Cannot convert {ext!r} — Pillow is not installed. "
-                         "Run: pip install Pillow"
-            }), 400
+            return jsonify({"error": f"Cannot convert {ext!r} — Pillow not installed. Run: pip install Pillow"}), 400
         try:
             img = _PIL_Image.open(io.BytesIO(file_bytes))
             img = img.convert("RGBA" if img.mode in ("RGBA", "LA", "P") else "RGB")
@@ -2578,8 +2127,7 @@ def upload_image():
         except Exception as e:
             return jsonify({"error": f"image conversion failed: {e}"}), 400
 
-    base_name = Path(f.filename).stem
-    safe_name = re.sub(r"[^\w.\-]", "_", base_name) + ext
+    safe_name = re.sub(r"[^\w.\-]", "_", Path(f.filename).stem) + ext
     filename  = f"{int(time.time())}_{safe_name}"
     dest      = uploads_dir / filename
 
@@ -2605,19 +2153,19 @@ def index():
             host = request.host or f"localhost:{_PORT}"
         except Exception:
             host = "localhost"
-        auth_url = f"{scheme}://{host}/?token={_AGENT_TOKEN}"
-        html = _UNAUTH_HTML.replace("__AUTH_URL__", auth_url)
-        return Response(html, mimetype="text/html")
+        # QR encodes only the base sign-in URL — user must type the PIN manually
+        base_url = f"{scheme}://{host}/"
+        from urllib.parse import quote as _quote
+        qr_img = _make_qr_data_uri(base_url)
+        return Response(_UNAUTH_HTML.replace("__QR_IMG__", qr_img), mimetype="text/html")
 
-    page = HTML.replace("__AGENT_TOKEN__", _AGENT_TOKEN)
-    return Response(page, mimetype="text/html")
+    return Response(HTML.replace("__AGENT_TOKEN__", _AGENT_TOKEN), mimetype="text/html")
 
 
 # =============================================================================
 # SSE STREAM
 # =============================================================================
 
-# FIX-8: valid JSON ping so JS client ignores it cleanly
 _SSE_PING = json.dumps({"type": "ping"})
 
 
@@ -2630,26 +2178,13 @@ def stream():
         with _session_lock:
             sid  = _current_session_id
             mode = _current_permission_mode
-        state = _get_agent_state()
-        hist  = _chatlog_get(sid)
-
-        connect_payload = json.dumps({
-            "type": "connect",
-            "data": {
-                "session": sid,
-                "mode":    mode,
-                "state":   state,
-                "history": [[k, v] for k, v in hist],
-            },
-        })
-        yield f"data: {connect_payload}\n\n"
-
+        hist = _chatlog_get(sid)
+        yield f"data: {json.dumps({'type':'connect','data':{'session':sid,'mode':mode,'state':_get_agent_state(),'history':[[k,v] for k,v in hist]}})}\n\n"
         try:
             while True:
                 try:
-                    item = q.get(timeout=20)
-                    kind, payload = item
-                    yield f"data: {json.dumps({'type': kind, 'data': payload})}\n\n"
+                    kind, payload = q.get(timeout=20)
+                    yield f"data: {json.dumps({'type':kind,'data':payload})}\n\n"
                 except queue.Empty:
                     yield f"data: {_SSE_PING}\n\n"
         except GeneratorExit:
@@ -2661,13 +2196,13 @@ def stream():
 
 
 # =============================================================================
-# CHAT ENDPOINT
+# CHAT
 # =============================================================================
 
 @app.route("/chat", methods=["POST"])
 @_require_auth
 def chat():
-    global _current_session_id, _current_permission_mode
+    global _current_session_id
 
     data       = request.get_json(force=True, silent=True) or {}
     message    = (data.get("message") or "").strip()
@@ -2676,7 +2211,6 @@ def chat():
 
     if not message:
         return jsonify({"error": "empty message"}), 400
-
     if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT):
         return jsonify({"error": "agent busy — try again shortly"}), 429
 
@@ -2686,97 +2220,24 @@ def chat():
 
     def _run():
         global _current_session_id
-
-        _tl.stop_event  = stop_ev
-        _tl.request_id  = request_id
-        thinking_cb, flush_thinking = _make_thinking_helpers()
-        _tl.thinking_cb = thinking_cb
-
-        def token_cb(tok):
-            if stop_ev.is_set():
-                raise _AgentStopped()
-            _broadcast(("token", tok))
-
-        _tl.token_cb = token_cb
-
-        # FIX-13: read pre_run_sid under the lock to avoid a race
         with _session_lock:
-            pre_run_sid = _current_session_id
+            pre = _current_session_id
             _current_session_id = session_id
+        _chatlog_merge_keys(pre, session_id)
 
-        _chatlog_merge_keys(pre_run_sid, session_id)
-        _broadcast(("session", session_id or ""))
-        _set_agent_state("running")
-
-        last_status = [""]
-
-        def ev_cb(event):
-            if stop_ev.is_set():
-                return
-            _push_event(event, stop_ev, last_status, flush_thinking)
-
-        def _whisper_fn():
+        def whisper_fn():
             with _whisper_lock:
-                if _whisper_store:
-                    return _whisper_store.pop(0)
-            return None
+                return _whisper_store.pop(0) if _whisper_store else None
 
         try:
-            result = run_agent(
-                message,
-                WORKSPACE,
-                permission_mode=_resolve_permission_mode(),
-                resume_session=session_id,
-                plan_first=False,
-                mode="output",
-                event_callback=ev_cb,
-                soul=soul,
-                whisper_fn=_whisper_fn,
-            )
-
-            with _session_lock:
-                _current_session_id = result.session_id
-            _chatlog_merge_keys(session_id, result.session_id)
-
-            flush_thinking()
-
-            if result.status == "waiting":
-                _broadcast(("done", f"waiting until {result.wait_until}"))
-                _set_agent_state("waiting")
-            elif result.status in ("error", "interrupted"):
-                _broadcast(("error", result.final_answer or result.status))
-                _set_agent_state("idle")
-            else:
-                reason = result.status
-                if result.final_answer:
-                    words = result.final_answer.split()
-                    reason = " ".join(words[:8]) + ("\u2026" if len(words) > 8 else "")
-                _broadcast(("done", reason))
-                _set_agent_state("idle")
-
-        except _AgentStopped:
-            flush_thinking()
-            _broadcast(("done", "stopped"))
-            _set_agent_state("idle")
-        except Exception as e:
-            flush_thinking()
-            _broadcast(("error", str(e)))
-            _set_agent_state("idle")
-            Log.error(f"[/chat] unhandled exception: {e}")
-            traceback.print_exc()
+            _execute_agent(message, session_id, request_id, stop_ev,
+                           _resolve_permission_mode(), whisper_fn)
         finally:
             with _stop_events_lock:
                 _stop_events.pop(request_id, None)
-            _tl.stop_event  = None
-            _tl.request_id  = None
-            _tl.thinking_cb = None
-            _tl.token_cb    = None
-            with _active_responses_lock:
-                _active_responses.pop(request_id, None)
             _AGENT_LOCK.release()
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    threading.Thread(target=_run, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -2793,17 +2254,11 @@ def stop():
         ev = _stop_events.get(request_id)
     if ev:
         ev.set()
-
-    # Close the streaming HTTP response so iter_lines() unblocks immediately.
-    # (Can't use _tl.current_resp here — different thread — so use the shared dict.)
     with _active_responses_lock:
         resp = _active_responses.pop(request_id, None)
     if resp is not None:
-        try:
-            resp.close()
-        except Exception:
-            pass
-
+        try: resp.close()
+        except Exception: pass
     return jsonify({"ok": True})
 
 
@@ -2824,14 +2279,13 @@ def new_session():
 
 
 # =============================================================================
-# WHISPER
+# WHISPER / MODE / STATUS / SOUL / SESSIONS / TOOLS / CMD
 # =============================================================================
 
 @app.route("/whisper", methods=["POST"])
 @_require_auth
 def whisper():
-    data = request.get_json(force=True, silent=True) or {}
-    text = (data.get("text") or "").strip()
+    text = ((request.get_json(force=True, silent=True) or {}).get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty text"}), 400
     with _whisper_lock:
@@ -2839,26 +2293,17 @@ def whisper():
     return jsonify({"ok": True})
 
 
-# =============================================================================
-# MODE
-# =============================================================================
-
 @app.route("/mode", methods=["POST"])
 @_require_auth
 def set_mode():
     global _current_permission_mode
-    data = request.get_json(force=True, silent=True) or {}
-    mode = (data.get("mode") or "").strip().lower()
+    mode  = ((request.get_json(force=True, silent=True) or {}).get("mode") or "").strip().lower()
     valid = {m.value for m in PermissionMode}
     if mode not in valid:
         return jsonify({"ok": False, "error": f"invalid mode {mode!r}"}), 400
     _current_permission_mode = mode
     return jsonify({"ok": True, "mode": mode})
 
-
-# =============================================================================
-# STATUS
-# =============================================================================
 
 @app.route("/status")
 @_require_auth
@@ -2875,31 +2320,17 @@ def status():
     })
 
 
-# =============================================================================
-# SOUL
-# =============================================================================
-
 @app.route("/soul")
 @_require_auth
 def get_soul():
     return jsonify({"soul": soul})
 
 
-# =============================================================================
-# SESSIONS LIST
-# =============================================================================
-
 @app.route("/sessions")
 @_require_auth
 def sessions():
-    mgr  = SessionManager(WORKSPACE)
-    sess = mgr.list_recent(50)
-    return jsonify(sess)
+    return jsonify(SessionManager(WORKSPACE).list_recent(50))
 
-
-# =============================================================================
-# TOOLS
-# =============================================================================
 
 @app.route("/tools")
 @_require_auth
@@ -2907,152 +2338,126 @@ def tools():
     return jsonify(_build_tools_payload())
 
 
-# =============================================================================
-# CMD (/todo, /plan)
-# =============================================================================
-
 @app.route("/cmd", methods=["POST"])
 @_require_auth
 def cmd():
     import contextlib as _ctx
-
     data       = request.get_json(force=True, silent=True) or {}
     command    = data.get("cmd", "").strip()
     session_id = data.get("session_id", "").strip()
     if not session_id:
         return jsonify({"error": "no session_id"}), 400
-
     buf = io.StringIO()
-
     if command == "todo":
-        mgr = TodoManager(WORKSPACE, session_id)
-        with _ctx.redirect_stdout(buf):
-            mgr.display()
+        with _ctx.redirect_stdout(buf): TodoManager(WORKSPACE, session_id).display()
     elif command == "plan":
-        mgr = PlanManager(WORKSPACE, session_id)
-        with _ctx.redirect_stdout(buf):
-            mgr.display()
+        with _ctx.redirect_stdout(buf): PlanManager(WORKSPACE, session_id).display()
     else:
         return jsonify({"error": f"unknown cmd {command!r}"}), 400
-
     text = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue()).strip()
     return jsonify({"text": text or f"(no {command} data)"})
 
 
 # =============================================================================
-# FILE TREE  (left-panel browser)
+# FILE TREE
 # =============================================================================
 
-# FIX-9: unified hidden exclusion — all dotfiles/dotdirs plus named noisy dirs
-_FT_IGNORE = frozenset({"__pycache__", "node_modules", ".mypy_cache",
-                         ".pytest_cache", ".tox", ".venv", "venv"})
+_FT_IGNORE      = frozenset({"__pycache__", "node_modules", ".mypy_cache",
+                              ".pytest_cache", ".tox", ".venv", "venv"})
 _FT_MAX_ENTRIES = 2000
 
 
-def _ft_safe(rel: str) -> "Path | None":
+def _ft_safe(rel):
     try:
         target = (WORKSPACE / rel).resolve()
         target.relative_to(WORKSPACE)
         return target
-    except (ValueError, Exception):
+    except Exception:
         return None
 
 
 @app.route("/filetree")
 @_require_auth
 def filetree():
-    rel = request.args.get("path", ".").strip()
-    tgt = _ft_safe(rel)
+    tgt = _ft_safe(request.args.get("path", ".").strip())
     if tgt is None or not tgt.is_dir():
         return jsonify({"error": "invalid path"}), 400
-
     entries = []
     try:
         items = sorted(tgt.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
     except PermissionError:
         return jsonify({"entries": []})
-
     for p in items[:_FT_MAX_ENTRIES]:
-        # FIX-9: skip ALL dotfiles/dotdirs and known noisy dirs
         if p.name.startswith(".") or p.name in _FT_IGNORE:
             continue
         rel_path = str(p.relative_to(WORKSPACE)).replace("\\", "/")
         if p.is_dir():
             entries.append({"name": p.name, "path": rel_path, "type": "dir"})
         else:
-            stat = p.stat()
-            entries.append({
-                "name": p.name,
-                "path": rel_path,
-                "type": "file",
-                "size": stat.st_size,
-                "ext":  p.suffix.lower(),
-            })
-
+            st = p.stat()
+            entries.append({"name": p.name, "path": rel_path, "type": "file",
+                            "size": st.st_size, "ext": p.suffix.lower()})
     return jsonify({"entries": entries})
 
 
 @app.route("/fileread")
 @_require_auth
 def fileread():
-    rel = request.args.get("path", "").strip()
-    tgt = _ft_safe(rel)
+    tgt = _ft_safe(request.args.get("path", "").strip())
     if tgt is None or not tgt.is_file():
         return jsonify({"error": "not found"}), 404
-
     MAX_PREVIEW = 100 * 1024
-    stat = tgt.stat()
-
     try:
-        sample = tgt.read_bytes()[:8192]
-        if b"\x00" in sample:
-            return jsonify({"binary": True, "size": stat.st_size})
+        if b"\x00" in tgt.read_bytes()[:8192]:
+            return jsonify({"binary": True, "size": tgt.stat().st_size})
         text = tgt.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return jsonify({"error": str(e)})
-
-    truncated = len(text) > MAX_PREVIEW
-    return jsonify({
-        "content":   text[:MAX_PREVIEW],
-        "truncated": truncated,
-        "size":      stat.st_size,
-    })
+    return jsonify({"content": text[:MAX_PREVIEW], "truncated": len(text) > MAX_PREVIEW,
+                    "size": tgt.stat().st_size})
 
 
 @app.route("/workspace/mtime")
 @_require_auth
 def workspace_mtime():
     try:
-        mtime = WORKSPACE.stat().st_mtime
+        return jsonify({"mtime": WORKSPACE.stat().st_mtime})
     except Exception:
-        mtime = 0
-    return jsonify({"mtime": mtime})
+        return jsonify({"mtime": 0})
+
+
+# =============================================================================
+# HTML VIEWER  (/serve/)
+# =============================================================================
+
+@app.route("/serve/<path:filepath>")
+def serve_workspace(filepath):
+    token = (request.args.get("token", "")
+             or request.headers.get("X-Token", "")
+             or request.cookies.get("agent_token", ""))
+    if _AGENT_TOKEN and not (token and secrets.compare_digest(token, _AGENT_TOKEN)):
+        return Response("Unauthorized", status=401, mimetype="text/plain")
+    tgt = _ft_safe(filepath)
+    if tgt is None or not tgt.is_file():
+        return Response("Not found", status=404, mimetype="text/plain")
+    mime = _mimetypes.guess_type(str(tgt))[0] or "application/octet-stream"
+    try:
+        return Response(tgt.read_bytes(), mimetype=mime)
+    except PermissionError:
+        return Response("Permission denied", status=403, mimetype="text/plain")
+    except Exception as exc:
+        return Response(f"Error: {exc}", status=500, mimetype="text/plain")
 
 
 # =============================================================================
 # WEB SCHEDULER
 # =============================================================================
-# Wakes waiting sessions whose resume_after has passed.
-# FIX-11: _waking_sessions set prevents double-waking the same session across
-#         consecutive poll cycles while a previous wake thread is still running.
-# FIX-12: token_cb / thinking_cb are wired up inside _do_wake so the browser
-#         actually receives streamed output from scheduler-woken sessions.
-# FIX-14: a stop event is created and registered in _stop_events for each wake
-#         so the Stop button works during scheduler-initiated runs.
 
-_waking_sessions:      set             = set()
-_waking_sessions_lock: threading.Lock  = threading.Lock()
+_waking_sessions:      set           = set()
+_waking_sessions_lock: threading.Lock = threading.Lock()
 
 
-def _set_current_session_id(sid: "str | None") -> None:
-    """Module-level helper used by _do_wake to update _current_session_id safely."""
-    global _current_session_id
-    with _session_lock:
-        _current_session_id = sid
-
-
-def _web_scheduler() -> None:
-    from agent_core import StateManager, WaitState
+def _web_scheduler():
     session_mgr = SessionManager(WORKSPACE)
     state_mgr   = StateManager(WORKSPACE)
     poll_s      = int(os.environ.get("WEB_SCHEDULER_POLL", "30"))
@@ -3060,29 +2465,22 @@ def _web_scheduler() -> None:
 
     while True:
         try:
-            next_wake: "float | None" = None
-
+            next_wake = None
             for session in session_mgr.list_recent(200):
                 if session.get("status") != "waiting":
                     continue
                 sid = session["id"]
-
-                # FIX-11: skip if already being woken
                 with _waking_sessions_lock:
                     if sid in _waking_sessions:
                         continue
-
                 saved = state_mgr.load(sid)
                 if not saved or not saved.wait_state:
                     continue
                 ws = WaitState.from_dict(saved.wait_state)
-
                 if not ws.is_ready():
                     try:
                         from datetime import datetime
-                        remaining = (
-                            datetime.fromisoformat(ws.resume_after) - datetime.now()
-                        ).total_seconds()
+                        remaining = (datetime.fromisoformat(ws.resume_after) - datetime.now()).total_seconds()
                         if remaining > 0:
                             next_wake = remaining if next_wake is None else min(next_wake, remaining)
                     except Exception:
@@ -3090,13 +2488,11 @@ def _web_scheduler() -> None:
                     continue
 
                 Log.info(f"[web-scheduler] waking session {sid[:8]}")
-
-                # FIX-11: mark as waking before spawning thread
                 with _waking_sessions_lock:
                     _waking_sessions.add(sid)
 
                 def _do_wake(sid=sid):
-                    # FIX-14: create and register a stop event for this wake
+                    global _current_session_id
                     wake_req_id = f"sched-{sid}"
                     stop_ev     = threading.Event()
                     with _stop_events_lock:
@@ -3111,89 +2507,20 @@ def _web_scheduler() -> None:
                         return
 
                     try:
-                        _set_agent_state("running")
                         _broadcast(("status", f"waking session {sid[:8]}\u2026"))
-
-                        # FIX-12: wire up token/thinking streaming for browser
-                        _tl.stop_event  = stop_ev
-                        _tl.request_id  = wake_req_id
-                        thinking_cb, flush_thinking = _make_thinking_helpers()
-                        _tl.thinking_cb = thinking_cb
-
-                        def token_cb(tok):
-                            if stop_ev.is_set():
-                                raise _AgentStopped()
-                            _broadcast(("token", tok))
-
-                        _tl.token_cb = token_cb
-
-                        _set_current_session_id(sid)
-                        _broadcast(("session", sid))
-
-                        last_status = [""]
-
-                        def ev_cb(event):
-                            if stop_ev.is_set():
-                                return
-                            _push_event(event, stop_ev, last_status, flush_thinking)
-
-                        try:
-                            result = run_agent(
-                                "Continue from scheduled wake-up",
-                                WORKSPACE,
-                                permission_mode=PermissionMode.AUTO,
-                                resume_session=sid,
-                                plan_first=False,
-                                mode="output",
-                                event_callback=ev_cb,
-                                soul=soul,
-                            )
-                        except _AgentStopped:
-                            flush_thinking()
-                            _broadcast(("done", "stopped"))
-                            _set_agent_state("idle")
-                            return
-
-                        flush_thinking()
-                        _set_current_session_id(result.session_id)
-                        _chatlog_merge_keys(sid, result.session_id)
-
-                        if result.status == "waiting":
-                            _broadcast(("done", f"waiting until {result.wait_until}"))
-                            _set_agent_state("waiting")
-                        elif result.status in ("error", "interrupted"):
-                            _broadcast(("error", result.final_answer or result.status))
-                            _set_agent_state("idle")
-                        else:
-                            words = (result.final_answer or "").split()
-                            reason_str = " ".join(words[:8]) + ("\u2026" if len(words) > 8 else "")
-                            _broadcast(("done", reason_str or "done"))
-                            _set_agent_state("idle")
-
-                    except Exception as e:
-                        Log.error(f"[web-scheduler] error waking {sid[:8]}: {e}")
-                        _set_agent_state("idle")
+                        with _session_lock:
+                            _current_session_id = sid
+                        _execute_agent("Continue from scheduled wake-up", sid,
+                                       wake_req_id, stop_ev, PermissionMode.AUTO)
                     finally:
-                        # FIX-12: clean up thread-locals
-                        _tl.stop_event  = None
-                        _tl.request_id  = None
-                        _tl.thinking_cb = None
-                        _tl.token_cb    = None
-                        with _active_responses_lock:
-                            _active_responses.pop(wake_req_id, None)
-                        # FIX-14: clean up stop event
                         with _stop_events_lock:
                             _stop_events.pop(wake_req_id, None)
-                        # FIX-11: unmark waking
                         with _waking_sessions_lock:
                             _waking_sessions.discard(sid)
                         _AGENT_LOCK.release()
 
-                threading.Thread(
-                    target=_do_wake,
-                    daemon=True,
-                    name=f"web-sched-{sid[:8]}",
-                ).start()
+                threading.Thread(target=_do_wake, daemon=True,
+                                 name=f"web-sched-{sid[:8]}").start()
 
         except Exception as poll_err:
             Log.error(f"[web-scheduler] poll error: {poll_err}")
@@ -3206,7 +2533,7 @@ def _web_scheduler() -> None:
 # STARTUP
 # =============================================================================
 
-def _get_local_ip() -> str:
+def _get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -3223,9 +2550,8 @@ _PORT = int(os.environ.get("AGENT_PORT", "7860"))
 def main():
     proto    = "https" if _SSL_CERT and _SSL_KEY else "http"
     local_ip = _get_local_ip()
-
     print("\n" + colored("=" * 60, Colors.CYAN))
-    print(colored("  LMAgent Web  v6.9.1", Colors.YELLOW, bold=True))
+    print(colored("  LMAgent Web  v6.9.2", Colors.YELLOW, bold=True))
     print(colored("=" * 60, Colors.CYAN))
     print(colored(f"  Workspace : {WORKSPACE}", Colors.CYAN))
     print(colored(f"  Local     : {proto}://127.0.0.1:{_PORT}/?token={_AGENT_TOKEN}", Colors.GREEN))
@@ -3233,20 +2559,10 @@ def main():
     print(colored(f"  PIN       : {_AGENT_TOKEN}", Colors.YELLOW))
     print(colored("=" * 60, Colors.CYAN) + "\n")
 
-    ssl_ctx = None
-    if _SSL_CERT and _SSL_KEY:
-        ssl_ctx = (_SSL_CERT, _SSL_KEY)
-
+    ssl_ctx = (_SSL_CERT, _SSL_KEY) if _SSL_CERT and _SSL_KEY else None
     threading.Thread(target=_web_scheduler, daemon=True, name="web-scheduler").start()
-
-    app.run(
-        host=_HOST,
-        port=_PORT,
-        debug=False,
-        threaded=True,
-        ssl_context=ssl_ctx,
-        use_reloader=False,
-    )
+    app.run(host=_HOST, port=_PORT, debug=False, threaded=True,
+            ssl_context=ssl_ctx, use_reloader=False)
 
 
 if __name__ == "__main__":
