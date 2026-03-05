@@ -2,16 +2,11 @@
 """
 agent_llm.py — LLM client, agent execution loops, and system prompts.
 
-Imports tool definitions from agent_tools.  agent_tools lazy-imports
-run_sub_agent / SUB_AGENT_SYSTEM_PROMPT from here inside tool_task() to
-avoid a circular module-level dependency.
-
-Dependency graph (no cycles):
-    agent_core
-        ↑
-    agent_tools   ←── (call-time lazy import only) ──┐
-        ↑                                             │
-    agent_llm  ────────────────────────────────────────
+Sub-agent delegation is now handled by Brief-Contract Architecture (BCA)
+in agent_bca.py. run_sub_agent() is kept for backward-compat re-exports
+but is no longer called by the delegation tools — those use _run_bca_agent
+directly. SUB_AGENT_SYSTEM_PROMPT is kept for any external code that
+imports it; BCA builds its own prompts via build_sub_agent_system_prompt().
 """
 
 import json
@@ -42,14 +37,12 @@ from agent_tools import (
     set_tool_context,
 )
 
-# Thread-local storage for per-session LLM flags (e.g. tool_choice rejection).
 _llm_local = threading.local()
 
-# Names of tools that sub-agents are allowed to call.
-# shell, vision, git are intentionally excluded — sub-agents are file-only.
-_SUB_AGENT_TOOL_NAMES = frozenset({"write", "read", "edit", "ls", "glob"})
+# Sub-agent tool allowlist for backward-compat run_sub_agent().
+# BCA agents use depth-scoped tool lists from agent_bca.get_depth_scoped_tools().
+_SUB_AGENT_TOOL_NAMES = frozenset({"write", "read", "edit", "ls", "glob", "grep", "shell"})
 
-# Names of tools available during plan-mode (read-only orientation).
 _PLAN_TOOL_NAMES = frozenset({"ls", "read", "glob", "grep", "git_status"})
 
 
@@ -120,13 +113,15 @@ Before every tool call, ask:
 ## TOOL CALL RULES
 Every call needs ALL required arguments:
 
-| Tool   | Required args |
-|--------|---------------|
-| write  | path + complete content (no placeholders) |
-| read   | path |
-| edit   | path, search, replace |
-| shell  | command |
-| vision | path (workspace-relative image file) |
+| Tool        | Required args |
+|-------------|---------------|
+| write       | path + complete content (no placeholders) |
+| read        | path |
+| edit        | path, search, replace |
+| shell       | command |
+| delegate    | objective, deliverable_type, deliverable_description |
+| decompose   | manifest_json |
+| vision      | path (workspace-relative image file) |
 
 Unknown path? → ls or glob first, then act.
 
@@ -142,13 +137,65 @@ Single-file task? Skip step 1. Write → verify → TASK_COMPLETE.
 
 ---
 
+## DELEGATION — when and how to use sub-agents
+
+Use sub-agents when:
+- A file is complex enough to benefit from a focused agent (long html, full python module)
+- You need multiple files that can be built sequentially
+- Tasks are independent and each needs its own focused context
+
+**delegate** — one sub-agent, one deliverable:
+  Use for a single focused output: one file, one report, one analysis.
+  The sub-agent gets a clean brief with only the data it needs.
+  Result returns: {success, summary, artifacts, data, error}
+  After delegate returns → the file is in the workspace. Read summary for details.
+
+  Example — neon website:
+    delegate(
+      objective="Create a neon cyberpunk themed index.html with animated header and dark background",
+      deliverable_type="file",
+      deliverable_path="index.html",
+      deliverable_description="Single-page HTML with inline CSS, neon glow effects, animated text",
+      data_hint="Theme: cyberpunk neon. Colors: #0ff (cyan), #f0f (magenta) on #0a0a0a background."
+    )
+
+**decompose** — split into sequential sub-tasks with dependencies:
+  Use for multi-file projects where later files depend on earlier ones.
+  Each task's result (artifacts + summary) is automatically passed to dependent tasks.
+  Maximum 8 tasks. depends_on enforces execution order.
+  After decompose returns → all artifacts are in the workspace.
+
+  Example — multi-file project:
+    decompose(manifest_json='{
+      "tasks": [
+        {"task_id":"t1","objective":"Create styles.css with neon theme variables and component styles",
+         "deliverable":{"type":"file","path":"styles.css","format":"css"},"depends_on":[]},
+        {"task_id":"t2","objective":"Create index.html importing styles.css with full neon layout",
+         "deliverable":{"type":"file","path":"index.html","format":"html"},"depends_on":["t1"]},
+        {"task_id":"t3","objective":"Create app.js with interactive effects matching the neon theme",
+         "deliverable":{"type":"file","path":"app.js","format":"javascript"},"depends_on":["t1","t2"]}
+      ]
+    }')
+
+**Key principles:**
+- After delegate/decompose: the files exist. Don't re-write them. Just verify + TASK_COMPLETE.
+- Pass data_hint for anything the sub-agent needs that isn't on disk (colors, specs, URLs).
+- For research tasks: either do the research yourself first and pass it via data_hint,
+  OR delegate to a sub-agent that uses shell (curl, wget) to research and write.
+- Sub-agents can themselves delegate/decompose (up to depth 3 by default).
+
+**Don't use delegation when:**
+- The task is simple (< 50 lines, obvious content) — just write it directly
+- You need the output immediately in your own reasoning (read it after delegation)
+- There's only one small file — faster to write it yourself
+
+---
+
 ## SCHEDULED WAIT
 To pause until a future time:
 
   WAIT: <ISO_datetime>: <reason>
   Example: WAIT: 2026-03-01T09:00:00: Waiting for market open.
-
-Do NOT follow WAIT with TASK_COMPLETE.
 
 ---
 
@@ -170,10 +217,14 @@ Git:        git_status, git_diff, git_add, git_commit, git_branch
 Todos:      todo_add, todo_complete, todo_update, todo_list
 Task State: task_state_update, task_state_get, task_reconcile
 Planning:   plan_complete_step
-Delegation: task (sub-agent, one per file maximum)
+Delegation: delegate (single focused sub-task with a deliverable contract)
+            decompose (split into ≤8 sequential sub-tasks with dependencies)
+            task (backward-compat single-file delegation)
+            report_result (sub-agents only — do not call this as root agent)
 Vision:     vision (only present when a VLM is loaded — use for any image/screenshot task)
 """
 
+# Kept for backward-compat re-exports. BCA builds its own prompts.
 SUB_AGENT_SYSTEM_PROMPT = """You are a precise file-creation agent. One job: create the file exactly as specified.
 
 Rules:
@@ -185,7 +236,7 @@ Rules:
 
 Never loop. Never ask questions. Never plan. TASK_COMPLETE means stop — nothing follows it.
 
-Tools: write, read, edit, ls, glob
+Tools: write, read, edit, ls, glob, grep, shell
 """
 
 PLAN_MODE_PROMPT = """You are in PLAN MODE. Produce a concrete, actionable plan. Do not execute anything.
@@ -499,8 +550,6 @@ _ASKING_PHRASES = ("would you like", "what would you", "should i")
 
 def detect_completion(content: str, has_tool_calls: bool) -> Tuple[bool, str]:
     if "TASK_COMPLETE" in content.upper():
-        # TASK_COMPLETE is authoritative even alongside tool calls —
-        # agent completed its work and did bookkeeping in the same turn.
         for line in content.split("\n"):
             if "TASK_COMPLETE" not in line.upper(): continue
             stripped = line.strip()
@@ -548,8 +597,10 @@ def ask_permission(tool_name: str, args: Dict[str, Any]) -> Tuple[bool, Optional
 
 
 # =============================================================================
-# SUB-AGENT EXECUTION
-# shell + vision intentionally excluded — sub-agents are file-only.
+# BACKWARD-COMPAT: run_sub_agent
+#
+# Still exported so external code that imports it doesn't break.
+# New code should use tool_delegate or tool_decompose (via agent_bca).
 # =============================================================================
 
 def run_sub_agent(
@@ -559,14 +610,18 @@ def run_sub_agent(
     max_iterations: int,
     stream_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    # Sub-agents are file-only: no shell, no vision, no git.
-    # get_available_tools() is NOT used here intentionally — the allowlist controls scope.
+    """
+    Backward-compatible sub-agent runner.
+
+    Still functional — runs an isolated agent with the _SUB_AGENT_TOOL_NAMES
+    allowlist. New code should use tool_delegate/tool_decompose instead, which
+    give the agent a proper brief, structured results, and depth-scoped tools.
+    """
     available_tools = [
         t for t in TOOL_SCHEMAS
         if t["function"]["name"] in _SUB_AGENT_TOOL_NAMES
     ]
-    detector = LoopDetector()
-
+    detector     = LoopDetector()
     parent_ctx   = get_current_context()
     sub_todo_mgr = TodoManager(workspace, session_id)
     sub_plan_mgr = PlanManager(workspace, session_id)
@@ -655,7 +710,6 @@ def run_plan_mode(task: str, workspace: Path) -> Optional[Dict[str, Any]]:
         {"role": "system", "content": PLAN_MODE_PROMPT},
         {"role": "user",   "content": f"Create plan for:\n\n{task}"},
     ]
-    # Planning uses a restricted read-only set — vision not needed here.
     planning_tools = [
         t for t in TOOL_SCHEMAS
         if t["function"]["name"] in _PLAN_TOOL_NAMES
@@ -800,16 +854,6 @@ def _process_tool_calls(
     current_permission_mode: PermissionMode,
     emit: Callable,
 ) -> PermissionMode:
-    """Execute all tool calls for one agent iteration.
-
-    Returns the (possibly updated) permission mode.
-
-    NOTE: returns a single value (PermissionMode), not a tuple.
-    Old callers that did:
-        _, mode = _process_tool_calls(...)
-    should be updated to:
-        mode = _process_tool_calls(...)
-    """
     todo_op_count = 0
     total_calls   = len(tool_calls)
 
@@ -847,6 +891,16 @@ def _process_tool_calls(
         if result.get("success"):
             emit("tool_result", {"name": fn_name, "success": True,
                                   "summary": str(result)[:200]})
+
+            # BCA: when delegate or decompose completes, emit a clean summary
+            if fn_name in ("delegate", "decompose", "task") and result.get("status") == "ok":
+                summary   = result.get("summary", "")
+                artifacts = result.get("artifacts", [])
+                emit("log", {"message": (
+                    f"✓ {fn_name} complete: {summary[:80]}"
+                    + (f" → {artifacts}" if artifacts else "")
+                )})
+
             if fn_name == "todo_complete" and result.get("all_complete"):
                 emit("log", {"message": "✓ All todos complete"})
                 messages.append({
@@ -862,9 +916,16 @@ def _process_tool_calls(
                     ),
                 })
                 continue
+
         else:
             emit("tool_result", {"name": fn_name, "success": False,
                                   "error": result.get("error", "")[:200]})
+
+            # BCA: surface blocked sub-agent errors clearly
+            if fn_name in ("delegate", "decompose", "task"):
+                error = result.get("error", result.get("summary", "Sub-agent failed"))
+                emit("warning", {"message": f"Sub-agent blocked/failed: {error[:120]}"})
+
             if (fn_name == "todo_complete"
                     and result.get("already_completed")
                     and result.get("all_complete")):
