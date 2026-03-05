@@ -638,8 +638,24 @@ def run_agent(
     todo_mgr       = TodoManager(workspace, session_id)
     plan_mgr       = PlanManager(workspace, session_id)
     task_state_mgr = TaskStateManager(workspace, session_id)
+
+    # ── BCA + tool context — always paired, always together ──────────────────
+    # set_tool_context must come first (BCA reads from it immediately after).
     set_tool_context(workspace, session_id, todo_mgr, plan_mgr, task_state_mgr,
                      messages, mode=mode, stream_callback=_base_stream_cb)
+
+    # initialize_root_agent gives the root agent a proper BCA brief so that
+    # delegate/decompose work identically from root and sub-agents.
+    # This is the ONLY change needed in this file vs the previous version.
+    from agent_bca import initialize_root_agent, cleanup_session_dirs
+    initialize_root_agent(
+        workspace=workspace,
+        session_id=session_id,
+        task=task,
+        messages=messages,
+        stream_callback=_base_stream_cb,
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     if resume_session:
         loaded = task_state_mgr.load()
@@ -875,9 +891,13 @@ def run_agent(
     finally:
         mcp_manager.close_all()
         close_shell_session()
+        # Clean up BCA agent directories created during this session.
+        # Keeps the workspace tidy — safe to remove, nothing here is needed
+        # after the agent finishes. Remove this line if you want to inspect
+        # brief.json / result.json after a run for debugging.
+        cleanup_session_dirs(workspace)
         if mode == "output":
             Log.set_silent(False)
-
 
 # =============================================================================
 # BANNER
