@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-agent_bca.py — Brief-Contract Architecture (BCA) for LMAgent. v2 HARDENED.
+agent_bca.py — Brief-Contract Architecture (BCA) for LMAgent. 
 
 Drop this file next to agent_tools.py and agent_llm.py.
-See INTEGRATION GUIDE at the bottom for the exact changes needed.
 
 ─────────────────────────────────────────────────────────────────────
 PARADIGM: why this exists
@@ -30,8 +29,9 @@ Brief-Contract Architecture (BCA) fixes this with four principles:
      removed from the tool list entirely — the model cannot attempt them.
 
   4. SCOPE ISOLATION
-     Each agent gets a private scope directory. Context per agent is
-     O(1) — bounded by brief size, not cumulative history.
+     Each agent gets a private scope directory for temp work only.
+     Deliverables are ALWAYS written to workspace-root-relative paths.
+     Context per agent is O(1) — bounded by brief size, not cumulative history.
 
 ─────────────────────────────────────────────────────────────────────
 v2 HARDENED — FIXES OVER v1
@@ -69,6 +69,60 @@ v2 HARDENED — FIXES OVER v1
     remove accumulated .lmagent/agents/* directories.
 
 ─────────────────────────────────────────────────────────────────────
+PATCH — WORKSPACE PATH FIXES (v2.1)
+─────────────────────────────────────────────────────────────────────
+  PATCH A (CRITICAL): render_system_context() — scope_path is now
+    described as a TEMP/SCRATCH directory only. Deliverable paths are
+    explicitly called out as workspace-root-relative. Previously the
+    wording "Your working directory is '{scope_path}'" caused sub-agents
+    to write all files into the hidden .lmagent/agents/xxx/scope/ dir
+    instead of the workspace root where the parent expects them.
+
+  PATCH B (CRITICAL): build_sub_agent_system_prompt() — added an
+    explicit FILE WRITING section that repeats: write deliverables to
+    the exact path from the brief, NOT into the scope dir. Includes a
+    worked example showing a correct vs. incorrect write call.
+
+  PATCH C (HIGH): tool_delegate() — automatically injects a path
+    constraint "Write the deliverable to exactly: <path>" whenever
+    deliverable_path is non-empty, so the sub-agent has a redundant
+    hard constraint on disk even if it skims the brief.
+
+  PATCH D (HIGH): tool_decompose() — same automatic path constraint
+    injected for every child task that has a non-empty deliverable path.
+
+  PATCH E (MEDIUM): _run_bca_agent() user turn — the initial user
+    message now echoes the deliverable path explicitly so it appears
+    near the top of the agent's context, not buried in the system prompt.
+
+  PATCH F (LOW): _scan_recent_artifacts() — now also skips the
+    .lmagent/agents/*/scope/ directories so auto-detected artifacts
+    never include temp files written to scope dirs. Previously scope
+    files could appear in the artifact list and confuse downstream tasks.
+
+─────────────────────────────────────────────────────────────────────
+v2.2 FIXES — WORKSPACE DELIVERY RELIABILITY
+─────────────────────────────────────────────────────────────────────
+  FIX 2.2-A (CRITICAL): Auto-correct condition in _run_bca_agent was
+    logically inverted — the guard `not write_path.endswith(deliverable_path)`
+    caused the correction to be SKIPPED in the most common failure case
+    (agent writes scope/index.html when deliverable IS index.html).
+    Fixed to trigger on ANY write to the scope dir unconditionally.
+
+  FIX 2.2-B (HIGH): _dispatch_bca_tool() now accepts an optional `brief`
+    parameter and enforces the path redirect as a hard wall at the
+    dispatch layer — independent of the loop-level intercept. Double
+    protection: loop catches it first, dispatch catches anything that
+    slips through.
+
+  FIX 2.2-C (HIGH): verify_and_collect_artifacts() — new public utility
+    called by the root agent runner after all sub-agents complete.
+    Checks every claimed artifact actually exists on disk. If a file
+    landed in the scope dir instead of workspace root, it is physically
+    moved/copied to the correct location. Returns a full verification
+    report so the root agent has an accurate, confirmed artifact list.
+
+─────────────────────────────────────────────────────────────────────
 SCALING PROPERTIES
 ─────────────────────────────────────────────────────────────────────
   Depth 0 (root): decomposes into N sequential sub-tasks
@@ -80,6 +134,7 @@ SCALING PROPERTIES
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -172,8 +227,8 @@ class DeliverableSpec:
 
     def render_for_prompt(self) -> str:
         lines = [f"Type: {self.type}", f"Description: {self.description}"]
-        if self.path:   lines.append(f"File path: {self.path}")
-        if self.paths:  lines.append(f"File paths: {', '.join(self.paths)}")
+        if self.path:   lines.append(f"File path (write here): {self.path}")
+        if self.paths:  lines.append(f"File paths (write here): {', '.join(self.paths)}")
         if self.schema: lines.append(f"Schema: {self.schema}")
         if self.format: lines.append(f"Format: {self.format}")
         return "\n".join(lines)
@@ -200,7 +255,7 @@ class AgentBrief:
     data:             str          # Extracted relevant data only
     constraints:      List[str]
     parent_objective: str          # Root task breadcrumb
-    scope_path:       str          # Agent's private write dir (workspace-relative)
+    scope_path:       str          # Agent's private TEMP dir (workspace-relative)
     parent_scope:     str
     session_id:       str
     created_at:       str = ""
@@ -266,9 +321,26 @@ class AgentBrief:
                 "",
             ]
 
+        # PATCH A: Clearly separate scope (temp) from deliverable (workspace-root) paths.
+        deliverable_path_note = ""
+        if self.deliverable.path:
+            deliverable_path_note = (
+                f"\n⚠️  DELIVERABLE PATH: Write your output to '{self.deliverable.path}' "
+                f"— this is workspace-root-relative (e.g. 'index.html' = workspace root)."
+            )
+        elif self.deliverable.paths:
+            deliverable_path_note = (
+                f"\n⚠️  DELIVERABLE PATHS: {', '.join(self.deliverable.paths)} "
+                f"— all workspace-root-relative."
+            )
+
         lines += [
-            f"SCOPE: Your working directory is '{self.scope_path}'.",
-            "Write deliverables there unless an explicit path is specified.",
+            "SCRATCH DIRECTORY (temp files only): " + self.scope_path,
+            "  ↳ Use this ONLY for intermediate/temp work, NOT for your deliverable.",
+            "WORKSPACE ROOT: All deliverable files must be written relative to workspace root.",
+            "  ↳ 'index.html' → workspace_root/index.html",
+            "  ↳ 'js/main.js' → workspace_root/js/main.js",
+            "  ↳ Do NOT prefix deliverable paths with the scratch directory." + deliverable_path_note,
             "",
             "When done: call report_result with status='ok' and a summary.",
             "If blocked: call report_result with status='blocked' and the reason.",
@@ -595,9 +667,42 @@ def build_sub_agent_system_prompt(brief: AgentBrief) -> str:
         "The 'delegate' and 'decompose' tools are NOT available to you."
     )
 
+    # PATCH B: Build an unambiguous file-path instruction block.
+    if brief.deliverable.path:
+        file_path_instruction = (
+            f"## FILE PATH — CRITICAL\n\n"
+            f"Your deliverable MUST be written to: **`{brief.deliverable.path}`**\n\n"
+            f"This is a WORKSPACE-ROOT-RELATIVE path. The tool call must be:\n\n"
+            f"    write(path=\"{brief.deliverable.path}\", content=\"...\")\n\n"
+            f"❌ WRONG — do NOT write to the scratch dir:\n"
+            f"    write(path=\"{brief.scope_path}/{brief.deliverable.path}\", content=\"...\")\n"
+            f"    write(path=\"{brief.scope_path}/output.html\", content=\"...\")\n\n"
+            f"✅ CORRECT — write directly to the deliverable path:\n"
+            f"    write(path=\"{brief.deliverable.path}\", content=\"...\")\n\n"
+            f"The scratch directory (`{brief.scope_path}`) is for temp files ONLY.\n"
+            f"Your final deliverable must NOT be placed there.\n"
+        )
+    elif brief.deliverable.paths:
+        paths_list = "\n".join(f"  - write(path=\"{p}\", content=\"...\")" for p in brief.deliverable.paths)
+        file_path_instruction = (
+            f"## FILE PATHS — CRITICAL\n\n"
+            f"Your deliverables MUST be written to these workspace-root-relative paths:\n"
+            f"{paths_list}\n\n"
+            f"Do NOT prefix any of these with the scratch dir (`{brief.scope_path}`).\n"
+        )
+    else:
+        file_path_instruction = (
+            f"## FILE PATH — CRITICAL\n\n"
+            f"Write all deliverable files to workspace-root-relative paths.\n"
+            f"The scratch directory (`{brief.scope_path}`) is for temp files ONLY.\n"
+            f"Do NOT write deliverables into the scratch directory.\n"
+        )
+
     return f"""You are a focused execution agent. You have one job: complete the objective in your brief.
 
 {brief.render_system_context()}
+
+{file_path_instruction}
 
 ## EXECUTION RULES
 
@@ -623,7 +728,12 @@ Always end with report_result. Never output TASK_COMPLETE — use report_result 
   - Success: report_result(status='ok', summary='...', artifacts=['path/to/file', ...])
   - Blocked: report_result(status='blocked', summary='...', error='exact reason')
 
-**7. Data fidelity.**
+**7. Artifacts list.**
+In report_result, set artifacts to the ACTUAL workspace-root-relative paths you wrote.
+Example: artifacts=['index.html', 'js/main.js', 'css/styles.css']
+Never list scratch-dir paths in artifacts.
+
+**8. Data fidelity.**
 If your brief's DATA section contains specific values, use ALL of them.
 Do not sample, abbreviate, or invent. Missing data → report_result(status='blocked').
 
@@ -632,6 +742,7 @@ Do not sample, abbreviate, or invent. Missing data → report_result(status='blo
 - Do NOT call report_result and then continue calling tools.
 - Do NOT re-read a file you already read unless it changed.
 - Do NOT ask clarifying questions. Everything you need is in the brief.
+- Do NOT write deliverables into the scratch directory.
 """
 
 
@@ -761,28 +872,133 @@ def _scan_recent_artifacts(
     Used by _auto_write_result to populate artifacts when an agent outputs
     TASK_COMPLETE without calling report_result.
 
-    Skips hidden directories and .lmagent internals.
+    PATCH F: Skips hidden directories, .lmagent internals, AND scope dirs
+    so temp files written to agent scratch dirs never appear as artifacts.
     """
     cutoff = time.time() - since_seconds
     artifacts: List[str] = []
+    # Pre-build the agents dir prefix to filter scope dirs efficiently.
+    agents_dir_rel = BRIEF_DIR_NAME  # ".lmagent/agents"
     try:
         for f in workspace.rglob("*"):
             if not f.is_file():
                 continue
-            rel_parts = f.relative_to(workspace).parts
-            # Skip hidden dirs and our own agent dirs
+            try:
+                rel = f.relative_to(workspace)
+            except ValueError:
+                continue
+            rel_parts = rel.parts
+            # Skip hidden dirs and .lmagent internals (includes scope dirs).
             if any(p.startswith(".") for p in rel_parts):
+                continue
+            # Extra guard: skip anything under .lmagent/agents explicitly.
+            rel_str = str(rel).replace("\\", "/")
+            if rel_str.startswith(agents_dir_rel):
                 continue
             try:
                 if f.stat().st_mtime >= cutoff:
-                    artifacts.append(
-                        str(f.relative_to(workspace)).replace("\\", "/")
-                    )
+                    artifacts.append(rel_str)
             except OSError:
                 continue
     except Exception as e:
         Log.warning(f"[BCA] Artifact scan failed: {e}")
     return artifacts
+
+
+# =============================================================================
+# FIX 2.2-C: ARTIFACT VERIFIER
+# =============================================================================
+
+def verify_and_collect_artifacts(
+    workspace: Path,
+    expected_artifacts: List[str],
+    brief: "AgentBrief",
+    bm: "BriefManager",
+) -> Dict[str, Any]:
+    """
+    Called by the root agent runner after all sub-agents complete.
+
+    For each expected artifact:
+      1. Check if it exists at the correct workspace-root-relative path.
+      2. If not, scan all agent scope directories to see if it was
+         accidentally written there.
+      3. If found misplaced, copy it to the correct workspace-root path.
+      4. If not found anywhere, report it as missing.
+
+    Returns a dict with:
+      found     — list of artifact paths confirmed/recovered in workspace root
+      missing   — list of artifact paths not found anywhere
+      misplaced — list of artifacts recovered from a scope dir
+      all_ok    — True if missing is empty
+      summary   — human-readable one-liner
+    """
+    found:     List[str] = []
+    missing:   List[str] = []
+    misplaced: List[str] = []
+
+    for art in expected_artifacts:
+        art_norm  = art.replace("\\", "/")
+        dest_path = workspace / art_norm
+
+        # 1. Happy path — file is exactly where it should be.
+        if dest_path.exists():
+            found.append(art_norm)
+            continue
+
+        # 2. Hunt through every agent's scope dir for a file with the same name.
+        recovered = False
+        target_name = Path(art_norm).name
+
+        agents_dir = workspace / BRIEF_DIR_NAME
+        if agents_dir.exists():
+            for agent_dir in agents_dir.iterdir():
+                if not agent_dir.is_dir():
+                    continue
+                scope_dir = agent_dir / SCOPE_DIRNAME
+                if not scope_dir.exists():
+                    continue
+                # Search recursively inside the scope dir.
+                for candidate in scope_dir.rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    if candidate.name == target_name:
+                        # Found it misplaced — copy to workspace root.
+                        try:
+                            dest_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(candidate, dest_path)
+                            Log.warning(
+                                f"[BCA] verify: recovered '{art_norm}' from scope dir "
+                                f"'{candidate.relative_to(workspace)}' → workspace root"
+                            )
+                            misplaced.append(art_norm)
+                            found.append(art_norm)
+                            recovered = True
+                        except Exception as e:
+                            Log.error(f"[BCA] verify: could not recover '{art_norm}': {e}")
+                        break
+                if recovered:
+                    break
+
+        if not recovered:
+            Log.warning(f"[BCA] verify: '{art_norm}' not found in workspace or any scope dir")
+            missing.append(art_norm)
+
+    all_ok  = len(missing) == 0
+    summary = f"{len(found)} artifact(s) confirmed in workspace root."
+    if misplaced:
+        summary += f" {len(misplaced)} recovered from scope dir(s)."
+    if missing:
+        summary += f" {len(missing)} MISSING: {missing}"
+
+    Log.info(f"[BCA] verify_and_collect_artifacts: {summary}")
+
+    return {
+        "found":     found,
+        "missing":   missing,
+        "misplaced": misplaced,
+        "all_ok":    all_ok,
+        "summary":   summary,
+    }
 
 
 # =============================================================================
@@ -825,11 +1041,24 @@ def tool_report_result(
             "error": f"Invalid status '{status}'. Must be one of: {sorted(valid)}",
         }
 
+    # Sanitize artifacts: strip any that accidentally point into scope/agent dirs.
+    agents_dir_rel = BRIEF_DIR_NAME
+    clean_artifacts: List[str] = []
+    for art in (artifacts or []):
+        art_norm = art.replace("\\", "/")
+        if art_norm.startswith(agents_dir_rel) or art_norm.startswith(".lmagent"):
+            Log.warning(
+                f"[BCA] report_result: artifact '{art}' points into agent scratch dir — "
+                f"removing from list. Write deliverables to workspace root, not scope dir."
+            )
+        else:
+            clean_artifacts.append(art_norm)
+
     result = AgentResult(
         agent_id=brief.agent_id,
         status=status,
         summary=summary,
-        artifacts=artifacts or [],
+        artifacts=clean_artifacts,
         data=data,
         error=error,
         iterations=getattr(_bca_local, "iteration_count", 0),
@@ -865,6 +1094,10 @@ def tool_delegate(
 
     FIX 1: Uses _ensure_bca_context() so this works from both root
     and sub-agents without any special-case guards.
+
+    PATCH C: Automatically injects an explicit file-path constraint when
+    deliverable_path is provided, so the sub-agent has a hard constraint
+    in addition to the brief's DELIVERABLE section.
     """
     # FIX 1: Always get a valid context — works from root and sub-agents.
     brief, bm = _ensure_bca_context(workspace, objective)
@@ -895,6 +1128,21 @@ def tool_delegate(
 
     scope_rel = str(bm.scope_path(child_id).relative_to(workspace)).replace("\\", "/")
 
+    # PATCH C: Build path-enforcing constraints automatically.
+    base_constraints = list(constraints or [])
+    if deliverable_path:
+        # Normalise path separator for the constraint text.
+        norm_path = deliverable_path.replace("\\", "/")
+        path_constraints = [
+            f"MANDATORY: Write your deliverable to exactly this path: {norm_path}",
+            f"This is a workspace-root-relative path. Use: write(path='{norm_path}', content='...')",
+            f"Do NOT write the deliverable into your scratch directory.",
+            "No placeholders or TODOs anywhere in the file content.",
+            f"Verify the file exists after writing: read(path='{norm_path}') or ls(path='.')",
+        ]
+        # Prepend so they appear first in the constraints block.
+        base_constraints = path_constraints + base_constraints
+
     child_brief = AgentBrief(
         agent_id=child_id,
         parent_id=brief.agent_id,
@@ -903,7 +1151,7 @@ def tool_delegate(
         objective=objective,
         deliverable=deliverable,
         data=extracted,
-        constraints=constraints or [],
+        constraints=base_constraints,
         parent_objective=brief.objective,
         scope_path=scope_rel,
         parent_scope=brief.scope_path,
@@ -941,17 +1189,28 @@ def tool_delegate(
 
 def tool_decompose(
     workspace: Path,
-    manifest_json: str,
+    manifest_json,          # str OR dict — models pass either
 ) -> Dict[str, Any]:
     """
-    Split the current task into sequential sub-tasks and run them.
-    Tasks with depends_on wait for their dependencies first.
-    Dependency results are injected into the next task's brief data.
+    Split the current task into sequential sub-tasks and run them in
+    dependency order. Results from completed tasks are injected into the
+    brief data of every task that depends on them.
 
-    FIX 1: Uses _ensure_bca_context() — works from root and sub-agents.
-    FIX 2: Cycle detection — explicit error if manifest has circular deps.
+    Improvements over v2:
+      - Accepts manifest_json as str OR pre-parsed dict (model-agnostic).
+      - Strips markdown fences and trailing commas before JSON parse.
+      - Dependency chain halting: if a task fails, all tasks that
+        (transitively) depend on it are skipped, not run and failed.
+      - Richer dependency injection: includes artifact file contents
+        (if small enough) so downstream agents don't need extra reads.
+      - Independent tasks that don't depend on the failed task still run.
+      - Clearer per-task and aggregate error reporting.
+
+    PATCH D: Automatically injects workspace-root path constraints for
+    every child task that has a non-empty deliverable.path, mirroring
+    the PATCH C behaviour in tool_delegate.
     """
-    # FIX 1: Always get a valid context — works from root and sub-agents.
+    # ── Context ───────────────────────────────────────────────────────────────
     brief, bm = _ensure_bca_context(workspace)
 
     if brief.depth >= brief.max_depth:
@@ -963,20 +1222,33 @@ def tool_decompose(
             ),
         }
 
-    # Parse manifest — strip markdown fences if the model wrapped the JSON.
+    # ── Parse manifest (str OR dict) ──────────────────────────────────────────
     try:
-        raw = manifest_json.strip()
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            # Drop first line (```json or ```) and last if it's ```
-            raw = "\n".join(lines[1:])
-            if raw.rstrip().endswith("```"):
-                raw = raw.rstrip()[:-3]
-        manifest_data = json.loads(raw)
+        if isinstance(manifest_json, dict):
+            manifest_data = manifest_json
+        elif isinstance(manifest_json, list):
+            # Model passed the tasks array directly — wrap it.
+            manifest_data = {"tasks": manifest_json}
+        else:
+            raw = str(manifest_json).strip()
+
+            # Strip markdown code fences (```json ... ``` or ``` ... ```)
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                raw   = "\n".join(lines[1:])          # drop opening fence line
+                if raw.rstrip().endswith("```"):
+                    raw = raw.rstrip()[:-3].rstrip()   # drop closing fence
+
+            # Strip trailing commas before ] or } (common model mistake)
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+            manifest_data = json.loads(raw)
+
         tasks = [SubTask.from_dict(t) for t in manifest_data.get("tasks", [])]
     except Exception as e:
-        return {"success": False, "error": f"Invalid manifest JSON: {e}"}
+        return {"success": False, "error": f"Could not parse manifest: {e}"}
 
+    # ── Basic validation ───────────────────────────────────────────────────────
     if not tasks:
         return {"success": False, "error": "Manifest contains no tasks."}
     if len(tasks) > 8:
@@ -985,24 +1257,45 @@ def tool_decompose(
             "error": f"Too many tasks ({len(tasks)}). Maximum is 8.",
         }
 
-    # Validate all depends_on references exist.
     task_ids = {t.task_id for t in tasks}
-    for task in tasks:
-        for dep in task.depends_on:
-            if dep not in task_ids:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Task '{task.task_id}' depends on unknown task '{dep}'. "
-                        f"Valid task IDs: {sorted(task_ids)}"
-                    ),
-                }
 
-    # FIX 2: Topological sort with cycle detection (Kahn's algorithm).
-    in_degree = {t.task_id: len(t.depends_on) for t in tasks}
-    by_id     = {t.task_id: t for t in tasks}
-    queue     = [t for t in tasks if in_degree[t.task_id] == 0]
-    ordered:  List[SubTask] = []
+    # Duplicate task_id check
+    if len(task_ids) < len(tasks):
+        seen: set = set()
+        dupes = []
+        for t in tasks:
+            if t.task_id in seen:
+                dupes.append(t.task_id)
+            seen.add(t.task_id)
+        return {
+            "success": False,
+            "error": f"Duplicate task_id(s): {dupes}. Every task_id must be unique.",
+        }
+
+    # Unknown depends_on references
+    for task in tasks:
+        bad = [d for d in task.depends_on if d not in task_ids]
+        if bad:
+            return {
+                "success": False,
+                "error": (
+                    f"Task '{task.task_id}' depends on unknown task(s): {bad}. "
+                    f"Valid task IDs: {sorted(task_ids)}"
+                ),
+            }
+
+        # Self-dependency guard
+        if task.task_id in task.depends_on:
+            return {
+                "success": False,
+                "error": f"Task '{task.task_id}' lists itself in depends_on.",
+            }
+
+    # ── Topological sort (Kahn's) with cycle detection ────────────────────────
+    in_degree   = {t.task_id: len(t.depends_on) for t in tasks}
+    by_id       = {t.task_id: t                  for t in tasks}
+    queue       = [t for t in tasks if in_degree[t.task_id] == 0]
+    ordered: List[SubTask] = []
 
     while queue:
         node = queue.pop(0)
@@ -1013,44 +1306,118 @@ def tool_decompose(
                 if in_degree[t.task_id] == 0:
                     queue.append(t)
 
-    # FIX 2: If not all tasks were ordered, there is a cycle.
     if len(ordered) < len(tasks):
         ordered_ids = {t.task_id for t in ordered}
         stuck       = sorted(task_ids - ordered_ids)
         return {
             "success": False,
             "error": (
-                f"Circular dependency detected. These tasks form a cycle "
-                f"and can never execute: {stuck}. "
+                f"Circular dependency detected — these tasks can never run: {stuck}. "
                 "Fix depends_on so the graph is acyclic."
             ),
         }
 
     Log.task(f"[BCA] decompose: {len(tasks)} sub-tasks for '{brief.agent_id}'")
 
+    # ── Build transitive-blocked set helper ───────────────────────────────────
+    def _transitive_blocked(failed_ids: set) -> set:
+        """Return all task_ids that (transitively) depend on any failed task."""
+        blocked = set(failed_ids)
+        changed = True
+        while changed:
+            changed = False
+            for t in tasks:
+                if t.task_id not in blocked:
+                    if any(d in blocked for d in t.depends_on):
+                        blocked.add(t.task_id)
+                        changed = True
+        return blocked - failed_ids   # exclude the originators themselves
+
+    # ── Execution ─────────────────────────────────────────────────────────────
     ctx      = get_current_context()
     messages = ctx.get("messages") or []
-    results: Dict[str, AgentResult] = {}
+
+    results:    Dict[str, AgentResult] = {}
+    failed_ids: set                    = set()
+    skipped:    List[str]              = []
 
     for task in ordered:
-        child_id  = make_agent_id(task.task_id)
-        scope_rel = str(bm.scope_path(child_id).relative_to(workspace)).replace("\\", "/")
+        # Check if this task should be skipped due to a failed dependency.
+        blocked_by = [d for d in task.depends_on if d in failed_ids]
+        if blocked_by:
+            skipped.append(task.task_id)
+            Log.warning(
+                f"[BCA] skipping '{task.task_id}' — "
+                f"blocked by failed dep(s): {blocked_by}"
+            )
+            # Record a synthetic skipped result so summaries are complete.
+            results[task.task_id] = AgentResult(
+                agent_id=task.task_id,
+                status=RESULT_BLOCKED,
+                summary=f"Skipped: dependency failed ({blocked_by})",
+                artifacts=[],
+                data=None,
+                error=f"Upstream failure in: {blocked_by}",
+            )
+            failed_ids.add(task.task_id)
+            continue
 
-        # Build data: inject dependency results + parent message context.
+        # ── Build dependency data injection ───────────────────────────────────
         dep_parts: List[str] = []
         for dep_id in task.depends_on:
             r = results.get(dep_id)
-            if r:
-                dep_parts.append(
-                    f"[Result from dependency '{dep_id}']\n"
-                    f"Status: {r.status}\n"
-                    f"Summary: {r.summary}\n"
-                    + (f"Artifacts: {r.artifacts}\n" if r.artifacts else "")
-                    + (f"Data: {json.dumps(r.data)}\n" if r.data is not None else "")
-                )
+            if not r:
+                continue
+
+            section = [
+                f"[Result from dependency '{dep_id}']",
+                f"Status  : {r.status}",
+                f"Summary : {r.summary}",
+            ]
+
+            if r.artifacts:
+                section.append(f"Artifacts: {r.artifacts}")
+                # Inline small text artifacts so the child doesn't need to read.
+                for art_path in r.artifacts[:3]:
+                    try:
+                        fp = workspace / art_path
+                        if fp.is_file() and fp.stat().st_size < 8_000:
+                            art_text = fp.read_text(encoding="utf-8", errors="replace")
+                            section.append(
+                                f"\n--- content of {art_path} ---\n"
+                                f"{art_text.strip()}\n"
+                                f"--- end {art_path} ---"
+                            )
+                    except Exception:
+                        pass
+
+            if r.data is not None:
+                try:
+                    section.append(f"Data: {json.dumps(r.data)[:2000]}")
+                except Exception:
+                    section.append(f"Data: {str(r.data)[:2000]}")
+
+            dep_parts.append("\n".join(section))
 
         base_data = BriefExtractor.extract(messages, task.objective)
         combined  = "\n\n".join(filter(None, ["\n\n".join(dep_parts), base_data]))
+
+        # ── Spawn child agent ─────────────────────────────────────────────────
+        child_id  = make_agent_id(task.task_id)
+        scope_rel = str(bm.scope_path(child_id).relative_to(workspace)).replace("\\", "/")
+
+        # PATCH D: Build path-enforcing constraints for this child task.
+        base_task_constraints = list(task.constraints)
+        if task.deliverable.path:
+            norm_path = task.deliverable.path.replace("\\", "/")
+            path_constraints = [
+                f"MANDATORY: Write your deliverable to exactly this path: {norm_path}",
+                f"This is workspace-root-relative. Use: write(path='{norm_path}', content='...')",
+                f"Do NOT write the deliverable into your scratch directory.",
+                "No placeholders or TODOs anywhere in the file content.",
+                f"Verify: read(path='{norm_path}') after writing.",
+            ]
+            base_task_constraints = path_constraints + base_task_constraints
 
         child_brief = AgentBrief(
             agent_id=child_id,
@@ -1060,7 +1427,7 @@ def tool_decompose(
             objective=task.objective,
             deliverable=task.deliverable,
             data=combined,
-            constraints=task.constraints + brief.constraints,
+            constraints=base_task_constraints + brief.constraints,
             parent_objective=brief.objective,
             scope_path=scope_rel,
             parent_scope=brief.scope_path,
@@ -1068,7 +1435,7 @@ def tool_decompose(
         )
 
         bm.write_brief(child_brief)
-        Log.task(f"[BCA] sub-task '{task.task_id}' → '{child_id}': {task.objective[:50]}")
+        Log.task(f"[BCA] sub-task '{task.task_id}' → '{child_id}': {task.objective[:60]}")
 
         raw_result = _run_bca_agent(
             brief=child_brief,
@@ -1090,32 +1457,56 @@ def tool_decompose(
 
         icon = "✓" if agent_result.status == RESULT_OK else "✗"
         Log.info(
-            f"[BCA] {icon} '{task.task_id}': {agent_result.summary[:60]}"
+            f"[BCA] {icon} '{task.task_id}': {agent_result.summary[:80]}"
             + (f" | artifacts: {agent_result.artifacts}" if agent_result.artifacts else "")
         )
 
-    all_ok        = all(r.status == RESULT_OK for r in results.values())
+        if agent_result.status not in (RESULT_OK, RESULT_PARTIAL):
+            failed_ids.add(task.task_id)
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    ran       = [r for tid, r in results.items() if tid not in skipped]
+    all_ok    = all(r.status == RESULT_OK for r in ran) and not skipped
+    tasks_ok  = sum(1 for r in ran if r.status == RESULT_OK)
+
     all_artifacts: List[str] = []
     summaries:     List[str] = []
-    for tid, r in results.items():
-        all_artifacts.extend(r.artifacts)
-        summaries.append(
-            f"{'✓' if r.status == RESULT_OK else '✗'} {tid}: {r.summary}"
+    for tid in [t.task_id for t in ordered]:
+        r = results.get(tid)
+        if not r:
+            continue
+        if tid in skipped:
+            summaries.append(f"⊘ {tid}: {r.summary}")
+        elif r.status == RESULT_OK:
+            summaries.append(f"✓ {tid}: {r.summary}")
+            all_artifacts.extend(r.artifacts)
+        else:
+            summaries.append(f"✗ {tid}: {r.summary} | error: {r.error}")
+
+    if all_ok:
+        note = (
+            "Decomposition complete — all tasks succeeded. "
+            "Call report_result(status='ok', ...) with a summary of everything accomplished."
+        )
+    elif tasks_ok > 0:
+        note = (
+            f"{tasks_ok}/{len(ran)} tasks succeeded; {len(skipped)} skipped. "
+            "Call report_result(status='partial', ...) describing what worked and what failed."
+        )
+    else:
+        note = (
+            "All tasks failed or were skipped. "
+            "Call report_result(status='blocked', ...) explaining the root cause."
         )
 
     return {
-        "success":   all_ok,
-        "tasks_run": len(results),
-        "tasks_ok":  sum(1 for r in results.values() if r.status == RESULT_OK),
-        "artifacts": all_artifacts,
-        "summaries": summaries,
-        "note": (
-            "Decomposition complete. "
-            "Call report_result with status='ok' and a summary of what was accomplished."
-            if all_ok else
-            "Decomposition partially failed. "
-            "Call report_result with status='partial' or 'blocked' describing what succeeded."
-        ),
+        "success":       all_ok,
+        "tasks_run":     len(ran),
+        "tasks_ok":      tasks_ok,
+        "tasks_skipped": len(skipped),
+        "artifacts":     all_artifacts,
+        "summaries":     summaries,
+        "note":          note,
     }
 
 
@@ -1144,6 +1535,9 @@ def _run_bca_agent(
     FIX 5: Config mutation uses thread-local save/restore so nested
     agents on the same thread correctly restore to their own prior values.
     FIX 6: _unpack_tc/_parse_tool_args imported from agent_tools directly.
+    PATCH E: User turn echoes deliverable path explicitly near top of context.
+    FIX 2.2-A: Auto-correct now triggers on ANY write to the scope dir,
+    not just when the filename doesn't match the deliverable path.
     """
     # FIX 6: Lazy imports — avoids circular dependency at module load time.
     # Import from agent_tools directly (where these are defined), not via agent_llm.
@@ -1167,13 +1561,41 @@ def _run_bca_agent(
     )
     brief.session_id = session_id
 
-    messages = [
-        {"role": "system", "content": build_sub_agent_system_prompt(brief)},
-        {"role": "user",   "content": (
+    # PATCH E: Build user turn that explicitly echoes the deliverable path
+    # so it appears near the top of the model's effective context window.
+    if brief.deliverable.path:
+        user_turn = (
             f"Execute your brief now.\n\n"
             f"Objective: {brief.objective}\n\n"
+            f"⚠️  WRITE YOUR DELIVERABLE TO: {brief.deliverable.path}\n"
+            f"Use: write(path='{brief.deliverable.path}', content='...')\n"
+            f"Do NOT write to your scratch directory ({brief.scope_path}).\n\n"
+            f"When done, call report_result with artifacts=['{brief.deliverable.path}']. "
+            f"Do not ask questions."
+        )
+    elif brief.deliverable.paths:
+        paths_str = ", ".join(f"'{p}'" for p in brief.deliverable.paths)
+        user_turn = (
+            f"Execute your brief now.\n\n"
+            f"Objective: {brief.objective}\n\n"
+            f"⚠️  WRITE YOUR DELIVERABLES TO: {', '.join(brief.deliverable.paths)}\n"
+            f"All paths are workspace-root-relative. "
+            f"Do NOT write to your scratch directory ({brief.scope_path}).\n\n"
+            f"When done, call report_result with artifacts=[{paths_str}]. "
+            f"Do not ask questions."
+        )
+    else:
+        user_turn = (
+            f"Execute your brief now.\n\n"
+            f"Objective: {brief.objective}\n\n"
+            f"Write all deliverable files to workspace-root-relative paths "
+            f"(NOT into your scratch directory at {brief.scope_path}).\n\n"
             f"When done, call report_result. Do not ask questions."
-        )},
+        )
+
+    messages = [
+        {"role": "system", "content": build_sub_agent_system_prompt(brief)},
+        {"role": "user",   "content": user_turn},
     ]
 
     # Depth-scoped tool list.
@@ -1215,6 +1637,9 @@ def _run_bca_agent(
 
     detector                    = LoopDetector()
     _bca_local.iteration_count  = 0
+
+    # Pre-compute normalised scope prefix once for the whole loop.
+    scope_norm = brief.scope_path.rstrip("/").replace("\\", "/")
 
     try:
         for iteration in range(1, max_iter + 1):
@@ -1259,7 +1684,32 @@ def _run_bca_agent(
                     })
                     continue
 
-                result  = _dispatch_bca_tool(fn_name, args, workspace)
+                # ── FIX 2.2-A: Hard path intercept (loop layer) ───────────────
+                # Trigger on ANY write() whose path starts with the scope dir,
+                # regardless of whether the filename matches the deliverable.
+                # The old condition `not write_path.endswith(deliverable_path)`
+                # was logically wrong — it SKIPPED the correction in the exact
+                # case where the agent wrote scope/index.html and deliverable
+                # IS index.html.
+                if fn_name == "write" and scope_norm:
+                    write_path = args.get("path", "").replace("\\", "/")
+                    if write_path.startswith(scope_norm + "/"):
+                        # Determine the corrected path.
+                        if brief.deliverable.path:
+                            corrected = brief.deliverable.path
+                        else:
+                            # Strip scope prefix, keep the relative remainder.
+                            corrected = write_path[len(scope_norm):].lstrip("/")
+                        Log.warning(
+                            f"[BCA] Auto-corrected write: "
+                            f"'{write_path}' → '{corrected}' "
+                            f"(agent '{brief.agent_id}' tried to write to scope dir)"
+                        )
+                        args = dict(args)
+                        args["path"] = corrected
+
+                # Pass brief to dispatch for the second layer of enforcement.
+                result  = _dispatch_bca_tool(fn_name, args, workspace, brief=brief)
                 success = result.get("success", False)
                 detector.track_tool(fn_name, args, success)
                 if success: detector.track_success(iteration)
@@ -1320,13 +1770,37 @@ def _dispatch_bca_tool(
     fn_name: str,
     args: Dict[str, Any],
     workspace: Path,
+    brief: Optional["AgentBrief"] = None,
 ) -> Dict[str, Any]:
     """Route a tool call to the correct handler.
 
     BCA tools (report_result, delegate, decompose) take priority so they
     always use the BCA implementations, never any stale TOOL_HANDLERS entry.
+
+    FIX 2.2-B: Accepts an optional `brief` parameter and enforces a hard
+    path redirect at the dispatch layer as a second line of defence,
+    independent of the loop-level intercept in _run_bca_agent.
+    Any write() that still targets the scope dir after the loop intercept
+    is silently redirected here before the actual write tool runs.
     """
     from agent_tools import TOOL_HANDLERS  # noqa: PLC0415
+
+    # FIX 2.2-B: Dispatch-layer scope-dir enforcement.
+    if fn_name == "write" and brief and brief.scope_path:
+        write_path = args.get("path", "").replace("\\", "/")
+        scope_norm = brief.scope_path.rstrip("/").replace("\\", "/")
+        if write_path.startswith(scope_norm + "/"):
+            corrected = (
+                brief.deliverable.path
+                if brief.deliverable.path
+                else write_path[len(scope_norm):].lstrip("/")
+            )
+            Log.warning(
+                f"[BCA] _dispatch: redirecting write '{write_path}' → '{corrected}' "
+                f"(scope-dir write slipped past loop intercept)"
+            )
+            args = dict(args)
+            args["path"] = corrected
 
     bca_handlers: Dict[str, Callable] = {
         "report_result": tool_report_result,
@@ -1373,9 +1847,9 @@ def _auto_write_result(
     Fallback result writer when an agent outputs TASK_COMPLETE without
     calling report_result.
 
-    FIX 3: Scans workspace for recently modified files and includes them
-    as artifacts so downstream dependency chains have accurate artifact
-    lists rather than always receiving [].
+    FIX 3 + PATCH F: Scans workspace for recently modified files, excluding
+    scope/agent scratch dirs, so downstream dependency chains have accurate
+    artifact lists.
     """
     is_blocked = "BLOCKED" in content.upper()
     artifacts  = [] if is_blocked else _scan_recent_artifacts(workspace)
@@ -1409,6 +1883,7 @@ def tool_task_bca(
 
     FIX 1: Uses get_current_brief() now that root is always initialized.
     No more inline brief construction — consistent with delegate/decompose.
+    Path constraints are injected just like tool_delegate (PATCH C).
     """
     if not Config.ENABLE_SUB_AGENTS:
         return {"success": False, "error": "Sub-agents disabled"}
@@ -1421,6 +1896,7 @@ def tool_task_bca(
 
     agent_id  = make_agent_id(file_path.replace("/", "_").replace(".", "_")[:20])
     scope_rel = str(bm.scope_path(agent_id).relative_to(workspace)).replace("\\", "/")
+    norm_path = file_path.replace("\\", "/")
 
     brief = AgentBrief(
         agent_id=agent_id,
@@ -1431,14 +1907,16 @@ def tool_task_bca(
         deliverable=DeliverableSpec(
             type="file",
             description=instructions[:300],
-            path=file_path,
+            path=norm_path,
             format=task_type,
         ),
         data=BriefExtractor.extract(messages, objective),
         constraints=[
-            f"Write the file to exactly this path: {file_path}",
-            "No placeholders or TODOs anywhere in the file content",
-            "Verify the file exists after writing with read or ls",
+            f"MANDATORY: Write the file to exactly this path: {norm_path}",
+            f"This is workspace-root-relative. Use: write(path='{norm_path}', content='...')",
+            "Do NOT write the deliverable into your scratch directory.",
+            "No placeholders or TODOs anywhere in the file content.",
+            f"Verify the file exists after writing: read(path='{norm_path}')",
         ],
         parent_objective=current_brief.objective,
         scope_path=scope_rel,
@@ -1447,7 +1925,7 @@ def tool_task_bca(
     )
 
     bm.write_brief(brief)
-    Log.task(f"[BCA] task_bca: '{agent_id}' depth={brief.depth} → {file_path}")
+    Log.task(f"[BCA] task_bca: '{agent_id}' depth={brief.depth} → {norm_path}")
 
     result = _run_bca_agent(
         brief=brief,
@@ -1459,7 +1937,7 @@ def tool_task_bca(
 
     return {
         "success":   result.get("success", False),
-        "file_path": file_path,
+        "file_path": norm_path,
         "agent_id":  agent_id,
         "status":    result.get("status"),
         "summary":   result.get("summary"),
@@ -1519,7 +1997,9 @@ _BCA_SCHEMAS_ALL: List[Dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Workspace-relative paths of every file you wrote. "
+                        "Workspace-root-relative paths of every deliverable file you wrote. "
+                        "Example: ['index.html', 'css/styles.css', 'js/main.js']. "
+                        "Do NOT include scratch-dir paths. "
                         "Always populate this — downstream agents depend on it."
                     ),
                 },
@@ -1563,7 +2043,11 @@ _BCA_SCHEMAS_ALL: List[Dict[str, Any]] = [
                 },
                 "deliverable_path": {
                     "type": "string",
-                    "description": "Workspace-relative file path if deliverable_type is 'file'.",
+                    "description": (
+                        "Workspace-root-relative file path if deliverable_type is 'file'. "
+                        "Example: 'index.html', 'src/app.js', 'css/styles.css'. "
+                        "Do NOT prefix with scratch or agent dirs."
+                    ),
                 },
                 "deliverable_format": {
                     "type": "string",
@@ -1605,10 +2089,17 @@ _BCA_SCHEMAS_ALL: List[Dict[str, Any]] = [
                         '{"tasks": [{'
                         '"task_id": "t1", '
                         '"objective": "precise description of what this task does", '
-                        '"deliverable": {"type": "file", "description": "...", "path": "..."}, '
-                        '"constraints": ["rule 1", "rule 2"], '
+                        '"deliverable": {'
+                        '"type": "file", '
+                        '"description": "...", '
+                        '"path": "index.html"'
+                        '}, '
+                        '"constraints": ["rule 1"], '
                         '"depends_on": []'
-                        '}]} '
+                        '}]}. '
+                        "IMPORTANT: deliverable.path must be workspace-root-relative "
+                        "(e.g. 'index.html', 'css/styles.css', 'js/main.js'). "
+                        "Do NOT include scope or agent-dir prefixes in paths. "
                         "task_id must be unique. depends_on lists task_ids that must complete first. "
                         "No circular dependencies. Maximum 8 tasks."
                     ),
@@ -1633,4 +2124,3 @@ def _get_bca_tool_schemas(depth: int, max_depth: int) -> List[Dict[str, Any]]:
         if s["function"]["name"] in always
         or (depth < max_depth and s["function"]["name"] in recurse)
     ]
-
