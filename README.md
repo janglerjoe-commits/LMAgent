@@ -11,6 +11,7 @@ A locally-hosted AI agent that connects to any OpenAI-compatible LLM — LM Stud
     <img src="https://img.youtube.com/vi/-_jKwfssAvA/hqdefault.jpg" alt="Watch the demo">
   </a>
 </p>
+
 ---
 
 ## Thank You
