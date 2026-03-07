@@ -48,6 +48,19 @@ Thank you, I don't say that as a formality.
 
 ---
 
+1. Install dependencies
+bashpip install requests flask colorama psutil docker
+Requires Python 3.10 or later.
+Optional extras — only install what you need:
+bashpip install Pillow              # image uploads in the web UI
+pip install discord.py          # Discord messaging integration
+pip install python-telegram-bot # Telegram messaging integration
+pip install twilio              # SMS integration
+WhatsApp (Green API) and QR code sign-in require no extra packages.
+If a messaging dep is missing, LMAgent will print the exact install command and disable that platform — it won't crash.
+
+---
+
 ## What Is This?
 
 You give LMAgent a task in plain English. It figures out the steps, uses real tools to execute them, checks its own work, and tells you when it's done.
