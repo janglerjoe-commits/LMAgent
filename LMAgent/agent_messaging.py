@@ -75,7 +75,7 @@ from flask import Flask, Response, jsonify, request
 # ── Load .env file from the same directory as this script ────────────────────
 def _load_env_file() -> None:
     _dir = Path(__file__).parent
-    env_path = next((p for p in [_dir / ".env", _dir / ".env"] if p.exists()), None)
+    env_path = next((p for p in [_dir / ".env", _dir / "env"] if p.exists()), None)
     if not env_path:
         return
     try:
