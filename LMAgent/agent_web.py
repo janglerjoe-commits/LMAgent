@@ -2,6 +2,35 @@
 LMAgent Web — v7
 Place this file next to agent_core.py, agent_tools.py, agent_main.py.
 """
+from pathlib import Path as _Path
+
+# ── Load .env file ────────────────────────────────────────────────────────────
+def _load_env():
+    _dir = _Path(__file__).parent
+    env_path = next((p for p in [_dir / ".env", _dir / "env"] if p.exists()), None)
+    if not env_path:
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path, override=False)
+        return
+    except ImportError:
+        pass
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in __import__("os").environ:
+                    __import__("os").environ[key] = value
+    except Exception as e:
+        print(f"[web] Warning: could not read env file: {e}")
+
+_load_env()
 
 import functools
 import io
@@ -34,10 +63,10 @@ try:
     import agent_bca   as _bca_mod
     import agent_main  as _agent_main_mod
     from agent_core import (
-    Config, Colors, colored, strip_thinking,
-    MCPManager, PermissionMode,
-    PlanManager, Safety, SessionManager, StateManager, WaitState,
-    SoulConfig, TodoManager, Log, AgentResult,
+        Config, Colors, colored, strip_thinking,
+        MCPManager, PermissionMode,
+        PlanManager, Safety, SessionManager, StateManager, WaitState,
+        SoulConfig, TodoManager, Log, AgentResult,
     )
     from agent_tools import (
         TOOL_SCHEMAS, LLMClient, _REQUIRED_ARG_TOOLS,
@@ -68,12 +97,29 @@ _mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 _UPLOAD_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 
+# ── Port ──────────────────────────────────────────────────────────────────────
+try:
+    _PORT = int(os.environ.get("AGENT_PORT", "7860"))
+except ValueError:
+    _PORT = 7860
+
 # ── Global MCP (used by tools panel) ─────────────────────────────────────────
 _global_mcp = MCPManager(WORKSPACE)
 try:
     _global_mcp.load_servers()
 except Exception:
     pass
+
+# ── UI template ───────────────────────────────────────────────────────────────
+_UI_HTML_PATH = Path(__file__).parent / "agent_web_ui.html"
+try:
+    HTML = _UI_HTML_PATH.read_text(encoding="utf-8")
+except FileNotFoundError:
+    sys.exit(f"ERROR: UI template not found: {_UI_HTML_PATH}")
+
+# ── Pre-compiled serve rewrite regexes ───────────────────────────────────────
+_SRC_HREF_RE = re.compile(r'((?:src|href)\s*=\s*["\'])([^"\']+)(["\'])')
+_CSS_URL_RE  = re.compile(r'url\(([^)]+)\)')
 
 
 # =============================================================================
@@ -88,7 +134,10 @@ def _security_headers(response):
     h = response.headers
     h["X-Content-Type-Options"] = "nosniff"
     h["Referrer-Policy"]        = "no-referrer"
-    if not request.path.startswith("/serve/"):
+    if request.path.startswith("/serve/"):
+        h["Cross-Origin-Embedder-Policy"] = "credentialless"
+        h["Cross-Origin-Opener-Policy"]   = "same-origin"
+    else:
         h["X-Frame-Options"]         = "DENY"
         h["Content-Security-Policy"] = (
             "default-src 'self'; "
@@ -108,9 +157,9 @@ def _security_headers(response):
 _AGENT_TOKEN = os.environ.get("AGENT_TOKEN") or str(secrets.randbelow(900_000) + 100_000)
 print(f"[LMAgent] PIN: {_AGENT_TOKEN}", flush=True)
 
-_HOST        = os.environ.get("AGENT_HOST", "0.0.0.0")
-_SSL_CERT    = os.environ.get("AGENT_CERT", "")
-_SSL_KEY     = os.environ.get("AGENT_KEY",  "")
+_HOST     = os.environ.get("AGENT_HOST", "0.0.0.0")
+_SSL_CERT = os.environ.get("AGENT_CERT", "")
+_SSL_KEY  = os.environ.get("AGENT_KEY",  "")
 
 _rate_data: dict = {}
 _rate_lock       = threading.Lock()
@@ -150,7 +199,6 @@ def _require_auth(f):
 
 # =============================================================================
 # SIGN-IN PAGE
-# QR encodes the base URL only — user must type the PIN.
 # =============================================================================
 
 def _make_qr_data_uri(url: str) -> str:
@@ -226,7 +274,7 @@ code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;border-radius:3
   function upd(){ btn.disabled=val().length!==6; digits.forEach(function(d){d.classList.toggle('filled',d.value!=='');}); }
   digits.forEach(function(d,i){
     d.addEventListener('input',function(){
-      d.value=d.value.replace(/\D/g,'').slice(0,1); upd();
+      d.value=d.value.replace(/\\D/g,'').slice(0,1); upd();
       if(d.value&&i<digits.length-1) digits[i+1].focus();
       if(val().length===6) submitPin();
     });
@@ -235,7 +283,7 @@ code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;border-radius:3
     });
     d.addEventListener('paste',function(e){
       e.preventDefault();
-      var t=(e.clipboardData||window.clipboardData).getData('text').replace(/\D/g,'').slice(0,6);
+      var t=(e.clipboardData||window.clipboardData).getData('text').replace(/\\D/g,'').slice(0,6);
       t.split('').forEach(function(ch,j){if(digits[i+j])digits[i+j].value=ch;});
       upd(); digits[Math.min(i+t.length,digits.length-1)].focus();
       if(val().length===6) submitPin();
@@ -258,17 +306,17 @@ code{background:#0d0d0f;border:1px solid #252530;padding:1px 6px;border-radius:3
 # =============================================================================
 
 _AGENT_LOCK         = threading.Lock()
-_AGENT_LOCK_TIMEOUT = 60
-_tl                 = threading.local()   # per-thread callbacks & request state
+_AGENT_LOCK_TIMEOUT = 30
+_tl                 = threading.local()
 
-_active_responses:      dict          = {}
+_active_responses:      dict           = {}
 _active_responses_lock: threading.Lock = threading.Lock()
 
 _session_lock            = threading.Lock()
 _current_session_id      = None
 _current_permission_mode = Config.PERMISSION_MODE
 
-_stop_events:      dict          = {}
+_stop_events:      dict           = {}
 _stop_events_lock: threading.Lock = threading.Lock()
 
 _whisper_store: list = []
@@ -276,6 +324,14 @@ _whisper_lock        = threading.Lock()
 
 _agent_state      = "idle"
 _agent_state_lock = threading.Lock()
+
+# Messaging mode — "web" means only the browser UI can send tasks;
+# any other value ("discord", "telegram", "whatsapp", "sms") means
+# the named platform is the active input source.  agent_messaging.py
+# calls _set_messaging_mode() when the operator switches platforms via
+# the /messaging/mode API endpoint.
+_messaging_mode      = "web"
+_messaging_mode_lock = threading.Lock()
 
 _PERM_MODE_MAP = {m.value: m for m in PermissionMode}
 
@@ -291,6 +347,17 @@ def _get_agent_state() -> str:
         return _agent_state
 
 
+def _get_messaging_mode() -> str:
+    with _messaging_mode_lock:
+        return _messaging_mode
+
+
+def _set_messaging_mode(mode: str) -> None:
+    global _messaging_mode
+    with _messaging_mode_lock:
+        _messaging_mode = mode
+
+
 def _resolve_permission_mode() -> PermissionMode:
     return _PERM_MODE_MAP.get(
         (_current_permission_mode or "").lower(), PermissionMode.AUTO
@@ -301,12 +368,13 @@ def _resolve_permission_mode() -> PermissionMode:
 # SSE BROADCAST / STREAM QUEUES
 # =============================================================================
 
-_stream_queues:      list          = []
+_stream_queues:      list           = []
 _stream_queues_lock: threading.Lock = threading.Lock()
 
 
 def _broadcast(item: tuple) -> None:
     """Push an event to all connected SSE clients and the persistent chat log."""
+    # Fix: normalize any latin-1 / utf-8 encoding edge cases (from script v2)
     kind, payload = item
     if isinstance(payload, str):
         try:
@@ -340,10 +408,10 @@ def _unregister_stream_q(q: queue.Queue) -> None:
 
 
 # =============================================================================
-# PERSISTENT CHAT LOG  (per-session replay on reconnect)
+# PERSISTENT CHAT LOG
 # =============================================================================
 
-_chat_logs:     dict          = defaultdict(list)
+_chat_logs:     dict           = defaultdict(list)
 _chat_log_lock: threading.Lock = threading.Lock()
 _NO_SESSION_KEY = "_none_"
 _REPLAY_KINDS   = frozenset({
@@ -384,20 +452,21 @@ def _chatlog_merge_keys(old_sid, new_sid) -> None:
 
 
 # =============================================================================
+# PATH VALIDATION HELPER
+# =============================================================================
+
+def _validate_ft_path(path: str):
+    """Validate a workspace-relative path; returns (ok, err, resolved_path)."""
+    if not path or path in (".", ""):
+        return True, "", WORKSPACE
+    ok, err, fp = Safety.validate_path(WORKSPACE, path)
+    if not ok:
+        return False, err, WORKSPACE
+    return True, "", fp
+
+
+# =============================================================================
 # BCA WEB HOOKS
-# ─────────────────────────────────────────────────────────────────────────────
-# Wrap three BCA internals to broadcast sub-agent progress to SSE clients.
-# No logic changes — pure event emission layered on top of the originals.
-#
-# Execution order on one thread:
-#   run_agent → _process_tool_calls → tool_decompose / tool_delegate
-#             → _run_bca_agent (per sub-agent)
-#             → _dispatch_bca_tool (per tool call inside sub-agent)
-#
-# Because BCA runs synchronously on the same thread as the web handler,
-# _tl.token_cb is live throughout. We suppress sub-agent token streaming
-# (saves/restores _tl.token_cb) so root-agent message blocks stay clean,
-# while still surfacing per-tool progress via tool events.
 # =============================================================================
 
 _orig_run_bca_agent     = _bca_mod._run_bca_agent
@@ -405,16 +474,13 @@ _orig_dispatch_bca_tool = _bca_mod._dispatch_bca_tool
 _orig_tool_decompose    = _bca_mod.tool_decompose
 _orig_tool_delegate     = _bca_mod.tool_delegate
 
-# Tools whose intermediate results are too noisy for the UI
 _BCA_SILENT_TOOLS = frozenset({
-    "task_state_update", "task_state_get", "task_reconcile",
-    "todo_list",
+    "task_state_update", "task_state_get", "task_reconcile", "todo_list",
 })
 
 
 def _web_run_bca_agent(brief, workspace, bm, parent_ctx,
                        stream_callback=None, max_iterations=None):
-    """Broadcast sub-agent lifecycle events, suppress token noise."""
     depth  = getattr(brief, "depth", 0)
     indent = "  " * max(0, depth - 1)
     short  = brief.agent_id[:8]
@@ -422,8 +488,6 @@ def _web_run_bca_agent(brief, workspace, bm, parent_ctx,
 
     _broadcast(("status", f"{indent}▶ [{short}] {obj}…"))
 
-    # Suppress sub-agent tokens so they don't pollute the root agent's
-    # streaming message block.  The parent's token_cb is restored in finally.
     prev_token_cb = getattr(_tl, "token_cb", None)
     _tl.token_cb  = None
 
@@ -444,14 +508,11 @@ def _web_run_bca_agent(brief, workspace, bm, parent_ctx,
     if arts:
         line += f" → {', '.join(arts[:3])}"
     _broadcast(("status", line))
-
     return result
 
 
 def _web_dispatch_bca_tool(fn_name, args, workspace, brief=None):
-    """Broadcast each sub-agent tool call as a tool event in the UI."""
     if fn_name not in _BCA_SILENT_TOOLS:
-        # Build a compact args preview using the most useful key
         preview = ""
         for key in ("path", "command", "pattern", "step_id", "description"):
             v = args.get(key, "")
@@ -470,7 +531,6 @@ def _web_dispatch_bca_tool(fn_name, args, workspace, brief=None):
 
 
 def _web_tool_decompose(workspace, manifest_json):
-    """Show decompose task count before starting, then final outcome."""
     try:
         if isinstance(manifest_json, dict):
             n = len(manifest_json.get("tasks", []))
@@ -504,7 +564,6 @@ def _web_tool_decompose(workspace, manifest_json):
 
 
 def _web_tool_delegate(workspace, **kwargs):
-    """Show delegate objective before and result after."""
     obj = kwargs.get("objective", "")[:60]
     _broadcast(("status", f"delegate → {obj}…"))
 
@@ -517,7 +576,6 @@ def _web_tool_delegate(workspace, **kwargs):
     if arts:
         line += f" → {', '.join(arts[:3])}"
     _broadcast(("status", line))
-
     return result
 
 
@@ -527,19 +585,12 @@ _bca_mod._dispatch_bca_tool = _web_dispatch_bca_tool
 _bca_mod.tool_decompose      = _web_tool_decompose
 _bca_mod.tool_delegate       = _web_tool_delegate
 
-# Keep TOOL_HANDLERS in sync so agent_tools dispatch uses the patched versions
 _at_mod.TOOL_HANDLERS["decompose"] = _web_tool_decompose
 _at_mod.TOOL_HANDLERS["delegate"]  = _web_tool_delegate
 
 
 # =============================================================================
 # LLMClient STREAM PARSER PATCH
-# ─────────────────────────────────────────────────────────────────────────────
-# Replaces the default blocking _parse_stream with one that:
-#   • Routes tokens to _tl.token_cb (broadcasts to all SSE clients)
-#   • Routes thinking tokens to _tl.thinking_cb
-#   • Respects _tl.stop_event for mid-stream cancellation
-#   • Registers the raw response so /stop can close it immediately
 # =============================================================================
 
 def _web_parse_stream(resp, stream_callback):
@@ -610,7 +661,6 @@ def _web_parse_stream(resp, stream_callback):
                         elif eff_cb:
                             eff_cb(part)
 
-            # Native thinking blocks (e.g. Claude API)
             for tb in (delta.get("thinking") or []):
                 tb_text = tb.get("thinking") if isinstance(tb, dict) else None
                 if tb_text:
@@ -641,7 +691,7 @@ def _web_parse_stream(resp, stream_callback):
             f"[web] Stream interrupted mid-response "
             f"({type(_stream_err).__name__}: {_stream_err}) — returning partial result"
         )
-        _broadcast(("status", f"⚠ stream interrupted — partial response returned"))
+        _broadcast(("status", "⚠ stream interrupted — partial response returned"))
 
     if content and stream_callback:
         stream_callback("\n")
@@ -661,9 +711,9 @@ def _web_parse_stream(resp, stream_callback):
         if is_empty or args_str.strip() == "{}":
             if fn_name in _REQUIRED_ARG_TOOLS:
                 Log.error(f"'{fn_name}' received empty args — finish_reason={finish_reason!r}")
-                incomplete           = True
+                incomplete                  = True
                 tc["function"]["arguments"] = "{}"
-                tc["_truncated"]     = True
+                tc["_truncated"]            = True
             else:
                 tc["function"]["arguments"] = "{}"
             calls.append(tc)
@@ -688,9 +738,9 @@ def _web_parse_stream(resp, stream_callback):
                     except json.JSONDecodeError:
                         pass
             if not repaired:
-                incomplete                   = True
-                tc["function"]["arguments"]  = "{}"
-                tc["_truncated"]             = True
+                incomplete                  = True
+                tc["function"]["arguments"] = "{}"
+                tc["_truncated"]            = True
                 calls.append(tc)
 
     if finish_reason == "length":
@@ -712,11 +762,9 @@ def _web_parse_stream(resp, stream_callback):
 
 LLMClient._parse_stream = staticmethod(_web_parse_stream)
 
+
 # =============================================================================
 # STREAMING HEADER CALLBACK PATCH
-# ─────────────────────────────────────────────────────────────────────────────
-# Extends _OrigHSC to also route tokens through _tl.token_cb so that
-# non-stream-callback paths (mode="output") still reach the browser.
 # =============================================================================
 
 class _PatchedHSC(_OrigHSC):
@@ -793,11 +841,11 @@ def _push_event(event, stop_event, last_status: list, flush_thinking=None) -> No
         if flush_thinking:
             flush_thinking()
         _broadcast(("tool",
-                     f"{edata.get('name','?')}({edata.get('args_preview','')[:50]})"))
+                    f"{edata.get('name','?')}({edata.get('args_preview','')[:50]})"))
 
     elif etype == "tool_result":
         _broadcast(("tool",
-                     f"{'✓' if edata.get('success') else '✗'} {edata.get('name','')}"))
+                    f"{'✓' if edata.get('success') else '✗'} {edata.get('name','')}"))
 
     elif etype == "iteration":
         if flush_thinking:
@@ -819,21 +867,22 @@ def _push_event(event, stop_event, last_status: list, flush_thinking=None) -> No
 
 def _sse_response(generator):
     return Response(generator, mimetype="text/event-stream", headers={
-        "Cache-Control":    "no-cache, no-transform",
+        "Cache-Control":     "no-cache, no-transform",
         "X-Accel-Buffering": "no",
-        "Connection":       "keep-alive",
-        "Content-Type":     "text/event-stream; charset=utf-8",
+        "Connection":        "keep-alive",
+        "Content-Type":      "text/event-stream; charset=utf-8",
     })
 
 
 # =============================================================================
 # SHARED AGENT EXECUTION
-# ─────────────────────────────────────────────────────────────────────────────
-# Called by /chat and the web scheduler.  Caller MUST hold _AGENT_LOCK.
 # =============================================================================
 
+# PATCH 1 & 2 & 3: Added web_origin parameter; gated session broadcasts and
+# _current_session_id updates so only web-originated calls affect browser state.
 def _execute_agent(message, session_id, request_id, stop_ev,
-                   permission_mode, whisper_fn=None):
+                   permission_mode, whisper_fn=None,
+                   web_origin: bool = True, on_session=None):
     global _current_session_id
 
     _tl.stop_event  = stop_ev
@@ -849,13 +898,17 @@ def _execute_agent(message, session_id, request_id, stop_ev,
 
     _tl.token_cb = token_cb
 
-    _broadcast(("session", session_id or ""))
+    # PATCH 2: Only broadcast the initial "session" event for web-originated calls.
+    # Messaging/scheduler tasks must not push their session IDs to SSE clients.
+    if web_origin:
+        _broadcast(("session", session_id or ""))
     _set_agent_state("running")
     last_status = [""]
 
     def ev_cb(event):
-        if not stop_ev.is_set():
-            _push_event(event, stop_ev, last_status, flush_thinking)
+        if stop_ev.is_set():
+            raise _AgentStopped()   # fires between tool calls, not just during streaming
+        _push_event(event, stop_ev, last_status, flush_thinking)
 
     def whisper_fn_safe():
         with _whisper_lock:
@@ -874,10 +927,17 @@ def _execute_agent(message, session_id, request_id, stop_ev,
         )
         flush_thinking()
 
+        # PATCH 3: Only update _current_session_id and broadcast the final
+        # session event when the call originated from the web /chat endpoint.
         with _session_lock:
-            _current_session_id = result.session_id
-        _chatlog_merge_keys(session_id, result.session_id)
-        _broadcast(("session", result.session_id))
+            if web_origin:
+                _current_session_id = result.session_id
+        if web_origin:
+            _chatlog_merge_keys(session_id, result.session_id)
+            _broadcast(("session", result.session_id))
+        # Always notify non-web callers of the final session ID
+        if on_session and result.session_id:
+            on_session(result.session_id)
 
         if result.status == "waiting":
             _broadcast(("done", f"waiting until {result.wait_until}"))
@@ -893,6 +953,9 @@ def _execute_agent(message, session_id, request_id, stop_ev,
 
     except _AgentStopped:
         flush_thinking()
+        # Re-confirm the session ID so the next message picks it up cleanly
+        if web_origin:
+            _broadcast(("session", session_id or ""))
         _broadcast(("done", "stopped"))
         _set_agent_state("idle")
 
@@ -913,7 +976,7 @@ def _execute_agent(message, session_id, request_id, stop_ev,
 
 
 # =============================================================================
-# TOOL CATEGORIES  (for /tools panel)
+# TOOL CATEGORIES
 # =============================================================================
 
 _TOOL_CATEGORIES = {
@@ -964,1456 +1027,157 @@ def _build_tools_payload() -> dict:
 
 
 # =============================================================================
-# HTML TEMPLATE
+# SERVE FILE — module-level rewrite helpers
 # =============================================================================
 
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>LMAgent</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-:root {
-  --bg:        #0d0d0f;
-  --bg2:       #121214;
-  --surface:   #16161a;
-  --surface2:  #1c1c22;
-  --border:    #252530;
-  --border2:   #32323e;
-  --amber:     #e8a245;
-  --amber-dim: #7a4e18;
-  --teal:      #3ecfb2;
-  --teal-dim:  #0e4037;
-  --red:       #e05555;
-  --green:     #3ec97a;
-  --purple:    #9d7dea;
-  --text:      #ddd8d0;
-  --text2:     #8e8c88;
-  --text3:     #4e4c50;
-  --user-bg:   #14131f;
-  --user-bdr:  #27254a;
-  --agent-bg:  #111113;
-  --agent-bdr: #1f1f25;
-  --code-bg:   #09090b;
-  --code-bdr:  #1a1a20;
-  --mono: 'IBM Plex Mono', monospace;
-  --sans: 'IBM Plex Sans', sans-serif;
-  --r: 8px;
-}
-
-html, body { height: 100%; background: var(--bg); color: var(--text);
-  font-family: var(--mono); font-size: 13.5px; line-height: 1.6; overflow: hidden; }
-
-::-webkit-scrollbar { width: 3px; }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
-::-webkit-scrollbar-track { background: transparent; }
-
-#app {
-  display: flex; flex-direction: column;
-  height: 100dvh; max-width: 860px; margin: 0 auto; position: relative;
-}
-
-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 11px 16px; border-bottom: 1px solid var(--border);
-  background: var(--surface); flex-shrink: 0; z-index: 5; gap: 10px;
-}
-
-.logo {
-  display: flex; align-items: center; gap: 9px;
-  font-family: var(--sans); font-weight: 700; font-size: 15px;
-  color: var(--text); letter-spacing: -0.2px;
-}
-.logo-mark {
-  width: 28px; height: 28px; background: var(--amber); border-radius: 6px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 14px; color: #0d0d0f; font-weight: 700; flex-shrink: 0; font-family: var(--mono);
-}
-.logo-sub { color: var(--text2); font-weight: 400; font-size: 12px; margin-left: 2px; }
-.header-right { display: flex; gap: 6px; align-items: center; }
-
-.session-pill {
-  font-size: 10px; font-family: var(--mono); color: var(--text3);
-  background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
-  padding: 2px 7px; display: none; letter-spacing: 0.04em;
-}
-
-.conn-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--text3); flex-shrink: 0; transition: background .4s;
-}
-.conn-dot.ok  { background: var(--green); }
-.conn-dot.err { background: var(--red); }
-.conn-dot.try { background: var(--amber); animation: pulse 1s ease-in-out infinite; }
-
-.btn {
-  font-family: var(--mono); font-size: 11px; padding: 5px 12px; border-radius: 5px;
-  border: 1px solid var(--border); background: transparent; color: var(--text2);
-  cursor: pointer; transition: border-color .12s, color .12s; white-space: nowrap; user-select: none;
-  text-decoration: none; display: inline-flex; align-items: center;
-}
-.btn:hover { border-color: var(--amber); color: var(--amber); }
-.btn.danger:hover { border-color: var(--red); color: var(--red); }
-.btn.accent { border-color: var(--teal-dim); color: var(--teal); }
-.btn.accent:hover { border-color: var(--teal); }
-
-#messages {
-  flex: 1; overflow-y: auto; padding: 16px 16px 8px;
-  display: flex; flex-direction: column; gap: 0;
-  transition: background .15s;
-}
-#messages.drag-over {
-  background: rgba(62,207,178,.04);
-  outline: 2px dashed var(--teal-dim);
-  outline-offset: -6px;
-}
-
-#empty {
-  margin: auto; text-align: center; color: var(--text3);
-  padding: 40px 20px; display: flex; flex-direction: column;
-  align-items: center; gap: 12px; user-select: none;
-}
-.empty-glyph {
-  font-size: 32px; opacity: 0.4; letter-spacing: -4px;
-  font-family: var(--mono); color: var(--amber);
-}
-#empty p { font-size: 12px; max-width: 200px; line-height: 1.5; }
-#empty .hint {
-  font-size: 11px; border: 1px solid var(--border);
-  border-radius: 4px; padding: 4px 10px; color: var(--text3);
-}
-
-.msg { display: flex; flex-direction: column; animation: fadeUp .14s ease both; }
-@keyframes fadeUp { from { opacity: 0; transform: translateY(3px); } }
-
-.msg-label {
-  font-size: 10px; font-family: var(--sans); font-weight: 600;
-  letter-spacing: .08em; text-transform: uppercase;
-  color: var(--text3); padding: 12px 2px 3px;
-}
-.msg.user  .msg-label { color: var(--amber); }
-.msg.agent .msg-label { color: var(--teal); }
-
-.msg-body {
-  padding: 13px 16px; border-radius: var(--r);
-  border: 1px solid var(--border); word-break: break-word; overflow-x: auto;
-}
-.msg.user .msg-body {
-  background: var(--user-bg); border-color: var(--user-bdr);
-  white-space: pre-wrap; line-height: 1.65;
-}
-.msg.agent { position: relative; }
-.msg.agent .msg-body {
-  background: var(--agent-bg); border-color: var(--agent-bdr);
-  font-family: var(--sans); font-size: 14px; line-height: 1.75; color: var(--text);
-}
-.msg.agent .msg-body h1,.msg.agent .msg-body h2,
-.msg.agent .msg-body h3,.msg.agent .msg-body h4 {
-  font-family: var(--sans); font-weight: 600; color: var(--text);
-  margin: 1em 0 .35em; line-height: 1.3;
-}
-.msg.agent .msg-body h1 { font-size: 1.2em; border-bottom: 1px solid var(--border2); padding-bottom: .3em; }
-.msg.agent .msg-body h2 { font-size: 1.05em; }
-.msg.agent .msg-body h3 { font-size: 1em; color: var(--text2); }
-.msg.agent .msg-body p  { margin: .5em 0; }
-.msg.agent .msg-body p:first-child { margin-top: 0; }
-.msg.agent .msg-body p:last-child  { margin-bottom: 0; }
-.msg.agent .msg-body strong { color: var(--text); font-weight: 600; }
-.msg.agent .msg-body em     { font-style: italic; color: var(--text2); }
-.msg.agent .msg-body del    { text-decoration: line-through; color: var(--text3); }
-.msg.agent .msg-body a { color: var(--teal); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
-.msg.agent .msg-body a:hover { color: var(--amber); }
-.msg.agent .msg-body code {
-  background: var(--code-bg); border: 1px solid var(--code-bdr); border-radius: 3px;
-  padding: 1px 6px; font-family: var(--mono); font-size: .82em; color: var(--amber);
-}
-.msg.agent .msg-body pre {
-  background: var(--code-bg); border: 1px solid var(--code-bdr); border-radius: 6px;
-  padding: 13px 15px; overflow-x: auto; margin: .7em 0; position: relative;
-}
-.msg.agent .msg-body pre code {
-  background: none; border: none; padding: 0;
-  font-size: .83em; color: var(--text2); white-space: pre; font-family: var(--mono);
-}
-.msg.agent .msg-body pre .lang {
-  position: absolute; top: 7px; right: 9px; font-size: 9px; color: var(--text3);
-  text-transform: uppercase; letter-spacing: .06em; font-family: var(--mono);
-}
-.msg.agent .msg-body ul, .msg.agent .msg-body ol { padding-left: 1.5em; margin: .5em 0; }
-.msg.agent .msg-body li { margin: .2em 0; }
-.msg.agent .msg-body blockquote {
-  border-left: 2px solid var(--teal-dim); margin: .5em 0;
-  padding: .25em .8em .25em 1em; color: var(--text2);
-  background: rgba(62,207,178,.04); border-radius: 0 4px 4px 0; font-style: italic;
-}
-.msg.agent .msg-body hr { border: none; border-top: 1px solid var(--border2); margin: .9em 0; }
-.msg.agent .msg-body table {
-  border-collapse: collapse; width: 100%; margin: .6em 0;
-  font-size: .88em; font-family: var(--mono);
-}
-.msg.agent .msg-body th, .msg.agent .msg-body td {
-  border: 1px solid var(--border2); padding: 5px 10px; text-align: left;
-}
-.msg.agent .msg-body th { background: var(--surface2); color: var(--text2); font-weight: 600; }
-.msg.agent .msg-body tr:nth-child(even) td { background: rgba(255,255,255,.015); }
-
-.msg.sys .msg-label { display: none; }
-.msg.sys .msg-body {
-  background: transparent; border: none; border-left: 2px solid var(--border2);
-  border-radius: 0; padding: 2px 10px; color: var(--text3);
-  font-size: 11.5px; font-style: italic; white-space: pre-wrap; font-family: var(--mono);
-}
-.msg.sys.err  .msg-body { border-left-color: var(--red);    color: #c07070; }
-.msg.sys.ok   .msg-body { border-left-color: var(--green);  color: #60b070; }
-.msg.sys.warn .msg-body { border-left-color: var(--amber);  color: #b08040; }
-.msg.sys.info .msg-body { border-left-color: var(--purple); color: var(--text2); font-style: normal; font-size: 12px; }
-
-.msg-img {
-  max-width: 220px; max-height: 160px; border-radius: 6px;
-  border: 1px solid var(--border2); margin-top: 6px;
-  display: block; object-fit: cover;
-}
-
-.thinking-block {
-  margin: 2px 0 2px 4px; border-left: 2px solid var(--border2); padding: 3px 10px;
-  font-size: 11px; font-family: var(--mono); color: var(--text3); cursor: pointer;
-  user-select: none; transition: border-color .15s, opacity .15s; opacity: 0.6; line-height: 1.5;
-}
-.thinking-block:hover { border-left-color: var(--purple); opacity: 0.9; }
-.thinking-block .tb-header { display: flex; align-items: baseline; gap: 6px; }
-.thinking-block .tb-arrow { font-size: 9px; color: var(--purple); transition: transform .15s; flex-shrink: 0; display: inline-block; }
-.thinking-block.open .tb-arrow { transform: rotate(90deg); }
-.thinking-block .tb-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-.thinking-block .tb-body { display: none; white-space: pre-wrap; word-break: break-word; margin-top: 4px; color: var(--text3); line-height: 1.55; }
-.thinking-block.open .tb-body { display: block; }
-
-.msg-copy {
-  position: absolute; top: 30px; right: 10px;
-  background: var(--surface2); border: 1px solid var(--border2); border-radius: 4px;
-  color: var(--text3); font-size: 10px; padding: 2px 8px; cursor: pointer;
-  opacity: 0; pointer-events: none; transition: opacity .15s, color .12s, border-color .12s;
-  font-family: var(--mono); user-select: none; z-index: 2;
-}
-.msg.agent:hover .msg-copy { opacity: 1; pointer-events: auto; }
-.msg-copy:hover { color: var(--teal); border-color: var(--teal-dim); }
-.msg-copy.copied { color: var(--green); border-color: var(--green); opacity: 1; }
-
-.tool-group { display: flex; flex-direction: column; padding: 2px 0; }
-.tool-row {
-  display: flex; align-items: center; gap: 6px; padding: 1px 0 1px 12px;
-  font-size: 11px; color: var(--text3); min-height: 19px;
-  animation: fadeUp .1s ease both; font-family: var(--mono);
-}
-.tr-icon { width: 11px; flex-shrink: 0; font-size: 10px; transition: color .2s; }
-.tr-name { color: var(--text2); font-weight: 500; }
-.tr-args { color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
-.tool-row[data-s="pending"] .tr-icon { color: var(--text3); animation: spin .8s linear infinite; }
-.tool-row[data-s="ok"]      .tr-icon { color: var(--green); }
-.tool-row[data-s="fail"]    .tr-icon { color: var(--red); }
-@keyframes spin { to { transform: rotate(360deg); } }
-.tool-more {
-  font-size: 10px; color: var(--text3); padding: 1px 0 1px 12px;
-  cursor: pointer; transition: color .12s; font-family: var(--mono);
-}
-.tool-more:hover { color: var(--text2); }
-
-.tool-group-summary { display: none; }
-.tool-group.collapsible .tool-group-summary {
-  display: flex; align-items: center; gap: 6px; padding: 2px 0 2px 8px;
-  font-size: 11px; color: var(--text3); cursor: pointer; user-select: none;
-  font-family: var(--mono); transition: color .12s;
-}
-.tool-group.collapsible .tool-group-summary:hover { color: var(--text2); }
-.tgs-arrow { font-size: 9px; display: inline-block; transition: transform .15s; }
-.tool-group.collapsed .tool-row,
-.tool-group.collapsed .tool-more { display: none !important; }
-.tool-group.collapsed .tgs-arrow { transform: rotate(-90deg); }
-
-.cursor {
-  display: inline-block; width: 2px; height: 1em; background: var(--amber);
-  margin-left: 1px; vertical-align: text-bottom; animation: blink .6s step-end infinite;
-}
-@keyframes blink { 50% { opacity: 0; } }
-
-#scroll-btn {
-  position: absolute; bottom: 90px; right: 18px;
-  width: 30px; height: 30px; border-radius: 50%;
-  background: var(--surface); border: 1px solid var(--border2);
-  color: var(--text2); font-size: 14px; cursor: pointer;
-  display: none; align-items: center; justify-content: center;
-  box-shadow: 0 2px 8px rgba(0,0,0,.5);
-  transition: border-color .12s, color .12s; z-index: 4;
-}
-#scroll-btn.show { display: flex; }
-#scroll-btn:hover { border-color: var(--amber); color: var(--amber); }
-
-#status-bar {
-  display: flex; align-items: center; gap: 7px;
-  padding: 4px 16px; font-size: 11px; color: var(--text3);
-  border-top: 1px solid var(--border); background: var(--surface);
-  flex-shrink: 0; min-height: 24px; font-family: var(--mono);
-}
-.dot {
-  width: 5px; height: 5px; border-radius: 50%;
-  background: var(--text3); flex-shrink: 0; transition: background .25s;
-}
-.dot.run  { background: var(--amber);  animation: pulse 1s ease-in-out infinite; }
-.dot.wait { background: var(--purple); animation: pulse 1s ease-in-out infinite; }
-.dot.done { background: var(--green); }
-.dot.err  { background: var(--red); }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-#status-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#iter-badge  { font-size: 10px; border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; display: none; }
-#mode-badge  { font-size: 10px; border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; color: var(--text3); }
-
-#elapsed-timer {
-  font-size: 10px; color: var(--text3); font-family: var(--mono); display: none; letter-spacing: .03em;
-}
-#elapsed-timer.show { display: inline; }
-
-#input-area {
-  display: flex; flex-direction: column;
-  padding: 9px 16px 11px;
-  border-top: 1px solid var(--border); background: var(--surface);
-  flex-shrink: 0; gap: 6px;
-}
-
-#img-chip {
-  display: none; align-items: center; gap: 8px;
-  padding: 6px 10px 6px 8px; background: var(--surface2);
-  border: 1px solid var(--border2); border-radius: 6px;
-  font-size: 11px; font-family: var(--mono); animation: fadeUp .12s ease both;
-}
-#img-chip.show { display: flex; }
-.ic-thumb {
-  width: 32px; height: 32px; border-radius: 4px; object-fit: cover;
-  flex-shrink: 0; border: 1px solid var(--border2);
-}
-.ic-info { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
-.ic-name { color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.ic-status { color: var(--text3); font-size: 10px; }
-.ic-status.ok   { color: var(--green); }
-.ic-status.err  { color: var(--red); }
-.ic-status.busy { color: var(--amber); }
-.ic-remove {
-  flex-shrink: 0; width: 20px; height: 20px; border-radius: 3px;
-  display: flex; align-items: center; justify-content: center;
-  color: var(--text3); cursor: pointer; font-size: 12px;
-  transition: color .1s, background .1s;
-}
-.ic-remove:hover { color: var(--red); background: rgba(224,85,85,.1); }
-
-#input-row { display: flex; gap: 8px; align-items: flex-end; }
-
-.upload-btn {
-  width: 40px; height: 40px; border-radius: var(--r);
-  border: 1px solid var(--border); background: transparent;
-  color: var(--text3); cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0; transition: border-color .12s, color .12s;
-}
-.upload-btn:hover { border-color: var(--teal); color: var(--teal); }
-.upload-btn.has-image { border-color: var(--teal-dim); color: var(--teal); }
-
-#msg-input {
-  flex: 1; background: var(--bg2); border: 1px solid var(--border);
-  border-radius: var(--r); color: var(--text); font-family: var(--mono);
-  font-size: 13.5px; padding: 8px 12px; resize: none; outline: none;
-  max-height: 140px; overflow-y: auto; transition: border-color .12s;
-  line-height: 1.5; min-height: 40px;
-}
-#msg-input:focus { border-color: var(--amber); }
-#msg-input::placeholder { color: var(--text3); }
-#msg-input:disabled { opacity: 0.5; cursor: not-allowed; }
-
-#send-btn {
-  background: var(--amber); color: #0d0d0f; border: none;
-  border-radius: var(--r); padding: 8px 18px;
-  font-family: var(--sans); font-weight: 700; font-size: 12px;
-  cursor: pointer; transition: all .12s; flex-shrink: 0;
-  height: 40px; letter-spacing: .02em;
-}
-#send-btn:hover { background: #f0b055; }
-#send-btn.stop { background: transparent; border: 1px solid var(--red); color: var(--red); }
-#send-btn.stop:hover { background: rgba(224,85,85,.1); }
-
-#palette {
-  border: 1px solid var(--border2); border-radius: 6px;
-  background: var(--bg2); overflow: hidden; display: none;
-}
-#palette.open { display: block; }
-.pi {
-  display: flex; align-items: baseline; gap: 10px;
-  padding: 7px 12px; cursor: pointer; transition: background .1s; font-size: 12px;
-}
-.pi:hover, .pi.sel { background: var(--surface2); }
-.pi-cmd { color: var(--amber); font-weight: 600; min-width: 90px; }
-.pi-desc { color: var(--text3); font-size: 11px; }
-
-.panel {
-  position: absolute; top: 0; right: 0;
-  width: min(320px, 90vw); height: 100%;
-  background: var(--surface); border-left: 1px solid var(--border);
-  transform: translateX(100%); transition: transform .2s ease;
-  z-index: 20; display: flex; flex-direction: column;
-}
-.panel.open { transform: translateX(0); }
-#tools-panel { width: min(360px, 92vw); }
-
-#files-panel {
-  right: auto; left: 0; width: min(380px, 92vw);
-  border-left: none; border-right: 1px solid var(--border);
-  transform: translateX(-100%);
-}
-#files-panel.open { transform: translateX(0); }
-
-.ft-toolbar {
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
-}
-.ft-toolbar-title {
-  flex: 1; font-family: var(--sans); font-weight: 600; font-size: 12px;
-  color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.ft-icon-btn {
-  width: 24px; height: 24px; border-radius: 4px; border: 1px solid var(--border);
-  background: transparent; color: var(--text3); cursor: pointer; font-size: 12px;
-  display: flex; align-items: center; justify-content: center;
-  transition: border-color .1s, color .1s; flex-shrink: 0;
-}
-.ft-icon-btn:hover { border-color: var(--amber); color: var(--amber); }
-
-.ft-search {
-  margin: 7px 8px 5px; flex-shrink: 0; background: var(--bg);
-  border: 1px solid var(--border); border-radius: 5px; color: var(--text);
-  font-family: var(--mono); font-size: 12px; padding: 5px 10px;
-  outline: none; width: calc(100% - 16px);
-}
-.ft-search:focus { border-color: var(--amber); }
-.ft-search::placeholder { color: var(--text3); }
-#ft-tree { flex: 1; overflow-y: auto; padding: 2px 0 6px; font-size: 12px; font-family: var(--mono); }
-
-.ft-msg { padding: 10px 14px; color: var(--text3); font-size: 11px; font-style: italic; }
-
-.ft-node {
-  display: flex; align-items: center; gap: 5px; cursor: pointer;
-  min-height: 22px; padding-right: 8px; transition: background .07s;
-  white-space: nowrap; overflow: hidden;
-}
-.ft-node:hover { background: rgba(255,255,255,.03); }
-.ft-node.ft-selected { background: rgba(232,162,69,.07); }
-.ft-node.ft-loading-node { color: var(--text3); cursor: default; padding-left: 0; }
-
-.ft-arrow {
-  width: 10px; text-align: center; flex-shrink: 0; font-size: 7px; color: var(--text3);
-  transition: transform .12s; display: inline-block;
-}
-.ft-node.ft-expanded > .ft-arrow { transform: rotate(90deg); }
-
-.ft-name { flex: 1; overflow: hidden; text-overflow: ellipsis; color: var(--text2); user-select: none; }
-.ft-node.ft-dir  > .ft-name { color: var(--text); font-weight: 500; }
-.ft-node.ft-selected > .ft-name { color: var(--amber); }
-.ft-size { flex-shrink: 0; color: var(--text3); font-size: 10px; min-width: 34px; text-align: right; }
-
-.ft-ext-badge {
-  flex-shrink: 0; font-size: 9px; padding: 0 4px; border-radius: 2px;
-  font-family: var(--mono); border: 1px solid; text-transform: uppercase;
-  letter-spacing: .04em; line-height: 16px;
-}
-.ft-ext-py{color:#4ec9b0;border-color:#1a3c34}.ft-ext-js{color:#e8c45a;border-color:#504218}
-.ft-ext-ts{color:#569cd6;border-color:#18304c}.ft-ext-html{color:#ce9178;border-color:#4c301c}
-.ft-ext-css{color:#9d7dea;border-color:#362258}.ft-ext-md{color:#8e8c88;border-color:#28282e}
-.ft-ext-json{color:#3ecfb2;border-color:#0c342e}.ft-ext-sh{color:#3ec97a;border-color:#0c3224}
-.ft-ext-xml{color:#ce9178;border-color:#4c301c}.ft-ext-yml{color:#e8c45a;border-color:#504218}
-.ft-ext-txt{color:var(--text3);border-color:var(--border)}.ft-ext-def{color:var(--text3);border-color:var(--border)}
-
-.ft-divider { height: 1px; background: var(--border); flex-shrink: 0; }
-
-#ft-preview { display: flex; flex-direction: column; flex-shrink: 0; min-height: 130px; max-height: 44%; }
-.ft-preview-hdr {
-  display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px 5px 10px; flex-shrink: 0;
-  background: var(--surface2); border-bottom: 1px solid var(--border); min-height: 32px;
-}
-#ft-preview-path {
-  flex: 1; font-size: 10px; color: var(--text2); font-family: var(--mono);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ft-preview-actions { display: flex; gap: 4px; flex-shrink: 0; }
-.ft-preview-btn {
-  font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 3px;
-  border: 1px solid var(--border); background: transparent; color: var(--text3);
-  cursor: pointer; transition: border-color .1s, color .1s; white-space: nowrap;
-}
-.ft-preview-btn:hover { border-color: var(--amber); color: var(--amber); }
-.ft-preview-btn.html-preview-btn:hover { border-color: var(--teal); color: var(--teal); }
-
-#ft-preview-content {
-  flex: 1; overflow: auto; padding: 10px 12px; font-family: var(--mono);
-  font-size: 11px; line-height: 1.52; background: var(--code-bg);
-  color: var(--text2); white-space: pre; word-break: break-all; tab-size: 2;
-}
-.ft-preview-hint { color: var(--text3) !important; font-style: italic; white-space: normal !important; font-size: 11px; }
-
-.panel-hdr {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 14px; border-bottom: 1px solid var(--border);
-  font-family: var(--sans); font-weight: 600; font-size: 12px;
-  color: var(--text2); flex-shrink: 0;
-}
-
-#sessions-list { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px; }
-.session-item {
-  padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
-  cursor: pointer; transition: all .12s; background: var(--bg);
-}
-.session-item:hover { border-color: var(--teal-dim); background: var(--surface2); }
-.session-item.active { border-color: var(--amber); }
-.si-id   { font-size: 10px; color: var(--text3); margin-bottom: 2px; }
-.si-task { font-size: 11.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.si-stat { font-size: 10px; margin-top: 2px; color: var(--text3); }
-.si-stat.completed { color: var(--green); }
-.si-stat.error, .si-stat.interrupted { color: var(--red); }
-.si-stat.waiting { color: var(--purple); }
-.si-stat.active  { color: var(--amber); }
-
-#tools-search {
-  margin: 8px; background: var(--bg); border: 1px solid var(--border);
-  border-radius: 5px; color: var(--text); font-family: var(--mono);
-  font-size: 12px; padding: 6px 10px; outline: none; width: calc(100% - 16px); flex-shrink: 0;
-}
-#tools-search:focus { border-color: var(--teal); }
-#tools-list { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
-
-.tool-cat { margin-bottom: 6px; }
-.tool-cat-hdr {
-  font-family: var(--sans); font-weight: 600; font-size: 10px;
-  letter-spacing: .09em; text-transform: uppercase; color: var(--text3); padding: 7px 4px 3px;
-}
-.mcp-cat .tool-cat-hdr { color: var(--teal); }
-.tool-entry {
-  padding: 6px 8px; border-radius: 5px; border: 1px solid transparent;
-  margin-bottom: 1px; transition: all .1s;
-}
-.tool-entry:hover { background: var(--surface2); border-color: var(--border); }
-.te-name  { font-size: 12px; color: var(--text); font-weight: 500; }
-.te-params { color: var(--text3); font-size: 11px; font-weight: 400; }
-.te-desc  { font-size: 11px; color: var(--text2); margin-top: 1px; line-height: 1.4; font-family: var(--sans); }
-
-#overlay {
-  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 15;
-}
-#overlay.show { display: block; }
-
-#replay-banner {
-  display: none; text-align: center; font-size: 11px; color: var(--text3);
-  padding: 4px 0 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
-}
-#replay-banner.show { display: block; }
-
-#html-preview-modal {
-  display: none; position: fixed; inset: 0; z-index: 60;
-  flex-direction: column; background: var(--bg);
-}
-#html-preview-modal.open { display: flex; }
-
-#hp-toolbar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 12px; background: var(--surface);
-  border-bottom: 1px solid var(--border); flex-shrink: 0; min-height: 42px;
-}
-#hp-logo-mark {
-  width: 22px; height: 22px; background: var(--amber); border-radius: 5px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 11px; color: #0d0d0f; font-weight: 700; flex-shrink: 0;
-  font-family: var(--mono); user-select: none;
-}
-#hp-path {
-  flex: 1; font-size: 11px; font-family: var(--mono); color: var(--text2);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-#hp-toolbar-actions { display: flex; gap: 5px; flex-shrink: 0; }
-#hp-iframe { flex: 1; border: none; background: #fff; width: 100%; display: block; }
-
-@media (max-width: 520px) {
-  header, #input-area, #messages { padding-left: 11px; padding-right: 11px; }
-}
-</style>
-</head>
-<body>
-<div id="app">
-  <header>
-    <div class="logo">
-      <div class="logo-mark">&#955;</div>
-      LMAgent
-      <span class="logo-sub">v7.0</span>
-    </div>
-    <div class="header-right">
-      <span class="session-pill" id="session-pill"></span>
-      <div class="conn-dot" id="conn-dot" title="Stream connection"></div>
-      <button class="btn" onclick="UI.toggleFiles()">Files</button>
-      <button class="btn accent" onclick="UI.toggleTools()">Tools</button>
-      <button class="btn" onclick="UI.toggleSessions()">Sessions</button>
-      <button class="btn danger" onclick="Agent.newSession()">New</button>
-    </div>
-  </header>
-
-  <div id="messages">
-    <div id="replay-banner"></div>
-    <div id="empty">
-      <div class="empty-glyph">&#955;_</div>
-      <p>Send a message to start</p>
-      <div class="hint">/ for commands &nbsp;&middot;&nbsp; &uarr;&darr; history &nbsp;&middot;&nbsp; drag image to upload</div>
-    </div>
-  </div>
-
-  <button id="scroll-btn" onclick="Scroll.jump()" title="&#8595;">&#8595;</button>
-
-  <div id="status-bar">
-    <div class="dot" id="dot"></div>
-    <span id="status-text">ready</span>
-    <span id="elapsed-timer"></span>
-    <span id="iter-badge"></span>
-    <span id="mode-badge">auto</span>
-  </div>
-
-  <div id="input-area">
-    <div id="palette"></div>
-    <div id="img-chip">
-      <img class="ic-thumb" id="ic-thumb" src="" alt="">
-      <div class="ic-info">
-        <span class="ic-name" id="ic-name">image.png</span>
-        <span class="ic-status" id="ic-status">uploading&hellip;</span>
-      </div>
-      <div class="ic-remove" onclick="ImageUpload.clear()" title="Remove image">&#x2715;</div>
-    </div>
-    <div id="input-row">
-      <label for="img-upload-input" class="upload-btn" id="upload-btn-lbl" title="Attach image (vision)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-          <circle cx="8.5" cy="8.5" r="1.5"/>
-          <polyline points="21 15 16 10 5 21"/>
-        </svg>
-      </label>
-      <input type="file" id="img-upload-input" accept="image/*" style="display:none">
-      <textarea id="msg-input" rows="1" placeholder="Message or /command&hellip;"
-        onkeydown="Palette.onKey(event)"
-        oninput="Palette.onInput(this)"></textarea>
-      <button id="send-btn" onclick="Agent.sendOrStop()">Send</button>
-    </div>
-  </div>
-</div>
-
-<div id="overlay" onclick="UI.closeAll()"></div>
-
-<!-- Files panel (LEFT) -->
-<div class="panel" id="files-panel">
-  <div class="ft-toolbar">
-    <span class="ft-toolbar-title" id="ft-ws-label">Workspace</span>
-    <button class="ft-icon-btn" onclick="FileTree.refresh()" title="Refresh">&#8635;</button>
-    <button class="ft-icon-btn" onclick="UI.closeFiles()" title="Close">&times;</button>
-  </div>
-  <input id="ft-search" class="ft-search" placeholder="Filter files&hellip;" oninput="FileTree.filter(this.value)">
-  <div id="ft-tree"><div class="ft-msg">Loading&hellip;</div></div>
-  <div class="ft-divider"></div>
-  <div id="ft-preview">
-    <div class="ft-preview-hdr">
-      <span id="ft-preview-path">No file selected</span>
-      <div class="ft-preview-actions">
-        <button class="ft-preview-btn" onclick="FileTree.copyPath()">copy path</button>
-        <button class="ft-preview-btn" onclick="FileTree.askAgent()">ask agent</button>
-        <button class="ft-preview-btn html-preview-btn" id="hp-ft-btn" onclick="FileTree.previewHtml()" style="display:none">&#9654; preview</button>
-      </div>
-    </div>
-    <div id="ft-preview-content" class="ft-preview-hint">click a file to preview</div>
-  </div>
-</div>
-
-<!-- Sessions panel (RIGHT) -->
-<div class="panel" id="sessions-panel">
-  <div class="panel-hdr"><span>Sessions</span><button class="btn" onclick="UI.closeSessions()">&#x2715;</button></div>
-  <div id="sessions-list"></div>
-</div>
-
-<!-- Tools panel (RIGHT) -->
-<div class="panel" id="tools-panel">
-  <div class="panel-hdr"><span>Tools</span><button class="btn" onclick="UI.closeTools()">&#x2715;</button></div>
-  <input id="tools-search" placeholder="Filter&hellip;" oninput="ToolsPanel.filter(this.value)">
-  <div id="tools-list"></div>
-</div>
-
-<!-- HTML Preview Modal -->
-<div id="html-preview-modal">
-  <div id="hp-toolbar">
-    <div id="hp-logo-mark">&#955;</div>
-    <span id="hp-path">preview</span>
-    <div id="hp-toolbar-actions">
-      <button class="btn" onclick="HTMLPreview.refresh()" title="Reload page">&#8635;</button>
-      <a id="hp-popout" class="btn" href="#" target="_blank" rel="noopener" title="Open in new tab">&#8599; tab</a>
-      <button class="btn danger" onclick="HTMLPreview.close()" title="Close (Esc)">&#x2715;</button>
-    </div>
-  </div>
-  <iframe id="hp-iframe" allowfullscreen></iframe>
-</div>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
-<script>
-'use strict';
-
-const _AGENT_TOKEN = '__AGENT_TOKEN__';
-
-(function() {
-  var _orig = window.fetch.bind(window);
-  window.fetch = function(url, opts) {
-    opts = Object.assign({}, opts);
-    opts.headers = Object.assign({'X-Token': _AGENT_TOKEN}, opts.headers || {});
-    return _orig(url, opts);
-  };
-})();
-
-function _esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function _makeThinkingBlock(text) {
-  var el = document.createElement('div');
-  el.className = 'thinking-block';
-  var firstLine = text.split('\n')[0].slice(0, 120);
-  var multiline = text.length > firstLine.length || text.indexOf('\n') !== -1;
-  var hdr = document.createElement('div'); hdr.className = 'tb-header';
-  var arrow = document.createElement('span'); arrow.className = 'tb-arrow'; arrow.textContent = '\u25b6';
-  var preview = document.createElement('span'); preview.className = 'tb-preview';
-  preview.textContent = '\ud83d\udcad ' + firstLine + (multiline ? '\u2026' : '');
-  hdr.appendChild(arrow); hdr.appendChild(preview); el.appendChild(hdr);
-  var body = document.createElement('div'); body.className = 'tb-body'; body.textContent = text;
-  el.appendChild(body);
-  el.onclick = function() {
-    var open = el.classList.toggle('open');
-    arrow.textContent = open ? '\u25bc' : '\u25b6';
-    preview.textContent = open ? '\ud83d\udcad thinking\u2026' : '\ud83d\udcad ' + firstLine + (multiline ? '\u2026' : '');
-  };
-  return el;
-}
-
-const MD = (() => {
-  marked.use({
-    gfm: true, breaks: true,
-    renderer: {
-      code(code, lang) {
-        var lb = lang ? '<span class="lang">' + _esc(lang) + '</span>' : '';
-        return '<pre>' + lb + '<code>' + _esc(code) + '</code></pre>\n';
-      },
-      link(href, title, text) {
-        return '<a href="' + _esc(href||'') + '" target="_blank" rel="noopener"'
-          + (title ? ' title="' + _esc(title) + '"' : '') + '>' + text + '</a>';
-      },
-      image(href, title, text) {
-        return '<img src="' + _esc(href||'') + '" alt="' + _esc(text||'') + '" style="max-width:100%"'
-          + (title ? ' title="' + _esc(title) + '"' : '') + '>';
-      }
-    }
-  });
-  var MAX = 400000;
-  function render(md) {
-    if (!md || !md.trim()) return '';
-    if (md.length > MAX) return '<pre style="white-space:pre-wrap;word-break:break-word">' + _esc(md) + '</pre>';
-    try { return marked.parse(md); } catch (_) { return '<pre style="white-space:pre-wrap">' + _esc(md) + '</pre>'; }
-  }
-  return { render };
-})();
-
-const Scroll = (() => {
-  var pinned = true;
-  var pane = function(){ return document.getElementById('messages'); };
-  var btn  = function(){ return document.getElementById('scroll-btn'); };
-  function atBottom() { var el = pane(); return el.scrollHeight - el.scrollTop - el.clientHeight < 80; }
-  function update() { btn().classList.toggle('show', !pinned && Agent.running()); }
-  function maybe()  { if (pinned) pane().scrollTop = pane().scrollHeight; }
-  function jump()   { pinned = true; pane().scrollTop = pane().scrollHeight; update(); }
-  function onScroll() { pinned = atBottom() ? true : Agent.running() ? false : pinned; update(); }
-  pane().addEventListener('scroll', onScroll, { passive: true });
-  return { maybe, jump, pin: function(){ pinned = true; }, update };
-})();
-
-const Status = (() => ({
-  set: function(msg, state) {
-    document.getElementById('status-text').textContent = msg || '';
-    document.getElementById('dot').className = 'dot ' + (state || '');
-  },
-  iter: function(v) {
-    var el = document.getElementById('iter-badge');
-    el.textContent = v || ''; el.style.display = v ? '' : 'none';
-  },
-  mode: function(v) { document.getElementById('mode-badge').textContent = v || 'auto'; },
-}))();
-
-const ElapsedTimer = (() => {
-  var _t = null, _start = 0;
-  var el = function(){ return document.getElementById('elapsed-timer'); };
-  function _fmt(ms) { var s=Math.floor(ms/1000),m=Math.floor(s/60);s=s%60; return m+':'+(s<10?'0':'')+s; }
-  function start() {
-    stop(); _start = Date.now(); el().classList.add('show');
-    _t = setInterval(function(){ el().textContent = _fmt(Date.now()-_start); }, 500);
-  }
-  function stop() { if (_t){clearInterval(_t);_t=null;} el().classList.remove('show'); el().textContent=''; }
-  return { start, stop };
-})();
-
-const ConnDot = (() => {
-  var el = function(){ return document.getElementById('conn-dot'); };
-  return {
-    ok:  function(){ el().className='conn-dot ok';  el().title='Stream connected'; },
-    err: function(){ el().className='conn-dot err'; el().title='Stream disconnected'; },
-    try: function(){ el().className='conn-dot try'; el().title='Reconnecting\u2026'; },
-  };
-})();
-
-const InputHistory = (() => {
-  var _hist=[], _idx=-1, _draft='';
-  function _set(inp,val){ inp.value=val; inp.style.height='auto'; inp.style.height=Math.min(inp.scrollHeight,140)+'px'; setTimeout(function(){inp.selectionStart=inp.selectionEnd=inp.value.length;},0); }
-  function push(t){ if(!t||(_hist.length&&_hist[_hist.length-1]===t))return; _hist.push(t); if(_hist.length>200)_hist.shift(); _idx=-1; }
-  function up(inp){ if(!_hist.length)return; if(_idx===-1){_draft=inp.value;_idx=_hist.length;} if(_idx>0)_set(inp,_hist[--_idx]); }
-  function down(inp){ if(_idx===-1)return; _idx++; _set(inp,_idx>=_hist.length?(_idx=-1,_draft):_hist[_idx]); }
-  function reset(){ _idx=-1; }
-  return { push, up, down, reset };
-})();
-
-const ImageUpload = (() => {
-  var _path=null, _name=null, _localURL=null;
-  var _chip=function(){ return document.getElementById('img-chip'); };
-  var _thumb=function(){ return document.getElementById('ic-thumb'); };
-  var _nameEl=function(){ return document.getElementById('ic-name'); };
-  var _statEl=function(){ return document.getElementById('ic-status'); };
-  var _lbl=function(){ return document.getElementById('upload-btn-lbl'); };
-
-  function _setStatus(text, cls) {
-    var el=_statEl(); el.textContent=text; el.className='ic-status'+(cls?' '+cls:'');
-  }
-  function _showChip(file) {
-    if (_localURL) URL.revokeObjectURL(_localURL);
-    _localURL=URL.createObjectURL(file); _thumb().src=_localURL;
-    _nameEl().textContent=file.name; _setStatus('uploading\u2026','busy');
-    _chip().classList.add('show'); _lbl().classList.add('has-image');
-  }
-  async function _doUpload(file) {
-    var fd=new FormData(); fd.append('file',file);
-    try {
-      var resp=await fetch('/upload',{method:'POST',body:fd}), d=await resp.json();
-      if(!resp.ok||d.error) throw new Error(d.error||'Upload failed');
-      _path=d.path; _name=d.filename; _setStatus('\u2713 ready \u2014 send a message','ok');
-    } catch(e) { _setStatus('\u2717 '+e.message,'err'); _path=null; }
-  }
-  function clear() {
-    _path=_name=null;
-    if(_localURL){URL.revokeObjectURL(_localURL);_localURL=null;}
-    _chip().classList.remove('show'); _lbl().classList.remove('has-image'); _thumb().src='';
-  }
-  function getPendingPath() { return _path; }
-  function consumeForMessage() {
-    if(!_path) return {suffix:'',previewURL:null};
-    var p=_path, url=_localURL;
-    _path=_name=_localURL=null;
-    _chip().classList.remove('show'); _lbl().classList.remove('has-image'); _thumb().src='';
-    return {suffix:'\n[Attached image: '+p+' \u2014 please use the vision tool to analyze it]',previewURL:url};
-  }
-  function initDragDrop() {
-    var pane=document.getElementById('messages');
-    function _hasImg(e){ return e.dataTransfer&&Array.from(e.dataTransfer.types).includes('Files'); }
-    pane.addEventListener('dragenter',function(e){ if(!_hasImg(e))return; e.preventDefault(); pane.classList.add('drag-over'); });
-    pane.addEventListener('dragover',function(e){ if(!_hasImg(e))return; e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
-    pane.addEventListener('dragleave',function(e){ if(!pane.contains(e.relatedTarget)) pane.classList.remove('drag-over'); });
-    pane.addEventListener('drop',function(e){
-      pane.classList.remove('drag-over'); if(!_hasImg(e))return; e.preventDefault();
-      var files=Array.from(e.dataTransfer.files).filter(function(f){return f.type.startsWith('image/');});
-      if(!files.length)return; _showChip(files[0]); _doUpload(files[0]);
-    });
-    document.addEventListener('paste',function(e){
-      var items=Array.from(e.clipboardData&&e.clipboardData.items||[]);
-      var imgItem=items.find(function(i){return i.type.startsWith('image/');});
-      if(!imgItem)return; var f=imgItem.getAsFile(); if(!f)return;
-      var ext=f.type.split('/')[1]||'png';
-      var named=new File([f],'paste-'+Date.now()+'.'+ext,{type:f.type});
-      _showChip(named); _doUpload(named);
-    });
-  }
-  document.getElementById('img-upload-input').addEventListener('change',function(){ if(this.files&&this.files[0]){_showChip(this.files[0]);_doUpload(this.files[0]);this.value='';} });
-  return { clear, getPendingPath, consumeForMessage, initDragDrop };
-})();
-
-const Replay = (() => {
-  function _addCopyBtn(wrap, rawText) {
-    var btn=document.createElement('button'); btn.className='msg-copy'; btn.textContent='copy'; btn.title='Copy response';
-    btn.onclick=function(e){ e.stopPropagation(); navigator.clipboard.writeText(rawText||wrap.querySelector('.msg-body').innerText||'').then(function(){ btn.textContent='copied!'; btn.classList.add('copied'); setTimeout(function(){btn.textContent='copy';btn.classList.remove('copied');},1500); }).catch(function(){}); };
-    wrap.appendChild(btn);
-  }
-  function _applyEvents(events) {
-    var tokenBuf='', toolGroupItems=[];
-    var pane=document.getElementById('messages');
-    function flushTokens() {
-      if(!tokenBuf.trim()){tokenBuf='';return;}
-      document.getElementById('empty')&&document.getElementById('empty').remove();
-      var wrap=document.createElement('div'); wrap.className='msg agent';
-      wrap.innerHTML='<div class="msg-label">Agent</div><div class="msg-body"></div>';
-      var body=wrap.querySelector('.msg-body'); body.innerHTML=MD.render(tokenBuf)||_esc(tokenBuf);
-      _addCopyBtn(wrap,tokenBuf); pane.appendChild(wrap); tokenBuf='';
-    }
-    function flushTools() {
-      if(!toolGroupItems.length)return;
-      document.getElementById('empty')&&document.getElementById('empty').remove();
-      var group=document.createElement('div'); group.className='tool-group';
-      for(var ti=0;ti<toolGroupItems.length;ti++){
-        var t=toolGroupItems[ti],row=document.createElement('div');
-        row.className='tool-row'; row.dataset.s=t.ok===null?'pending':(t.ok?'ok':'fail');
-        var pv=t.args?(t.args.slice(0,50)+(t.args.length>50?'\u2026':'')):'';
-        row.innerHTML='<span class="tr-icon">'+(t.ok===null?'\u25cc':(t.ok?'\u2713':'\u2717'))+'</span><span class="tr-name">'+_esc(t.name)+'</span>'+(pv?'<span class="tr-args">('+_esc(pv)+')</span>':'');
-        group.appendChild(row);
-      }
-      _finaliseToolGroup(group,toolGroupItems.length); pane.appendChild(group); toolGroupItems=[];
-    }
-    function _sysMsg(text,variant){ var d=document.createElement('div'); d.className='msg sys '+(variant||''); d.innerHTML='<div class="msg-label"></div><div class="msg-body"></div>'; d.querySelector('.msg-body').textContent=text; pane.appendChild(d); }
-    var lastWasToken=false;
-    for(var ei=0;ei<events.length;ei++){
-      var kind=events[ei][0],payload=events[ei][1];
-      if(kind==='token'){if(!lastWasToken)flushTools();tokenBuf+=payload;lastWasToken=true;}
-      else if(kind==='thinking'){flushTokens();flushTools();lastWasToken=false;document.getElementById('empty')&&document.getElementById('empty').remove();pane.appendChild(_makeThinkingBlock(payload));}
-      else if(kind==='tool'){
-        if(lastWasToken)flushTokens();lastWasToken=false;
-        if(payload.startsWith('\u2713')||payload.startsWith('\u2717')){var name2=payload.slice(1).trim();for(var ri=toolGroupItems.length-1;ri>=0;ri--){if(toolGroupItems[ri].name===name2&&toolGroupItems[ri].ok===null){toolGroupItems[ri].ok=payload.startsWith('\u2713');break;}}}
-        else{flushTokens();var m2=payload.match(/^([^(]+)\(?([\s\S]*?)\)?$/);toolGroupItems.push({name:m2?m2[1].trim():payload,args:m2?m2[2].trim():'',ok:null});}
-      }
-      else if(kind==='iteration'){flushTokens();flushTools();lastWasToken=false;var mm=String(payload).match(/(\d+)\/(\d+)/);if(mm)_sysMsg('\u2014 iteration '+mm[1]+'/'+mm[2]+' \u2014','info');}
-      else if(kind==='done'){flushTokens();flushTools();lastWasToken=false;}
-      else if(kind==='error'){flushTokens();flushTools();lastWasToken=false;_sysMsg('\u26a0 '+payload,'err');}
-    }
-    flushTokens();flushTools();
-  }
-  function run(events) {
-    if(!events||!events.length)return;
-    var banner=document.getElementById('replay-banner');
-    banner.textContent='\u21a9 restored '+events.length+' events from this session';
-    banner.classList.add('show'); setTimeout(function(){banner.classList.remove('show');},3000);
-    var CHUNK=200,offset=0;
-    function nextChunk(){ var slice=events.slice(offset,offset+CHUNK); if(!slice.length){Scroll.jump();return;} _applyEvents(slice);offset+=CHUNK;requestAnimationFrame(nextChunk); }
-    requestAnimationFrame(nextChunk);
-  }
-  return { run };
-})();
-
-function _finaliseToolGroup(group, totalCount) {
-  if(totalCount<3)return;
-  var okCount=group.querySelectorAll('.tool-row[data-s="ok"]').length;
-  var failCount=group.querySelectorAll('.tool-row[data-s="fail"]').length;
-  function _label(c){ if(c)return'\u25b6 '+totalCount+' tool call'+(totalCount!==1?'s':'')+' \u2014 click to expand'; var parts=[totalCount+' tool call'+(totalCount!==1?'s':'')]; if(okCount)parts.push(okCount+' ok'); if(failCount)parts.push(failCount+' failed'); return'\u25bc '+parts.join(', ')+' \u2014 click to collapse'; }
-  var summary=document.createElement('div'); summary.className='tool-group-summary'; summary.textContent=_label(false);
-  group.insertBefore(summary,group.firstChild); group.classList.add('collapsible');
-  summary.onclick=function(){var c=group.classList.toggle('collapsed');summary.textContent=_label(c);};
-}
-
-const Messages = (() => {
-  var pane=function(){return document.getElementById('messages');};
-  function hideEmpty(){var e=document.getElementById('empty');if(e)e.remove();}
-  function add(role,html,extra,asHtml){
-    hideEmpty();Tools.endGroup();
-    var d=document.createElement('div'); d.className='msg '+role+(extra?' '+extra:'');
-    var labels={user:'You',agent:'Agent'};
-    d.innerHTML='<div class="msg-label">'+(labels[role]||'')+'</div><div class="msg-body"></div>';
-    pane().appendChild(d);
-    var body=d.querySelector('.msg-body');
-    if(html){if(asHtml)body.innerHTML=html;else body.textContent=html;}
-    Scroll.maybe();return body;
-  }
-  function sys(text,variant){add('sys',text,variant||'');}
-  return{add,sys,pane,hideEmpty};
-})();
-
-const Stream = (() => {
-  var el=null,buf='',_rafPending=false,_cursor=null;
-  function _attachCopyBtn(wrap,rawText){
-    var btn=document.createElement('button'); btn.className='msg-copy'; btn.textContent='copy'; btn.title='Copy response';
-    btn.onclick=function(e){e.stopPropagation();var copy=function(){btn.textContent='copied!';btn.classList.add('copied');setTimeout(function(){btn.textContent='copy';btn.classList.remove('copied');},1500);};navigator.clipboard.writeText(rawText).then(copy).catch(function(){var ta=document.createElement('textarea');ta.value=rawText;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();copy();});};
-    wrap.appendChild(btn);
-  }
-  function _renderFinal(body,rawBuf){
-    requestAnimationFrame(function(){
-      var wrap=body.closest('.msg');
-      if(!rawBuf.trim()){if(wrap)wrap.remove();}
-      else{body.innerHTML=MD.render(rawBuf)||_esc(rawBuf);if(wrap)_attachCopyBtn(wrap,rawBuf);}
-      Scroll.maybe();
-    });
-  }
-  function start(){buf='';el=Messages.add('agent','');_cursor=document.createElement('span');_cursor.className='cursor';el.appendChild(_cursor);}
-  function flush(){_rafPending=false;if(!el)return;el.innerHTML=MD.render(buf)||_esc(buf);el.appendChild(_cursor);Scroll.maybe();}
-  function token(tok){buf+=tok;if(!_rafPending){_rafPending=true;requestAnimationFrame(flush);}}
-  function finalize(){_rafPending=false;if(!el)return;var body=el,rawBuf=buf;el=null;buf='';_cursor=null;_renderFinal(body,rawBuf);}
-  function reset(){_rafPending=false;if(!el)return;var body=el,rawBuf=buf;el=null;buf='';_cursor=null;if(rawBuf.trim())_renderFinal(body,rawBuf);else{var wrap=body.closest('.msg');if(wrap)wrap.remove();}}
-  function active(){return el!==null;}
-  return{start,token,finalize,reset,active};
-})();
-
-const Tools = (() => {
-  var MAX=12,group=null,count=0,pending=new Map();
-  function ensureGroup(){if(group)return group;var e=document.getElementById('empty');if(e)e.remove();group=document.createElement('div');group.className='tool-group';Messages.pane().appendChild(group);count=0;return group;}
-  function endGroup(){if(group&&count>0)_finaliseToolGroup(group,count);group=null;count=0;}
-  function makeRow(name,args){
-    var row=document.createElement('div');row.className='tool-row';row.dataset.s='pending';
-    var pv=args?(args.slice(0,50)+(args.length>50?'\u2026':'')):'';
-    row.innerHTML='<span class="tr-icon">\u25cc</span><span class="tr-name">'+_esc(name)+'</span>'+(pv?'<span class="tr-args">('+_esc(pv)+')</span>':'');
-    if(!pending.has(name))pending.set(name,[]);pending.get(name).push(row);return row;
-  }
-  function call(name,args){
-    var g=ensureGroup();count++;
-    if(count>MAX){var more=g.querySelector('.tool-more');if(!more){more=Object.assign(document.createElement('div'),{className:'tool-more'});more.onclick=function(){more.remove();g.querySelectorAll('[data-hidden]').forEach(function(el){delete el.dataset.hidden;el.style.display='';});};g.appendChild(more);}
-    var n=count-MAX;more.textContent='+'+n+' more call'+(n!==1?'s':'')+' \u2014 click to expand';var row=makeRow(name,args);row.dataset.hidden='1';row.style.display='none';g.insertBefore(row,more);}
-    else{g.appendChild(makeRow(name,args));}Scroll.maybe();
-  }
-  function resolve(name,ok){var q=pending.get(name);if(!q||!q.length)return;var row=q.shift();if(!q.length)pending.delete(name);if(!row)return;row.dataset.s=ok?'ok':'fail';row.querySelector('.tr-icon').textContent=ok?'\u2713':'\u2717';}
-  function reset(){pending.clear();endGroup();}
-  return{call,resolve,endGroup,reset};
-})();
-
-const Whisper = (() => ({
-  queue: function(text){
-    if(!Agent.running()){Messages.sys('Agent is not running \u2014 whisper ignored.','warn');return;}
-    fetch('/whisper',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text})}).catch(function(){});
-  }
-}))();
-
-const Agent = (() => {
-  var state='idle',sessionId=null,requestId=null,_hadContent=false;
-  function setSession(id){sessionId=id;var pill=document.getElementById('session-pill');if(id){pill.textContent=id.slice(-8);pill.style.display='';}else{pill.style.display='none';}}
-  function getSession(){return sessionId;}
-  function running(){return state!=='idle';}
-  function lockUI(on){
-    var inp=document.getElementById('msg-input'),btn=document.getElementById('send-btn');
-    inp.disabled=false;
-    inp.placeholder=(state==='running')?'Whisper to agent\u2026 (nudge mid-run, Enter to send)':'Message or /command\u2026';
-    if(state==='waiting'){btn.textContent='Resume';btn.className='';}
-    else{btn.textContent=on?'Stop':'Send';btn.className=on?'stop':'';}
-  }
-  function transition(next){state=next;lockUI(next!=='idle');if(next==='idle')Scroll.pin();Scroll.update();if(next!=='idle')ElapsedTimer.start();else ElapsedTimer.stop();}
-  function handleEvent(evt){
-    if(evt.type==='connect'){
-      var d=evt.data||{};
-      if(d.session)setSession(d.session);
-      if(d.mode)Status.mode(d.mode);
-      if(d.history&&d.history.length&&!document.getElementById('messages').querySelectorAll('.msg').length)Replay.run(d.history);
-      if(d.state==='running'&&state==='idle'){transition('running');Status.set('running\u2026','run');}
-      else if(d.state==='waiting'&&state==='idle'){transition('waiting');Status.set('waiting \u2014 scheduled resume\u2026','wait');Messages.sys('\u23f0 Session waiting \u2014 will resume automatically','warn');}
-      else if(d.state==='idle'&&state!=='idle'){Stream.finalize();Tools.endGroup();transition('idle');Status.set('done','done');Status.iter('');Messages.sys('\u2713 task finished','ok');document.getElementById('msg-input').focus();}
-      return;
-    }
-    if(state==='waiting'&&evt.type!=='connect'){transition('running');Tools.reset();Stream.reset();}
-    switch(evt.type){
-      case 'token': Tools.endGroup();if(!Stream.active())Stream.start();Stream.token(evt.data);_hadContent=true;break;
-      case 'thinking': Stream.finalize();Tools.endGroup();Messages.hideEmpty();Messages.pane().appendChild(_makeThinkingBlock(evt.data));Scroll.maybe();_hadContent=true;break;
-      case 'session': setSession(evt.data);break;
-      case 'tool':{var t=evt.data;if(t.startsWith('\u2713')||t.startsWith('\u2717')){Tools.resolve(t.slice(1).trim(),t.startsWith('\u2713'));}else{Stream.finalize();var m=t.match(/^([^(]+)\(?([\s\S]*?)\)?$/);Tools.call(m?m[1].trim():t,m?m[2].trim():'');_hadContent=true;}break;}
-      case 'status': Status.set(evt.data,'run');break;
-      case 'iteration':{var mi=String(evt.data).match(/(\d+)\/(\d+)/);if(mi){Stream.finalize();Tools.endGroup();if(_hadContent)Messages.sys('\u2014 iteration '+mi[1]+'/'+mi[2]+' \u2014','info');_hadContent=false;Status.iter(mi[1]+'/'+mi[2]);}break;}
-      case 'done': onDone(evt.data);break;
-      case 'error': Stream.finalize();Tools.endGroup();Messages.sys('\u26a0 '+evt.data,'err');transition('idle');Status.set('error','err');Status.iter('');break;
-    }
-  }
-  function onDone(reason){
-    Stream.finalize();Tools.endGroup();Status.iter('');
-    var isWait=String(reason||'').startsWith('waiting'),isErr=reason==='error'||reason==='stopped';
-    if(isWait){transition('waiting');Status.set('waiting \u2014 will resume automatically','wait');Messages.sys('\u23f8 '+reason,'warn');}
-    else{transition('idle');Status.set(reason||'done',isErr?'err':'done');if(reason==='stopped')Messages.sys('\u2014 stopped \u2014','warn');else if(!isErr)Messages.sys('\u2713 '+((reason||'').replace(/\s*\u2713\s*$/,'').trim()||'task finished'),'ok');document.getElementById('msg-input').focus();}
-  }
-  async function send(text){
-    if(state!=='idle')return;
-    var consumed=ImageUpload.consumeForMessage(),imgSuffix=consumed.suffix,previewURL=consumed.previewURL,fullText=text+imgSuffix;
-    var body=Messages.add('user',text);
-    if(previewURL){var img=document.createElement('img');img.className='msg-img';img.src=previewURL;img.alt='attached image';body.appendChild(img);img.onload=function(){URL.revokeObjectURL(previewURL);};}
-    Scroll.pin();transition('running');Status.set('thinking\u2026','run');Tools.reset();_hadContent=false;
-    requestId='r'+Date.now()+Math.random().toString(36).slice(2,6);
-    try{
-      var resp=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:fullText,session_id:sessionId,request_id:requestId})});
-      if(!resp.ok){var err=await resp.json().catch(function(){return{error:'HTTP '+resp.status};});throw new Error(err.error||'HTTP '+resp.status);}
-    }catch(err){Stream.finalize();Tools.endGroup();Messages.sys('Failed to send: '+err.message,'err');transition('idle');Status.set('error','err');Status.iter('');}
-  }
-  function stop(){
-    if(state==='waiting'){transition('idle');Status.set('wait dismissed','');Messages.sys('\u2014 wait dismissed (session saved) \u2014','warn');return;}
-    if(state!=='running')return;
-    if(requestId){fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id:requestId})}).catch(function(){});requestId=null;}
-    Stream.reset();Tools.endGroup();Messages.sys('\u2014 stopped \u2014','warn');transition('idle');Status.set('stopped','');Status.iter('');
-  }
-  async function newSession(){
-    if(state!=='idle'){stop();return;}
-    try{await fetch('/new',{method:'POST'});}catch(_){}
-    sessionId=null;requestId=null;_hadContent=false;setSession(null);Tools.reset();Stream.reset();ImageUpload.clear();
-    document.getElementById('messages').innerHTML='<div id="replay-banner"></div><div id="empty"><div class="empty-glyph">&#955;_</div><p>Send a message to start</p><div class="hint">/ for commands &nbsp;&middot;&nbsp; &uarr;&darr; history &nbsp;&middot;&nbsp; drag image to upload</div></div>';
-    Status.set('ready','');Status.iter('');document.getElementById('msg-input').focus();
-  }
-  function sendOrStop(){
-    if(state==='waiting'){var inp=document.getElementById('msg-input'),text=inp.value.trim();if(text){inp.value='';inp.style.height='auto';transition('idle');InputHistory.push(text);Messages.add('user',text);send(text);}else{stop();}return;}
-    if(state!=='idle'){var inp=document.getElementById('msg-input'),text=inp.value.trim();if(text){inp.value='';inp.style.height='auto';Whisper.queue(text);Messages.sys('\ud83d\udcac whisper sent \u2014 agent will receive it on next iteration','ok');}else{stop();}}
-    else{_triggerSend();}
-  }
-  function _triggerSend(){
-    var inp=document.getElementById('msg-input'),text=inp.value.trim();
-    if(!text&&!ImageUpload.getPendingPath())return;
-    if(!text)text='Please analyze the attached image.';
-    inp.value='';inp.style.height='auto';Palette.close();InputHistory.reset();
-    if(text.startsWith('/')&&!ImageUpload.getPendingPath()){Messages.add('user',text);SlashCmds.run(text);}
-    else{InputHistory.push(text);send(text);}
-  }
-  return{sendOrStop,newSession,running,getSession,setSession,_handle:handleEvent};
-})();
-
-(function initStream(){
-  var es=null,retryMs=1000;
-  function connect(){
-    ConnDot.try();
-    es=new EventSource('/stream?token='+encodeURIComponent(_AGENT_TOKEN));
-    es.onopen=function(){ConnDot.ok();retryMs=1000;};
-    es.onmessage=function(e){if(!e.data||e.data==='[DONE]')return;try{Agent._handle(JSON.parse(e.data));}catch(_){}};
-    es.onerror=function(){es.close();ConnDot.err();setTimeout(connect,retryMs);retryMs=Math.min(retryMs*2,30000);};
-  }
-  connect();
-})();
-
-ImageUpload.initDragDrop();
-
-const HTMLPreview = (() => {
-  var _isOpen=false;
-  function _isHtml(path){var lp=(path||'').toLowerCase();return lp.endsWith('.html')||lp.endsWith('.htm');}
-  function open(path){
-    if(!path)return;
-    var rel=path.replace(/^\/+/,''),url='/serve/'+rel+'?token='+encodeURIComponent(_AGENT_TOKEN);
-    document.getElementById('hp-path').textContent=rel;
-    document.getElementById('hp-popout').href=url;
-    document.getElementById('hp-iframe').src=url;
-    document.getElementById('html-preview-modal').classList.add('open');
-    UI.closeAll();_isOpen=true;
-  }
-  function close(){document.getElementById('html-preview-modal').classList.remove('open');document.getElementById('hp-iframe').src='';_isOpen=false;}
-  function refresh(){var iframe=document.getElementById('hp-iframe');try{iframe.contentWindow.location.reload();}catch(_){var s=iframe.src;iframe.src='';iframe.src=s;}}
-  function isOpen(){return _isOpen;}
-  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&_isOpen){e.preventDefault();close();}});
-  return{open,close,refresh,isOpen,_isHtml};
-})();
-
-const FileTree = (() => {
-  var _expanded={},_children={},_loading={},_selected=null,_filter='',_autoTimer=null,_lastMtime=0;
-  var _EXT_MAP={'.py':'.py','.pyw':'.py','.js':'.js','.mjs':'.js','.jsx':'.js','.ts':'.ts','.tsx':'.ts','.html':'.html','.htm':'.html','.css':'.css','.scss':'.css','.sass':'.css','.less':'.css','.md':'.md','.markdown':'.md','.json':'.json','.jsonl':'.json','.sh':'.sh','.bash':'.sh','.zsh':'.sh','.fish':'.sh','.xml':'.xml','.yml':'.yml','.yaml':'.yml','.txt':'.txt'};
-  function _extKey(ext){var k=_EXT_MAP[ext];return k?k.slice(1):'def';}
-  function _fmtSize(b){if(!b)return'';if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'K';return(b/1048576).toFixed(1)+'M';}
-  async function _fetchDir(path){_loading[path]=true;try{var r=await fetch('/filetree?path='+encodeURIComponent(path)),d=await r.json();if(d.error)throw new Error(d.error);_children[path]=d.entries||[];}finally{delete _loading[path];}return _children[path];}
-  async function _fetchFile(path){var r=await fetch('/fileread?path='+encodeURIComponent(path));return await r.json();}
-  async function _fetchMtime(){try{var r=await fetch('/workspace/mtime'),d=await r.json();return d.mtime||0;}catch(_){return 0;}}
-  function _flatten(path,depth,out){
-    if(_loading[path]&&!_children[path]){out.push({kind:'loading',depth:depth});return;}
-    var entries=_children[path]||[],q=_filter.toLowerCase();
-    var filtered=q?entries.filter(function(e){return e.name.toLowerCase().indexOf(q)!==-1||e.type==='dir';}):entries;
-    for(var i=0;i<filtered.length;i++){var e=filtered[i];out.push({kind:'entry',depth:depth,entry:e});if(e.type==='dir'&&_expanded[e.path])_flatten(e.path,depth+1,out);}
-  }
-  function _render(){
-    var el=document.getElementById('ft-tree');if(!el)return;
-    var panel=document.getElementById('files-panel');if(!panel||!panel.classList.contains('open'))return;
-    var nodes=[];_flatten('.',0,nodes);
-    if(!nodes.length&&_loading['.']){el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>';return;}
-    if(!nodes.length&&!_children['.']){el.innerHTML='<div class="ft-msg">Empty workspace</div>';return;}
-    if(!nodes.length){el.innerHTML='<div class="ft-msg">No files'+(_filter?' matching \u201c'+_esc(_filter)+'\u201d':'')+' </div>';return;}
-    var frag=document.createDocumentFragment();
-    for(var i=0;i<nodes.length;i++){
-      var n=nodes[i],row=document.createElement('div');
-      if(n.kind==='loading'){row.className='ft-node ft-loading-node';row.style.paddingLeft=(n.depth*14+24)+'px';row.innerHTML='<span style="color:var(--text3);font-style:italic;font-size:11px">\u2026</span>';frag.appendChild(row);continue;}
-      var e=n.entry,isDir=e.type==='dir',isSel=_selected===e.path,isExp=!!_expanded[e.path];
-      row.className='ft-node'+(isDir?' ft-dir':' ft-file')+(isExp?' ft-expanded':'')+(isSel?' ft-selected':'');
-      row.style.paddingLeft=(n.depth*14+6)+'px';
-      var arrowHtml=isDir?'<span class="ft-arrow">\u25b6</span>':'<span class="ft-arrow" style="visibility:hidden">\u25b6</span>';
-      var badgeHtml=(!isDir&&e.ext)?'<span class="ft-ext-badge ft-ext-'+_extKey(e.ext)+'">'+_esc(e.ext.slice(1))+'</span>':'';
-      var sizeHtml=(!isDir&&e.size)?'<span class="ft-size">'+_fmtSize(e.size)+'</span>':'';
-      row.innerHTML=arrowHtml+'<span class="ft-name" title="'+_esc(e.path)+'">'+_esc(e.name)+'</span>'+badgeHtml+sizeHtml;
-      (function(entry){row.onclick=function(ev){ev.stopPropagation();if(entry.type==='dir')_toggleDir(entry.path);else _openFile(entry.path);};})(e);
-      frag.appendChild(row);
-    }
-    el.innerHTML='';el.appendChild(frag);
-  }
-  async function _toggleDir(path){
-    if(_expanded[path]){delete _expanded[path];_render();}
-    else{_expanded[path]=true;_render();if(!_children[path]&&!_loading[path]){try{await _fetchDir(path);}catch(e){_children[path]=[];delete _expanded[path];}}_render();}
-  }
-  async function _openFile(path){
-    _selected=path;_render();
-    var pathEl=document.getElementById('ft-preview-path'),contentEl=document.getElementById('ft-preview-content'),hpBtn=document.getElementById('hp-ft-btn');
-    if(pathEl)pathEl.textContent=path;
-    if(hpBtn)hpBtn.style.display=HTMLPreview._isHtml(path)?'':'none';
-    if(contentEl){contentEl.className='';contentEl.textContent='Loading\u2026';}
-    try{
-      var d=await _fetchFile(path);if(!contentEl)return;
-      if(d.error){contentEl.textContent='\u26a0 '+d.error;contentEl.className='ft-preview-hint';}
-      else if(d.binary){contentEl.textContent='[binary file \u2014 '+_fmtSize(d.size)+']';contentEl.className='ft-preview-hint';}
-      else{contentEl.className='';contentEl.textContent=(d.content!==undefined&&d.content!==null)?(d.content||'(empty file)'):'(empty file)';if(d.truncated)contentEl.textContent+='\n\n[\u2026 preview truncated at 100\u00a0KB \u2026]';}
-    }catch(err){if(contentEl){contentEl.textContent='Error: '+err.message;contentEl.className='ft-preview-hint';}}
-  }
-  async function load(){
-    _expanded={};_children={};_loading={};_selected=null;_lastMtime=0;
-    var el=document.getElementById('ft-tree');if(el)el.innerHTML='<div class="ft-msg">Loading workspace\u2026</div>';
-    var pathEl=document.getElementById('ft-preview-path'),contEl=document.getElementById('ft-preview-content'),hpBtn=document.getElementById('hp-ft-btn');
-    if(pathEl)pathEl.textContent='No file selected';
-    if(contEl){contEl.textContent='click a file to preview';contEl.className='ft-preview-hint';}
-    if(hpBtn)hpBtn.style.display='none';
-    var lbl=document.getElementById('ft-ws-label');
-    try{var s=await fetch('/status').then(function(r){return r.json();});if(lbl&&s.workspace){var parts=s.workspace.replace(/\\/g,'/').split('/');lbl.textContent=parts[parts.length-1]||'Workspace';lbl.title=s.workspace;}}catch(_){}
-    try{await _fetchDir('.');_lastMtime=await _fetchMtime();_render();}
-    catch(err){if(el)el.innerHTML='<div class="ft-msg" style="color:var(--red)">\u26a0 '+_esc(String(err.message||err))+'</div>';}
-    startAutoRefresh();
-  }
-  async function refresh(){
-    var paths=['.']; Object.keys(_expanded).forEach(function(p){if(paths.indexOf(p)===-1)paths.push(p);});
-    await Promise.all(paths.map(function(p){return _fetchDir(p).catch(function(){});}));_render();
-  }
-  function filter(text){_filter=text;_render();}
-  function copyPath(){
-    if(!_selected)return;
-    var pathEl=document.getElementById('ft-preview-path');
-    navigator.clipboard.writeText(_selected).then(function(){if(pathEl){var orig=pathEl.textContent;pathEl.textContent='\u2713 copied!';setTimeout(function(){pathEl.textContent=orig;},1200);}}).catch(function(){var ta=document.createElement('textarea');ta.value=_selected;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();if(pathEl){var orig=pathEl.textContent;pathEl.textContent='\u2713 copied!';setTimeout(function(){pathEl.textContent=orig;},1200);}});
-    }
-  function askAgent(){
-    if(!_selected)return;
-    var inp=document.getElementById('msg-input');
-    inp.value='Please read and explain this file: '+_selected;
-    inp.focus();
-    UI.closeFiles();
-  }
-  function previewHtml(){
-    if(!_selected)return;
-    HTMLPreview.open(_selected);
-  }
-  function startAutoRefresh(){
-    if(_autoTimer)clearInterval(_autoTimer);
-    _autoTimer=setInterval(async function(){
-      var panel=document.getElementById('files-panel');
-      if(!panel||!panel.classList.contains('open'))return;
-      try{
-        var mtime=await _fetchMtime();
-        if(mtime>_lastMtime){_lastMtime=mtime;await refresh();}
-      }catch(_){}
-    },3000);
-  }
-  return{load,refresh,filter,copyPath,askAgent,previewHtml};
-})();
-
-const Sessions = (() => {
-  async function load(){
-    var list=document.getElementById('sessions-list');
-    if(!list)return;
-    list.innerHTML='<div style="padding:12px;color:var(--text3);font-size:11px">Loading\u2026</div>';
-    try{
-      var d=await fetch('/sessions').then(function(r){return r.json();});
-      var sessions=d.sessions||[];
-      if(!sessions.length){list.innerHTML='<div style="padding:12px;color:var(--text3);font-size:11px;font-style:italic">No sessions yet</div>';return;}
-      list.innerHTML='';
-      sessions.forEach(function(s){
-        var item=document.createElement('div'); item.className='session-item'+(Agent.getSession()===s.id?' active':'');
-        var statClass=s.status==='completed'?'completed':s.status==='error'||s.status==='interrupted'?'error':s.status==='waiting'?'waiting':s.status==='active'?'active':'';
-        item.innerHTML='<div class="si-id">'+_esc(s.id.slice(-12))+'</div>'
-          +'<div class="si-task">'+_esc(s.task||'(no task)')+'</div>'
-          +'<div class="si-stat '+statClass+'">'+_esc(s.status)
-          +(s.iterations?' \u00b7 '+s.iterations+' iter':'')+'</div>';
-        item.onclick=function(){
-          Agent.setSession(s.id);
-          UI.closeSessions();
-          document.getElementById('msg-input').focus();
-        };
-        list.appendChild(item);
-      });
-    }catch(e){
-      list.innerHTML='<div style="padding:12px;color:var(--red);font-size:11px">\u26a0 '+_esc(String(e.message||e))+'</div>';
-    }
-  }
-  return{load};
-})();
-
-const ToolsPanel = (() => {
-  var _data=null;
-  async function load(){
-    var list=document.getElementById('tools-list');
-    if(!list)return;
-    list.innerHTML='<div style="padding:12px;color:var(--text3);font-size:11px">Loading\u2026</div>';
-    try{
-      _data=await fetch('/tools').then(function(r){return r.json();});
-      _render(_data,'');
-    }catch(e){
-      list.innerHTML='<div style="padding:12px;color:var(--red);font-size:11px">\u26a0 '+_esc(String(e.message||e))+'</div>';
-    }
-  }
-  function _render(data,q){
-    var list=document.getElementById('tools-list');
-    if(!list)return;
-    var html='',ql=q.toLowerCase();
-    function _cat(name,tools,isMcp){
-      var shown=tools.filter(function(t){return !ql||(t.name||'').toLowerCase().indexOf(ql)!==-1||(t.description||'').toLowerCase().indexOf(ql)!==-1;});
-      if(!shown.length)return;
-      html+='<div class="tool-cat'+(isMcp?' mcp-cat':'')+'"><div class="tool-cat-hdr">'+_esc(name)+'</div>';
-      shown.forEach(function(t){
-        var params=t.params&&t.params.length?'('+t.params.slice(0,4).join(', ')+(t.params.length>4?', \u2026':'')+')':'()';
-        html+='<div class="tool-entry"><div class="te-name">'+_esc(t.name)+'<span class="te-params"> '+_esc(params)+'</span></div>'
-          +(t.description?'<div class="te-desc">'+_esc(t.description.slice(0,100))+'</div>':'')+'</div>';
-      });
-      html+='</div>';
-    }
-    var b=data.builtin||{},m=data.mcp||{};
-    Object.keys(b).forEach(function(k){_cat(k,b[k],false);});
-    Object.keys(m).forEach(function(k){_cat(k,m[k],true);});
-    list.innerHTML=html||'<div style="padding:12px;color:var(--text3);font-size:11px;font-style:italic">No tools match</div>';
-  }
-  function filter(q){if(_data)_render(_data,q);}
-  return{load,filter};
-})();
-
-const SlashCmds = (() => {
-  var CMDS=[
-    {cmd:'/new',      desc:'Start a fresh session'},
-    {cmd:'/mode auto',   desc:'Set permission mode: auto'},
-    {cmd:'/mode normal', desc:'Set permission mode: normal'},
-    {cmd:'/mode manual', desc:'Set permission mode: manual'},
-    {cmd:'/sessions', desc:'List recent sessions'},
-    {cmd:'/plan',     desc:'Show current plan'},
-    {cmd:'/todo',     desc:'Show todo list'},
-    {cmd:'/status',   desc:'Agent + MCP status'},
-    {cmd:'/soul',     desc:'Show soul / personality'},
-    {cmd:'/session',  desc:'Show current session ID'},
-    {cmd:'/help',     desc:'Show help'},
-  ];
-  function run(text){
-    var parts=text.trim().split(/\s+/),cmd=parts[0],arg=parts.slice(1).join(' ');
-    if(cmd==='/new'){Agent.newSession();return;}
-    if(cmd==='/mode'&&arg){Status.mode(arg);Messages.sys('\u2713 permission mode \u2192 '+arg,'ok');return;}
-    fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,session_id:Agent.getSession(),request_id:'slash_'+Date.now()})}).catch(function(){});
-  }
-  return{run,CMDS};
-})();
-
-const Palette = (() => {
-  var _open=false,_sel=0,_filtered=[];
-  function _el(){return document.getElementById('palette');}
-  function _inp(){return document.getElementById('msg-input');}
-  function open(q){
-    q=q||'/'; var ql=q.toLowerCase();
-    _filtered=SlashCmds.CMDS.filter(function(c){return c.cmd.toLowerCase().indexOf(ql)!==-1;});
-    _sel=0; _open=true;
-    var html='';
-    _filtered.forEach(function(c,i){
-      html+='<div class="pi'+(i===0?' sel':'')+'" data-i="'+i+'">'
-        +'<span class="pi-cmd">'+_esc(c.cmd)+'</span>'
-        +'<span class="pi-desc">'+_esc(c.desc)+'</span></div>';
-    });
-    _el().innerHTML=html; _el().classList.add('open');
-    _el().querySelectorAll('.pi').forEach(function(el){
-      el.onmousedown=function(e){e.preventDefault();_apply(parseInt(el.dataset.i));};
-    });
-  }
-  function close(){_open=false;_el().classList.remove('open');_el().innerHTML='';}
-  function _apply(i){
-    if(!_filtered[i])return;
-    _inp().value=_filtered[i].cmd+' '; _inp().focus(); close();
-    _inp().style.height='auto'; _inp().style.height=Math.min(_inp().scrollHeight,140)+'px';
-  }
-  function _highlight(){
-    _el().querySelectorAll('.pi').forEach(function(el,i){el.classList.toggle('sel',i===_sel);});
-  }
-  function onKey(e){
-    var inp=_inp();
-    if(e.key==='ArrowUp'){
-      if(_open){e.preventDefault();_sel=Math.max(0,_sel-1);_highlight();}
-      else InputHistory.up(inp);
-      return;
-    }
-    if(e.key==='ArrowDown'){
-      if(_open){e.preventDefault();_sel=Math.min(_filtered.length-1,_sel+1);_highlight();}
-      else InputHistory.down(inp);
-      return;
-    }
-    if(e.key==='Enter'&&!e.shiftKey){
-      e.preventDefault();
-      if(_open&&_filtered.length){_apply(_sel);}
-      else{close();Agent.sendOrStop();}
-      return;
-    }
-    if(e.key==='Escape'){close();return;}
-    if(e.key==='Tab'&&_open){e.preventDefault();if(_filtered.length)_apply(_sel);return;}
-  }
-  function onInput(inp){
-    inp.style.height='auto'; inp.style.height=Math.min(inp.scrollHeight,140)+'px';
-    var v=inp.value;
-    if(v.startsWith('/')&&v.length>=1&&!Agent.running())open(v);
-    else close();
-  }
-  return{open,close,onKey,onInput};
-})();
-
-const UI = (() => {
-  var _overlay=function(){return document.getElementById('overlay');};
-  function _open(id){
-    document.getElementById(id).classList.add('open');
-    _overlay().classList.add('show');
-  }
-  function _close(id){document.getElementById(id).classList.remove('open');}
-  function closeAll(){
-    ['files-panel','sessions-panel','tools-panel'].forEach(function(id){_close(id);});
-    _overlay().classList.remove('show');
-  }
-  function toggleFiles(){
-    var p=document.getElementById('files-panel');
-    if(p.classList.contains('open')){closeAll();}
-    else{closeAll();_open('files-panel');FileTree.load();}
-  }
-  function toggleSessions(){
-    var p=document.getElementById('sessions-panel');
-    if(p.classList.contains('open')){closeAll();}
-    else{closeAll();_open('sessions-panel');Sessions.load();}
-  }
-  function toggleTools(){
-    var p=document.getElementById('tools-panel');
-    if(p.classList.contains('open')){closeAll();}
-    else{closeAll();_open('tools-panel');ToolsPanel.load();}
-  }
-  function closeFiles(){_close('files-panel');_overlay().classList.remove('show');}
-  function closeSessions(){_close('sessions-panel');_overlay().classList.remove('show');}
-  function closeTools(){_close('tools-panel');_overlay().classList.remove('show');}
-  document.addEventListener('keydown',function(e){
-    if(e.key==='Escape'&&!HTMLPreview.isOpen())closeAll();
-  });
-  return{toggleFiles,toggleSessions,toggleTools,closeFiles,closeSessions,closeTools,closeAll};
-})();
-
-Status.set('ready','');
-</script>
-</body>
-</html>"""
-
-
-# =============================================================================
-# PATH VALIDATION HELPER
-# =============================================================================
-
-def _validate_ft_path(path: str):
-    from agent_core import Safety
-    if not path or path in (".", ""):
-        return True, "", WORKSPACE
-    ok, err, fp = Safety.validate_path(WORKSPACE, path)
-    if not ok:
-        return False, err, WORKSPACE
-    return True, "", fp
+def _rewrite_html_asset(m, base_dir: str, token: str) -> str:
+    attr  = m.group(1)
+    path  = m.group(2)
+    quote = m.group(3)
+    if path.startswith(("http://", "https://", "//", "data:", "javascript:", "#", "/serve/")):
+        return m.group(0)
+    serve_path = f"/serve{path}" if path.startswith("/") else \
+                 f"/serve/{base_dir + '/' if base_dir else ''}{path}"
+    sep = "&" if "?" in serve_path else "?"
+    return f"{attr}{serve_path}{sep}token={token}{quote}"
+
+
+def _rewrite_css_asset(m, base_dir: str, token: str) -> str:
+    path = m.group(1).strip("'\"")
+    if path.startswith(("http://", "https://", "//", "data:", "/serve/")):
+        return m.group(0)
+    serve_path = f"/serve{path}" if path.startswith("/") else \
+                 f"/serve/{base_dir + '/' if base_dir else ''}{path}"
+    sep = "&" if "?" in serve_path else "?"
+    return f"url('{serve_path}{sep}token={token}')"
 
 
 # =============================================================================
 # ROUTES
 # =============================================================================
 
-def _get_port() -> int:
-    try:
-        return int(os.environ.get("AGENT_PORT", "7860"))
-    except ValueError:
-        return 7860
+@app.route("/command", methods=["POST"])
+@_require_auth
+def slash_command():
+    global _current_permission_mode
+    data       = request.get_json(force=True, silent=True) or {}
+    cmd        = (data.get("command") or "").strip()
+    session_id = data.get("session_id") or _current_session_id
+
+    if not cmd.startswith("/"):
+        return jsonify({"error": "not a command"}), 400
+
+    parts    = cmd.split(maxsplit=1)
+    cmd_name = parts[0].lower()
+    cmd_arg  = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd_name == "/help":
+        output = (
+            "Available Commands\n"
+            "──────────────────────────────────────────────────────\n"
+            "  /help           This help screen\n"
+            "  /sessions       List recent sessions\n"
+            "  /mode <level>   Set permission: manual / normal / auto\n"
+            "  /plan           Show the current plan\n"
+            "  /todo           Show todo list\n"
+            "  /status         Show agent + MCP status\n"
+            "  /soul           Show loaded soul / personality\n"
+            "  /new            Start a completely fresh session\n"
+            "  /session        Show current session ID"
+        )
+
+    elif cmd_name == "/sessions":
+        sessions = SessionManager(WORKSPACE).list_recent(10)
+        if not sessions:
+            output = "No sessions found."
+        else:
+            lines = ["Recent Sessions", "─" * 60]
+            for s in sessions:
+                parent = f"  ← {s['parent'][:8]}" if s.get("parent") else ""
+                iters  = f"  ·  {s['iterations']} iter" if s.get("iterations") else ""
+                lines.append(
+                    f"  {s['id'][-12:]}  {s['status']:<12}  "
+                    f"{s['task'][:38]}{iters}{parent}"
+                )
+            output = "\n".join(lines)
+
+    elif cmd_name == "/status":
+        mcp_lines = ""
+        status_map = _global_mcp.get_status()
+        if status_map:
+            mcp_lines = "\n  MCP Servers:\n" + "\n".join(
+                f"    {'✓' if ok else '✗'} {name}"
+                for name, ok in status_map.items()
+            )
+        output = (
+            f"Agent Status\n"
+            f"────────────────────────────────────────────\n"
+            f"  Workspace  : {WORKSPACE}\n"
+            f"  LLM        : {Config.LLM_URL}\n"
+            f"  Session    : {(session_id or 'none')[-8:]}\n"
+            f"  State      : {_get_agent_state()}\n"
+            f"  Permissions: {_current_permission_mode}"
+            f"{mcp_lines}"
+        )
+
+    elif cmd_name == "/soul":
+        loaded_soul = SoulConfig.load(WORKSPACE)
+        output = (
+            f"Soul Config  (.soul.md)\n"
+            f"────────────────────────────────────────────\n"
+            f"{loaded_soul or '(no .soul.md found in workspace)'}\n\n"
+            f"Edit .soul.md in your workspace to customise personality."
+        )
+
+    elif cmd_name == "/session":
+        if session_id:
+            output = f"Current session: {session_id}"
+        else:
+            output = "No active session — send your first task to create one."
+
+    elif cmd_name == "/plan":
+        if not session_id:
+            output = "No active session."
+        else:
+            try:
+                pm   = PlanManager(WORKSPACE, session_id)
+                plan = pm.plan
+                if plan:
+                    output = f"Current Plan\n{'─'*40}\n{json.dumps(plan, indent=2)}"
+                else:
+                    output = "No active plan for this session."
+            except Exception as e:
+                output = f"Could not load plan: {e}"
+
+    elif cmd_name == "/todo":
+        if not session_id:
+            output = "No active session."
+        else:
+            try:
+                tm    = TodoManager(WORKSPACE, session_id)
+                todos = getattr(tm, "todos", None) or []
+                if todos:
+                    lines = [f"Todo List  ({len(todos)} items)", "─" * 40]
+                    for t in todos:
+                        mark = "✓" if t.get("done") or t.get("completed") else "○"
+                        lines.append(f"  {mark}  {t.get('text', t.get('task', ''))}")
+                    output = "\n".join(lines)
+                else:
+                    output = "No todos for this session."
+            except Exception as e:
+                output = f"Could not load todos: {e}"
+
+    elif cmd_name == "/mode":
+        if cmd_arg in ("manual", "normal", "auto"):
+            _current_permission_mode = cmd_arg
+            output = f"✓ Permission mode → {cmd_arg}"
+        else:
+            output = "Usage: /mode <manual|normal|auto>"
+
+    else:
+        output = f"Unknown command: {cmd_name}  —  type /help for the full list."
+
+    return jsonify({"ok": True, "output": output})
 
 
 @app.route("/")
@@ -2424,9 +1188,9 @@ def index():
         if not token or not secrets.compare_digest(token, _AGENT_TOKEN):
             proto = "https" if _SSL_CERT and _SSL_KEY else "http"
             try:
-                host = request.host or f"localhost:{_get_port()}"
+                host = request.host or f"localhost:{_PORT}"
             except Exception:
-                host = f"localhost:{_get_port()}"
+                host = f"localhost:{_PORT}"
             base_url = f"{proto}://{host}/"
             qr_img   = _make_qr_data_uri(base_url)
             return _UNAUTH_HTML.replace("__QR_IMG__", qr_img), 401
@@ -2463,10 +1227,7 @@ def chat():
 
     def _run():
         try:
-            _execute_agent(
-                message, session_id, request_id,
-                stop_ev, perm_mode,
-            )
+            _execute_agent(message, session_id, request_id, stop_ev, perm_mode)
         finally:
             _AGENT_LOCK.release()
             with _stop_events_lock:
@@ -2498,8 +1259,13 @@ def stop():
     if ev:
         ev.set()
 
-    return jsonify({"ok": True})
+    # Give the agent thread up to 3 s to release the lock so the next
+    # /chat call doesn't immediately bounce with 429.
+    acquired = _AGENT_LOCK.acquire(timeout=3)
+    if acquired:
+        _AGENT_LOCK.release()
 
+    return jsonify({"ok": True})
 
 @app.route("/new", methods=["POST"])
 @_require_auth
@@ -2661,8 +1427,7 @@ def fileread():
         return jsonify({"error": "not a file"}), 400
 
     MAX_PREVIEW = 100_000
-    from agent_core import Config as _Cfg
-    if fp.suffix.lower() in _Cfg.BINARY_EXTS:
+    if fp.suffix.lower() in Config.BINARY_EXTS:
         return jsonify({"binary": True, "size": fp.stat().st_size})
     try:
         raw  = fp.read_bytes()
@@ -2691,27 +1456,6 @@ def workspace_mtime():
         return jsonify({"error": str(e)}), 500
 
 
-@app.after_request
-def _security_headers(response):
-    h = response.headers
-    h["X-Content-Type-Options"] = "nosniff"
-    h["Referrer-Policy"]        = "no-referrer"
-    if request.path.startswith("/serve/"):
-        h["Cross-Origin-Embedder-Policy"] = "credentialless"
-        h["Cross-Origin-Opener-Policy"]   = "same-origin"
-    else:
-        h["X-Frame-Options"]         = "DENY"
-        h["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src https://fonts.gstatic.com; "
-            "img-src 'self' data: blob:; "
-            "connect-src 'self'"
-        )
-    return response
-
-
 @app.route("/serve/<path:rel_path>")
 def serve_file(rel_path: str):
     token = (request.headers.get("X-Token", "")
@@ -2719,59 +1463,33 @@ def serve_file(rel_path: str):
              or request.cookies.get("agent_token", ""))
     if _AGENT_TOKEN and not secrets.compare_digest(token, _AGENT_TOKEN):
         return Response("Unauthorized", status=401, mimetype="text/plain")
+
     ok, err, fp = _validate_ft_path(rel_path)
     if not ok or not fp.is_file():
         return Response("Not found", status=404, mimetype="text/plain")
+
     mime = _mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
     try:
         raw = fp.read_bytes()
 
         if mime == "text/html":
-            html = raw.decode("utf-8", errors="replace")
+            html     = raw.decode("utf-8", errors="replace")
             base_dir = str(fp.parent.relative_to(WORKSPACE)).replace("\\", "/")
             if base_dir == ".":
                 base_dir = ""
-
-            def _rewrite(m):
-                attr  = m.group(1)
-                path  = m.group(2)
-                quote = m.group(3)
-                if path.startswith(("http://", "https://", "//", "data:", "javascript:", "#", "/serve/")):
-                    return m.group(0)
-                if path.startswith("/"):
-                    serve_path = f"/serve{path}"
-                else:
-                    prefix = f"{base_dir}/" if base_dir else ""
-                    serve_path = f"/serve/{prefix}{path}"
-                sep = "&" if "?" in serve_path else "?"
-                return f"{attr}{serve_path}{sep}token={token}{quote}"
-
-            html = re.sub(
-                r'((?:src|href)\s*=\s*["\'])([^"\']+)(["\'])',
-                _rewrite,
-                html
+            html = _SRC_HREF_RE.sub(
+                lambda m: _rewrite_html_asset(m, base_dir, token), html
             )
             return Response(html.encode("utf-8"), mimetype="text/html")
 
         if mime == "text/css":
-            css = raw.decode("utf-8", errors="replace")
+            css      = raw.decode("utf-8", errors="replace")
             base_dir = str(fp.parent.relative_to(WORKSPACE)).replace("\\", "/")
             if base_dir == ".":
                 base_dir = ""
-
-            def _rewrite_css(m):
-                path = m.group(1).strip("'\"")
-                if path.startswith(("http://", "https://", "//", "data:", "/serve/")):
-                    return m.group(0)
-                if path.startswith("/"):
-                    serve_path = f"/serve{path}"
-                else:
-                    prefix = f"{base_dir}/" if base_dir else ""
-                    serve_path = f"/serve/{prefix}{path}"
-                sep = "&" if "?" in serve_path else "?"
-                return f"url('{serve_path}{sep}token={token}')"
-
-            css = re.sub(r'url\(([^)]+)\)', _rewrite_css, css)
+            css = _CSS_URL_RE.sub(
+                lambda m: _rewrite_css_asset(m, base_dir, token), css
+            )
             return Response(css.encode("utf-8"), mimetype="text/css")
 
         return Response(raw, mimetype=mime)
@@ -2780,6 +1498,7 @@ def serve_file(rel_path: str):
         return Response("Permission denied", status=403, mimetype="text/plain")
     except Exception as exc:
         return Response(f"Error: {exc}", status=500, mimetype="text/plain")
+
 
 @app.route("/tools")
 @_require_auth
@@ -2792,76 +1511,79 @@ def tools():
 # =============================================================================
 
 def _start_web_scheduler() -> None:
-        # Patch run_agent inside agent_main so the scheduler's workers go
-        # through _execute_agent instead of calling run_agent directly.
-        # This gives every scheduled resume the full SSE broadcast pipeline
-        # (token_cb, thinking_cb, tool events, done/error signals) so the
-        # frontend transitions correctly out of the "waiting" state.
-        #
-        # _execute_agent uses the *locally-imported* run_agent reference
-        # (from `from agent_main import run_agent`), NOT _agent_main_mod.run_agent,
-        # so there is no recursion.
-        _orig_run_agent = _agent_main_mod.run_agent
+    def _sched_run_agent(
+        task,
+        workspace,
+        permission_mode=PermissionMode.AUTO,
+        resume_session=None,
+        plan_first=False,
+        mode="interactive",
+        event_callback=None,
+        soul="",
+        whisper_fn=None,
+    ):
+        request_id = f"sched_{secrets.token_hex(6)}"
+        stop_ev    = threading.Event()
 
-        def _sched_run_agent(
-            task,
-            workspace,
-            permission_mode=PermissionMode.AUTO,
-            resume_session=None,
-            plan_first=False,
-            mode="interactive",
-            event_callback=None,
-            soul="",
-            whisper_fn=None,
-        ):
-            request_id = f"sched_{secrets.token_hex(6)}"
-            stop_ev    = threading.Event()
+        with _stop_events_lock:
+            _stop_events[request_id] = stop_ev
 
+        if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT):
+            Log.warning("[web-scheduler] agent busy — skipping scheduled task")
+            return AgentResult(
+                status="error",
+                final_answer="agent busy",
+                events=[],
+                session_id=resume_session or "",
+                iterations=0,
+            )
+
+        try:
+            # PATCH 4: Pass web_origin=False so the scheduler cannot clobber
+            # the browser's session state.
+            _execute_agent(task, resume_session, request_id, stop_ev,
+                           permission_mode, web_origin=False)
+            with _session_lock:
+                sid = _current_session_id or resume_session or ""
+            status = "waiting" if _get_agent_state() == "waiting" else "completed"
+            return AgentResult(
+                status=status,
+                final_answer="",
+                events=[],
+                session_id=sid,
+                iterations=0,
+            )
+        finally:
+            _AGENT_LOCK.release()
             with _stop_events_lock:
-                _stop_events[request_id] = stop_ev
+                _stop_events.pop(request_id, None)
 
-            if not _AGENT_LOCK.acquire(timeout=_AGENT_LOCK_TIMEOUT):
-                Log.warning("[web-scheduler] agent busy — skipping scheduled task")
-                return AgentResult(
-                    status="error",
-                    final_answer="agent busy",
-                    events=[],
-                    session_id=resume_session or "",
-                    iterations=0,
-                )
+    _agent_main_mod.run_agent = _sched_run_agent
 
-            try:
-                _execute_agent(
-                    task, resume_session, request_id, stop_ev, permission_mode
-                )
-                with _session_lock:
-                    sid = _current_session_id or resume_session or ""
-                status = "waiting" if _get_agent_state() == "waiting" else "completed"
-                return AgentResult(
-                    status=status,
-                    final_answer="",
-                    events=[],
-                    session_id=sid,
-                    iterations=0,
-                )
-            finally:
-                _AGENT_LOCK.release()
-                with _stop_events_lock:
-                    _stop_events.pop(request_id, None)
+    def _run():
+        # Silence verbose internal logs on the scheduler thread
+        Log.set_silent(True)
+        try:
+            _agent_main_mod.run_scheduler(WORKSPACE, soul=soul)
+        except Exception as e:
+            Log.error(f"[web scheduler] crashed: {e}")
 
-        _agent_main_mod.run_agent = _sched_run_agent
+    threading.Thread(target=_run, daemon=True, name="web-scheduler").start()
+    Log.info("[web] Background scheduler started")
 
-        def _run():
-            Log.set_silent(True)
-            try:
-                _agent_main_mod.run_scheduler(WORKSPACE, soul=soul)
-            except Exception as e:
-                Log.error(f"[web scheduler] crashed: {e}")
 
-        t = threading.Thread(target=_run, daemon=True, name="web-scheduler")
-        t.start()
-        Log.info("[web] Background scheduler started")
+# =============================================================================
+# MESSAGING INTEGRATION
+# =============================================================================
 
+try:
+    from agent_messaging import init_messaging as _init_messaging
+    _MESSAGING_AVAILABLE = True
+except ImportError:
+    _MESSAGING_AVAILABLE = False
+    print("[messaging] agent_messaging.py not found — messaging disabled")
+
+_MESSAGING_CFG = None   # populated inside main()
 
 
 # =============================================================================
@@ -2869,8 +1591,9 @@ def _start_web_scheduler() -> None:
 # =============================================================================
 
 def main() -> None:
+    global _MESSAGING_CFG
+
     Log.set_silent(False)
-    port = _get_port()
 
     proto = "https" if _SSL_CERT and _SSL_KEY else "http"
     try:
@@ -2882,19 +1605,40 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"  LMAgent Web Interface v7.0")
     print(f"{'=' * 60}")
-    print(f"  Local  : {proto}://localhost:{port}")
-    print(f"  Network: {proto}://{local_ip}:{port}")
+    print(f"  Local  : {proto}://localhost:{_PORT}")
+    print(f"  Network: {proto}://{local_ip}:{_PORT}")
     print(f"  PIN    : {_AGENT_TOKEN}")
     print(f"  WS     : {WORKSPACE}")
     print(f"{'=' * 60}\n")
 
     _start_web_scheduler()
 
+    # ── Start messaging integrations ──────────────────────────────────────────
+    if _MESSAGING_AVAILABLE:
+        _MESSAGING_CFG = _init_messaging(app, {
+            "execute_agent":      _execute_agent,
+            "register_q":         _register_stream_q,
+            "unregister_q":       _unregister_stream_q,
+            "get_state":          _get_agent_state,
+            "set_state":          _set_agent_state,
+            "agent_lock":         _AGENT_LOCK,
+            "agent_lock_timeout": _AGENT_LOCK_TIMEOUT,
+            "stop_events":        _stop_events,
+            "stop_events_lock":   _stop_events_lock,
+            "session_lock":       _session_lock,
+            "require_auth":       _require_auth,
+            "permission_mode":    _resolve_permission_mode,
+            "broadcast":          _broadcast,
+            "get_messaging_mode": _get_messaging_mode,
+            "set_messaging_mode": _set_messaging_mode,
+        })
+    # ─────────────────────────────────────────────────────────────────────────
+
     if _SSL_CERT and _SSL_KEY:
-        app.run(host=_HOST, port=port, debug=False,
+        app.run(host=_HOST, port=_PORT, debug=False,
                 threaded=True, ssl_context=(_SSL_CERT, _SSL_KEY))
     else:
-        app.run(host=_HOST, port=port, debug=False, threaded=True)
+        app.run(host=_HOST, port=_PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
