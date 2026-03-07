@@ -18,6 +18,22 @@
 
 ---
 
+
+<p align="center">
+  <img src="discordlmagent.png" alt="LMAgent on Discord" width="200">
+</p>
+
+LMAgent doesn't have to live in a browser tab. Once agent_web.py is running, you can wire up Discord, Telegram, WhatsApp, or SMS and talk to your agent from your phone, your server, or wherever you already spend time.
+Each platform gets its own persistent session — your conversation survives restarts and picks up where you left off. Send /new on any platform to wipe the session and start fresh.
+Discord — run it as a bot in your own server or via DMs. Mention it or message it directly and it responds in-thread.
+Telegram — long-polling bot, works on mobile out of the box. Good option if you want to fire off tasks on the go.
+WhatsApp — connects via the Green API. Same idea — message it like a contact, get a reply when the task is done.
+SMS — Twilio webhook. If you want to send a task from a basic phone with no app, this is the option.
+Only one platform is active at a time. You switch between them from the web UI's messaging panel, which also shows connection status and a live feed of recent messages.
+Setup is just API keys in your .env and agent_messaging.py alongside the other files.
+
+---
+
 ## Thank You
 
 Started this for me. Somewhere along the way, it became something people actually gave a damn about.
